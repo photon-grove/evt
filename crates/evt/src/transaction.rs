@@ -429,12 +429,18 @@ impl<'a, R: Repository> Transaction<'a, R> {
                 }
             };
 
-        self.read_loaded(loaded)
+        let read = self.read_loaded(loaded)?;
+        // A read that succeeds ends the failure before it: a step that recovered from it and then
+        // fails with the same text fails on its own account.
+        self.read_failure = None;
+
+        Ok(read)
     }
 
-    /// Reports whether `error` is the error of this transaction's last failed
-    /// [`read`](Transaction::read), passed on unchanged. Fence-aware retry retries only such an
-    /// error from a prepare step: one the step made up itself is its own failure.
+    /// Reports whether `error` is the error of this transaction's latest
+    /// [`read`](Transaction::read), passed on unchanged, when that read failed. Fence-aware retry
+    /// retries only such an error from a prepare step: one the step made up itself, or one a later
+    /// successful read has superseded, is its own failure.
     pub(crate) fn is_read_failure(&self, error: &Error) -> bool {
         self.read_failure.as_ref().is_some_and(|failure| {
             failure.variant == std::mem::discriminant(error) && failure.message == error.to_string()

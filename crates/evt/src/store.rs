@@ -1642,8 +1642,8 @@ mod tests {
             Metadata::default().with_command_id(id)
         }
 
-        /// A repository whose event reads skip sequence 1, as a load that raced a compaction (or
-        /// one over expired events) sees the stream.
+        /// A repository whose event reads skip sequence 1 of a non-empty stream, as a load that
+        /// raced a compaction (or one over expired events) sees the stream.
         struct Gapped<R>(R);
 
         impl<R: crate::Repository> crate::Repository for Gapped<R> {
@@ -1666,6 +1666,11 @@ mod tests {
 
             async fn events(&self, entity_id: &EntityId) -> Result<Vec<SerializedEvent>, Error> {
                 let mut events = self.0.events(entity_id).await?;
+                // An empty stream has no event to skip, so it reads as it is.
+                if events.is_empty() {
+                    return Ok(events);
+                }
+
                 events.push(SerializedEvent {
                     id: EventId::for_event(entity_id, EventSequence(2)),
                     entity_id: entity_id.clone(),
@@ -1856,6 +1861,171 @@ mod tests {
                     .is_none(),
                 "a failed read says nothing about the decision going stale"
             );
+        }
+
+        /// A repository that commits like another writer of the same command, reports the outcome
+        /// put as lost, and never answers the outcome read that follows (its second). Its
+        /// deadlines pass at once.
+        struct Stalled<R> {
+            inner: R,
+            reads: std::sync::atomic::AtomicUsize,
+        }
+
+        impl<R: crate::Repository> crate::Repository for Stalled<R> {
+            type Operation = R::Operation;
+
+            fn writes_views(&self) -> bool {
+                self.inner.writes_views()
+            }
+
+            fn deadline(&self, _: std::time::Duration) -> impl Future<Output = ()> + Send {
+                std::future::ready(())
+            }
+
+            async fn commit(&self, commit: crate::Commit<R::Operation>) -> Result<(), Error> {
+                let command_id = commit.outcome.as_ref().map(|o| o.command_id.clone());
+                self.inner.commit(commit).await?;
+
+                Err(Error::OutcomeConflict {
+                    command_id: command_id.expect("an outcome-bearing commit"),
+                })
+            }
+
+            async fn outcome(
+                &self,
+                command_id: &CommandId,
+            ) -> Result<Option<crate::Outcome>, Error> {
+                use std::sync::atomic::Ordering;
+
+                if self.reads.fetch_add(1, Ordering::SeqCst) == 1 {
+                    std::future::pending::<()>().await;
+                }
+
+                self.inner.outcome(command_id).await
+            }
+
+            async fn events(&self, entity_id: &EntityId) -> Result<Vec<SerializedEvent>, Error> {
+                self.inner.events(entity_id).await
+            }
+
+            async fn events_after(
+                &self,
+                entity_id: &EntityId,
+                after: EventSequence,
+            ) -> Result<Vec<SerializedEvent>, Error> {
+                self.inner.events_after(entity_id, after).await
+            }
+
+            async fn latest(
+                &self,
+                entity_id: &EntityId,
+                n: usize,
+            ) -> Result<Vec<SerializedEvent>, Error> {
+                self.inner.latest(entity_id, n).await
+            }
+
+            async fn snapshot(
+                &self,
+                entity_id: &EntityId,
+            ) -> Result<Option<crate::SerializedSnapshot>, Error> {
+                self.inner.snapshot(entity_id).await
+            }
+
+            async fn put_snapshot(
+                &self,
+                snapshot: &crate::SerializedSnapshot,
+            ) -> Result<bool, Error> {
+                self.inner.put_snapshot(snapshot).await
+            }
+
+            async fn compact_below(
+                &self,
+                entity_id: &EntityId,
+                through: EventSequence,
+            ) -> Result<usize, Error> {
+                self.inner.compact_below(entity_id, through).await
+            }
+
+            async fn entity_heads(
+                &self,
+                entity_type: Option<&crate::EntityType>,
+            ) -> Result<std::collections::BTreeMap<EntityId, EventSequence>, Error> {
+                self.inner.entity_heads(entity_type).await
+            }
+        }
+
+        #[tokio::test]
+        async fn a_stalled_read_after_a_lost_outcome_put_is_retryable() {
+            let stalled = || Stalled {
+                inner: MemRepository::new(),
+                reads: std::sync::atomic::AtomicUsize::new(0),
+            };
+
+            // One attempt: the stalled read is a transient failure, never the final OutcomeConflict.
+            let repository = stalled();
+            let store = Store::<Counter, _>::new(&repository, ())
+                .with_snapshot_interval(0)
+                .with_outcomes(OutcomeConfig::new().with_retry(RetryPolicy::immediate(1)));
+            let error = store
+                .execute_with_outcome("c-1", Bump(1), command("stall"))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, Error::Transient(_)) && error.is_retryable(),
+                "{error:?}"
+            );
+
+            // Two attempts: the second attempt's pre-read answers the command.
+            let repository = stalled();
+            let store = Store::<Counter, _>::new(&repository, ())
+                .with_snapshot_interval(0)
+                .with_outcomes(OutcomeConfig::new().with_retry(RetryPolicy::immediate(2)));
+            let outcome = store
+                .execute_with_outcome("c-1", Bump(1), command("stall"))
+                .await
+                .unwrap();
+            assert!(outcome.replayed, "{outcome:?}");
+        }
+
+        #[tokio::test]
+        async fn a_read_that_succeeds_ends_the_failed_read_before_it() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            use crate::{CommandIdentity, Decision};
+
+            let inner = MemRepository::new();
+            Store::<Counter, _>::new(&inner, ())
+                .execute("c-1", Bump(1), Metadata::default())
+                .await
+                .unwrap();
+
+            let gapped = Gapped(&inner);
+            let store = Store::<Counter, _>::new(&gapped, ())
+                .with_snapshot_interval(0)
+                .with_outcomes(OutcomeConfig::new().with_retry(RetryPolicy::immediate(3)));
+            let identity = CommandIdentity::new("counter:check").with_targets(["c-1", "c-2"]);
+            let calls = AtomicUsize::new(0);
+
+            // The step recovers from a failed read, reads another stream, then fails with an error
+            // identical to the first: that is its own failure now, returned without a retry.
+            let result = store
+                .execute_transaction(&identity, &command("recovered"), |tx| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+
+                    Box::pin(async move {
+                        let failed = tx.read::<Counter>("c-1").await.unwrap_err();
+                        tx.read::<Counter>("c-2").await?;
+
+                        Err::<Decision, _>(failed)
+                    })
+                })
+                .await;
+
+            assert!(
+                matches!(&result, Err(Error::SequenceGap { .. })),
+                "{result:?}"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "no re-prepare");
         }
 
         #[tokio::test]

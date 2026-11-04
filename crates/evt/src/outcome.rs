@@ -1257,8 +1257,11 @@ pub(crate) async fn settle<R: Repository>(
                 // The row that won the race is gone again; nothing can be said about the command.
                 Some(Ok(None)) => Err(conflict),
                 Some(Err(err)) => Err(err),
-                // The read stalled past the window: the command is unresolved, and retryable.
-                None => Err(conflict),
+                // The read stalled past the window: the command is unresolved, and retryable,
+                // because the next attempt's outcome pre-read answers it.
+                None => Err(Error::Transient(
+                    format!("{conflict}, and its outcome row could not be read in time").into(),
+                )),
             }
         }
         Err(Error::Indeterminate(source)) => {

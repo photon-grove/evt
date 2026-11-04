@@ -375,7 +375,9 @@ error before any write and is never split.
   guard for pre-v0.9 IDs, and it sees only those after the latest snapshot
 - A lost outcome put is never a generic optimistic-concurrency conflict and is never resolved by
   re-preparing the command: it is `OutcomeConflict`, and it outranks every other failed item in the
-  commit's classification, so the engine resolves it by re-reading the row. An ordinary conflict
+  commit's classification, so the engine resolves it by re-reading the row. A re-read that stalls
+  past the recovery window is a transient error, so the next attempt's outcome pre-read answers
+  the command. An ordinary conflict
   of an outcome-bearing commit also re-reads the row once, so a lost race with the same command
   returns the winner's outcome
 - Only a genuinely indeterminate failure of an outcome-bearing commit is recovered — a timeout or
