@@ -124,7 +124,10 @@ function outcome(result: string, events = 0, deleted = 0, sequences: number[] = 
   return sequences.length > 0 ? {result, events, deleted, sequences} : {result, events, deleted}
 }
 
-/** A stream as compat/fixtures/scenarios.json records it. */
+/**
+ * A stream as compat/fixtures/scenarios.json records it. The DynamoDB items and SNS messages are
+ * observed only where the stream is in DynamoDB, or in memory, which builds them.
+ */
 export interface Observed {
   state: string
   sequence: bigint
@@ -132,8 +135,8 @@ export interface Observed {
   events: string[]
   snapshot: string | null
   head: bigint | null
-  dynamoItems: unknown[]
-  snsMessages: string[]
+  dynamoItems?: unknown[]
+  snsMessages?: string[]
 }
 
 /** Compares a scenario's main stream with its fixture. */
@@ -151,14 +154,16 @@ export function compareObserved(
     int(field(expected, 'snapshotSequence')),
   )
   compareStream(checks, name, observed, expected)
-  checks.equal(
-    `${name}: sns messages`,
-    canonical(observed.snsMessages),
-    canonical(optionalList(expected, 'snsMessages').map(str)),
-  )
+  if (observed.snsMessages !== undefined) {
+    checks.equal(
+      `${name}: sns messages`,
+      canonical(observed.snsMessages),
+      canonical(optionalList(expected, 'snsMessages').map(str)),
+    )
+  }
 }
 
-/** Compares a stream's events, snapshot, head and DynamoDB items with its fixture. */
+/** Compares a stream's events, snapshot, head and any DynamoDB items with its fixture. */
 export function compareStream(
   checks: Checks,
   name: string,
@@ -174,11 +179,13 @@ export function compareStream(
   checks.equal(`${name}: snapshot`, observed.snapshot, snapshot === null ? null : str(snapshot))
   const head = field(expected, 'head')
   checks.equal(`${name}: head`, observed.head, head === null ? null : int(head))
-  checks.equal(
-    `${name}: dynamo items`,
-    canonical(observed.dynamoItems),
-    canonical(optionalList(expected, 'dynamoItems').map(plain)),
-  )
+  if (observed.dynamoItems !== undefined) {
+    checks.equal(
+      `${name}: dynamo items`,
+      canonical(observed.dynamoItems),
+      canonical(optionalList(expected, 'dynamoItems').map(plain)),
+    )
+  }
 }
 
 /** A stream's loaded state, or an empty state when a sequence gap leaves it no coherent one. */

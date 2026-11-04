@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Cross-language integration run: the Go and Rust drivers take turns writing the same streams
 # (each scenario step names its writer), then both verify every stream against the golden
-# fixtures. On DynamoDB, two passes over the scenarios the TypeScript driver supports come first, in
-# which it stands in for Go and then for Rust (ADR 0009). Usage: scripts/compat-integration.sh
+# fixtures. Two passes over the scenarios the TypeScript driver supports come first, in which it
+# stands in for Go and then for Rust (ADR 0009). Usage: scripts/compat-integration.sh
 # dynamo|postgres
 set -euo pipefail
 
@@ -18,22 +18,18 @@ cargo build --quiet -p evt-compat --features drivers --bin evt-compat
 go_driver="target/compat/evt-compat-go-${backend}"
 rust_driver="target/debug/evt-compat"
 
-# The TypeScript driver writes only the DynamoDB run so far.
 ts_driver=(node packages/evt-compat/dist/live.js)
-ts_scenarios=""
-if [ "$backend" = dynamo ]; then
-  pnpm --silent --filter @photon-grove/evt run build
-  pnpm --silent --filter @photon-grove/evt-compat run build
-  ts_scenarios="$("${ts_driver[@]}" scenarios)"
-  if [ -z "$ts_scenarios" ]; then
-    echo "the TypeScript driver lists no scenarios" >&2
-    exit 1
-  fi
+pnpm --silent --filter @photon-grove/evt run build
+pnpm --silent --filter @photon-grove/evt-compat run build
+ts_scenarios="$("${ts_driver[@]}" scenarios)"
+if [ -z "$ts_scenarios" ]; then
+  echo "the TypeScript driver lists no scenarios" >&2
+  exit 1
 fi
 
 # pass RUN [go|rust]: one cross-language run under its own run ID. With a writer name, the
 # TypeScript driver writes that language's steps, and the pass takes only the scenarios TypeScript
-# supports: the others would only repeat the first pass, and the emulator slows as its table grows.
+# supports: the others would only repeat the last pass, and Moto slows as its table grows.
 pass() {
   local run="$1" as="${2:-}" listed="" label="Go and Rust" scope="every ${backend} stream"
   case "$as" in
@@ -102,13 +98,11 @@ pass() {
   echo "run ${run}: ${label} agree on ${scope} and on their enumeration"
 }
 
-# The TypeScript passes are small, so they go first, while the emulator's tables are smallest: a
-# transaction in Moto copies its table, so every pass slows the ones after it. Each pass writes its
+# The TypeScript passes are small, so they go first, while the tables are smallest: a transaction in
+# Moto copies its table, so on DynamoDB every pass slows the ones after it. Each pass writes its
 # own streams. Enumeration matches the run ID anywhere in an entity ID, so the last pass also lists
 # the TypeScript passes' events, which Go and Rust must list alike.
-if [ -n "$ts_scenarios" ]; then
-  pass "ts-go-${run}" go
-  pass "ts-rust-${run}" rust
-fi
+pass "ts-go-${run}" go
+pass "ts-rust-${run}" rust
 
 pass "$run"

@@ -33,7 +33,7 @@ jobs:
       # ts: the TypeScript packages and the shared compatibility fixtures.
       # compat: anything that can change the shared storage format, which runs the
       # cross-language suite against live backends. The TypeScript packages set it too, since the
-      # TypeScript driver writes in that suite's DynamoDB run.
+      # TypeScript driver writes in both of that suite's runs.
       - name: Classify changed files
         id: classify
         env:
