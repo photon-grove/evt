@@ -1451,10 +1451,12 @@ Nothing carries over from a failed attempt: its staged events, snapshot, fences,
 operations are discarded, and only the attempt that commits writes anything. The handler or
 prepare step can therefore run several times for one command and must be safe to repeat. External
 side effects it causes must be idempotent. In Go the entity the caller supplied is reset before each
-re-preparation: its exported fields (the state a snapshot persists) are restored from a deep copy,
-so events a failed attempt applied are not counted again, and its unexported fields are restored
-shallowly, so an unexported map, slice, or pointer keeps what the failed attempt put in it. Keep
-state that `Apply` changes in exported fields. The command value is reused by every attempt, so a
+re-preparation: its exported fields (the state a snapshot persists, including the fields an
+embedded struct promotes) are restored from a deep copy, so events a failed attempt applied are not
+counted again, and its other unexported fields are restored shallowly, so an unexported map, slice,
+or pointer keeps what the failed attempt put in it. A pointer back to the entity itself stays one.
+Keep state that `Apply` changes in exported fields, and dependencies (clients, locks) in unexported
+ones. The command value is reused by every attempt, so a
 handler must not mutate it. An entity the engine cannot reset (not a pointer to a struct) is
 attempted once and a conflict is returned as an error. Rust loads a fresh aggregate for every
 attempt and clones the command.

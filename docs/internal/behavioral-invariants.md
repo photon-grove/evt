@@ -375,7 +375,11 @@ error before any write and is never split.
   guard for pre-v0.9 IDs, and it sees only those after the latest snapshot
 - A lost outcome put is never a generic optimistic-concurrency conflict and is never resolved by
   re-preparing the command: it is `OutcomeConflict`, and it outranks every other failed item in the
-  commit's classification, so the engine resolves it by re-reading the row. An ordinary conflict
+  commit's classification, so the engine resolves it by re-reading the row. A re-read that fails
+  is retryable where it can be, so the next attempt's outcome pre-read answers the command: Go
+  makes any failure not classified permanent transient, and Rust makes a re-read that stalls past
+  the recovery window `Error::Transient` (a backend's `Transient` stays retryable, a definitive
+  `Backend` error is returned). An ordinary conflict
   of an outcome-bearing commit also re-reads the row once, so a lost race with the same command
   returns the winner's outcome
 - Only a genuinely indeterminate failure of an outcome-bearing commit is recovered — a timeout or
@@ -501,9 +505,11 @@ error before any write and is never split.
   intent, computed once before any attempt, so re-preparation, a client retry after the command
   landed, and recovery all digest to the same value (never `IdempotencyKeyReuse`)
 - Go resets the caller's aggregate before each re-preparation (exported fields from a deep copy,
-  unexported fields shallowly, so state `Apply` changes belongs in exported fields) and attempts an
-  aggregate it cannot reset (not a pointer to a struct) once; the command value is reused by every
-  attempt and must not be mutated by a handler. After a replayed or exhausted result the aggregate is
+  including those an embedded struct of an unexported type promotes, with self-references copied
+  once and pointers back to the aggregate kept; other unexported fields shallowly, so state `Apply`
+  changes belongs in exported fields and dependencies in unexported ones) and attempts an aggregate
+  it cannot reset (not a pointer to a struct) once; the command value is reused by every attempt
+  and must not be mutated by a handler. After a replayed or exhausted result the aggregate is
   reloaded so it reflects durable state. Rust loads a fresh aggregate and clones the command per
   attempt
 - Rust's `execute_with_retry` (a store without outcomes) remains blind whole-command retry for
