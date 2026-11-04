@@ -81,6 +81,11 @@ type headVerdict struct {
 	stored  evt.EventSequence
 	present bool
 	derived evt.EventSequence
+
+	// expiryRead is true when the probe read the stream's remaining items, and expired is what
+	// remainingItemsExpired found, so the caller need not read them again.
+	expiryRead bool
+	expired    bool
 }
 
 // verdictKind is what the probe's reads say about the stream.
@@ -135,6 +140,8 @@ func (repo *Repository) probeStream(
 			if eerr != nil {
 				return headVerdict{}, eerr
 			}
+
+			verdict.expiryRead, verdict.expired = true, expired
 
 			if expired {
 				verdict.kind = probeRace
@@ -276,9 +283,14 @@ func (repo *Repository) classifyStream(
 		}
 
 		if retained {
-			expired, eerr := repo.remainingItemsExpired(ctx, stream.id)
-			if eerr != nil {
-				return verdictNone, eerr
+			// The probe already read the remaining items when it found the head item absent below
+			// the derived head; read them only if it did not.
+			expired := verdict.expired
+			if !verdict.expiryRead {
+				expired, err = repo.remainingItemsExpired(ctx, stream.id)
+				if err != nil {
+					return verdictNone, err
+				}
 			}
 
 			if expired {

@@ -944,3 +944,101 @@ func TestProbe_AHeadAboveTheLog(t *testing.T) {
 		})
 	}
 }
+
+// expiryReadCounter counts the reads of a stream's remaining items: the snapshot GetItem (sk=0)
+// and the event Query that project ttl.
+type expiryReadCounter struct {
+	*compat.FakeDynamo
+
+	snapshotReads, eventQueries int
+}
+
+func (c *expiryReadCounter) GetItem(
+	ctx context.Context,
+	params *dynamodb.GetItemInput,
+	options ...func(*dynamodb.Options),
+) (*dynamodb.GetItemOutput, error) {
+	if sk, ok := params.Key["sk"].(*types.AttributeValueMemberN); ok && sk.Value == "0" && params.ExpressionAttributeNames["#ttl"] == "ttl" {
+		c.snapshotReads++
+	}
+
+	return c.FakeDynamo.GetItem(ctx, params, options...)
+}
+
+func (c *expiryReadCounter) Query(
+	ctx context.Context,
+	params *dynamodb.QueryInput,
+	options ...func(*dynamodb.Options),
+) (*dynamodb.QueryOutput, error) {
+	if params.ExpressionAttributeNames["#ttl"] == "ttl" {
+		c.eventQueries++
+	}
+
+	return c.FakeDynamo.Query(ctx, params, options...)
+}
+
+// A retained stream's commit whose head update passes and event put fails reads the remaining
+// items once: the probe's expiry read when it made one (the head item is absent), otherwise the
+// classification's own (the head item is present, below the events).
+func TestCommit_AFailedEventPutReadsTheRemainingItemsOnce(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(1_791_763_200, 0)
+	retention := dynamo.Retention{"scratch": time.Hour}
+
+	for _, tc := range []struct {
+		name  string
+		head  int
+		after time.Duration
+		drift bool
+	}{
+		{name: "absent head, unexpired residual is drift", head: 0, after: 0, drift: true},
+		{name: "absent head, expired residual is a conflict", head: 0, after: 3 * time.Hour, drift: false},
+		{name: "lagging head, unexpired residual is drift", head: 1, after: 0, drift: true},
+		{name: "lagging head, expired residual is a conflict", head: 1, after: 3 * time.Hour, drift: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := compat.NewFakeDynamo()
+			seed := dynamo.NewRepository(fake, "events").WithLazyInitialization(true).WithRetention(retention).WithClock(func() time.Time { return now })
+			require.NoError(t, seed.Commit(ctx, evt.SerializedResult{Events: headEvents("residual", 1, 2, "scratch")}))
+
+			// The head item: deleted by TTL before the events, or lagging below them.
+			key := map[string]types.AttributeValue{
+				"pk": &types.AttributeValueMemberS{Value: "residual"},
+				"sk": &types.AttributeValueMemberN{Value: "-1"},
+			}
+
+			if tc.head == 0 {
+				_, err := fake.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []types.TransactWriteItem{{
+					Delete: &types.Delete{TableName: aws.String("events"), Key: key},
+				}}})
+				require.NoError(t, err)
+			} else {
+				item := maps.Clone(key)
+				item["head"] = &types.AttributeValueMemberN{Value: strconv.Itoa(tc.head)}
+
+				_, err := fake.PutItem(ctx, &dynamodb.PutItemInput{Item: item})
+				require.NoError(t, err)
+			}
+
+			client := &expiryReadCounter{FakeDynamo: fake}
+			repo := dynamo.NewRepository(client, "events").WithLazyInitialization(true).WithRetention(retention).
+				WithClock(func() time.Time { return now.Add(tc.after) })
+
+			// The commit continues from the stored head, so its head update passes and the put of an
+			// event that already exists fails.
+			err := repo.Commit(ctx, evt.SerializedResult{Events: headEvents("residual", tc.head+1, 1, "scratch")})
+
+			var drift *evt.StreamHeadDriftError
+			if tc.drift {
+				require.ErrorAs(t, err, &drift)
+				require.Equal(t, tc.head == 0, drift.HeadAbsent)
+			} else {
+				require.NotErrorAs(t, err, &drift)
+				require.True(t, evt.IsOptimisticConflict(err))
+			}
+
+			require.Equal(t, 1, client.snapshotReads, "the snapshot's ttl is read once")
+			require.Equal(t, 1, client.eventQueries, "the events' ttls are read once")
+		})
+	}
+}
