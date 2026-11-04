@@ -13,6 +13,17 @@ export async function loadFixture(name: string): Promise<JsonValue> {
   return parseJson(await readFile(new URL(name, FIXTURES), 'utf8'))
 }
 
+/**
+ * A fixture recorded under the fixture run, rewritten for a live run: every `compat-fixture-`
+ * prefix, such as an entity ID's, becomes `compat-<run>-`, as the Go and Rust drivers rewrite it.
+ */
+export async function loadFixtureForRun(name: string, run: string): Promise<JsonValue> {
+  const text = await readFile(new URL(name, FIXTURES), 'utf8')
+
+  // A replacer function, so a `$` in the run ID is taken literally.
+  return parseJson(text.replaceAll('compat-fixture-', () => `compat-${run}-`))
+}
+
 /** A field of a fixture object. */
 export function field(value: JsonValue | undefined, name: string): JsonValue {
   if (!(value instanceof Map)) {

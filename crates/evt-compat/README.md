@@ -16,7 +16,9 @@ cargo test -p evt-compat
 The `drivers` feature adds the `evt-compat` binary and the tests that need a live DynamoDB or
 PostgreSQL. [`scripts/compat-integration.sh`](../../scripts/compat-integration.sh) builds this binary
 and the Go driver, then has them take turns writing the same streams, one scenario step at a time,
-before both verify every stream against the fixtures:
+before both verify every stream against the fixtures. On DynamoDB, two passes over the scenarios
+the TypeScript driver supports come first, in which it takes the Go steps, then the Rust steps.
+`step --scenarios` and `verify --scenarios` limit this driver to those scenarios:
 
 ```sh
 scripts/compat-integration.sh dynamo
