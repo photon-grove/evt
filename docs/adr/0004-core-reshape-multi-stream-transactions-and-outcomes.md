@@ -244,6 +244,16 @@ row still absent at the end as a retryable ambiguous write rather than proof tha
 not apply ("absent → safe to retry" above is superseded: a transaction can land after any single
 read). See the storage spec's Command Outcomes section.
 
+**Amendment (recorded identity, [#235](https://github.com/photon-grove/evt/issues/235)).** The
+outcome row now also stores the identity its digest was computed from: the command type, the
+sorted target streams and the principal (DynamoDB `commandType`, `targets`, `principal`;
+PostgreSQL columns of the same names, added to existing tables by the schema step). They are
+descriptive. The digest stays the idempotency key, and the `evt-cmd-digest-v1` canonical bytes are
+unchanged. They back a lookup by command ID and principal that answers a principal mismatch with a
+typed error instead of failing closed on every row. Rows written before the change record no
+identity, are never rewritten, and keep the old fail-closed answer. See the storage spec's
+Recorded identity section.
+
 ### C4 — Rejections
 
 **Current state.** Go's command errors are ad-hoc sentinel types (`NotFoundError`,
