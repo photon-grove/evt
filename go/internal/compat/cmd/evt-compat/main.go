@@ -4,14 +4,16 @@
 //	evt-compat steps [-only SCENARIO]
 //	evt-compat exclusive
 //	evt-compat settle -backend dynamo|postgres
-//	evt-compat step   -backend dynamo|postgres -run RUN -index N [-only SCENARIO]
-//	evt-compat verify -backend dynamo|postgres -run RUN
+//	evt-compat step   -backend dynamo|postgres -run RUN -index N [-only SCENARIO] [-scenarios LIST]
+//	evt-compat verify -backend dynamo|postgres -run RUN [-scenarios LIST]
 //	evt-compat enumerate -backend dynamo|postgres -run RUN
 //
 // step executes step N of every scenario whose writer is "go", against streams the Rust driver
 // also writes to. A scenario marked exclusive holds store-wide state across steps (a rebuild lock
 // refuses every other scenario's commits), so the interleaved run skips it: it runs alone, one step
-// at a time, with -only. steps prints how many steps the interleaved run has, or how many the named
+// at a time, with -only. -scenarios limits step and verify to a comma-separated list of scenarios,
+// for a pass in which the TypeScript driver writes the other language's steps of the scenarios it
+// supports. steps prints how many steps the interleaved run has, or how many the named
 // scenario has, and exclusive lists the exclusive scenarios. verify checks every stream against the golden fixtures: the raw stored items or
 // rows, the events and snapshot read through the repository, and the loaded state. enumerate prints
 // the run's events as StreamAllEvents yields them (unfiltered and filtered by entity type), one
@@ -69,6 +71,7 @@ func main() {
 	run := flags.String("run", "", "run identifier")
 	index := flags.Int("index", 0, "step index")
 	only := flags.String("only", "", "run only this (exclusive) scenario")
+	scenarioList := flags.String("scenarios", "", "comma-separated scenarios to step or verify (default all)")
 	check(flags.Parse(os.Args[2:]))
 
 	ctx := context.Background()
@@ -120,11 +123,14 @@ func main() {
 
 	var failures []string
 
+	listed, err := listedScenarios(*scenarioList)
+	check(err)
+
 	switch command {
 	case "step":
-		failures, err = step(ctx, b, *run, *index, *only)
+		failures, err = step(ctx, b, *run, *index, *only, listed)
 	case "verify":
-		failures, err = verify(ctx, b, *run)
+		failures, err = verify(ctx, b, *run, listed)
 	case "enumerate":
 		err = enumerate(ctx, b, *run)
 	default:
@@ -138,6 +144,29 @@ func main() {
 	if len(failures) > 0 {
 		os.Exit(1)
 	}
+}
+
+// listedScenarios reports whether -scenarios takes a scenario: every scenario when the list is
+// empty. A name that is no scenario fails, so a typo can't leave a scenario unchecked.
+func listedScenarios(list string) (func(compat.Scenario) bool, error) {
+	if list == "" {
+		return func(compat.Scenario) bool { return true }, nil
+	}
+
+	scenarios, err := compat.LoadScenarios()
+	if err != nil {
+		return nil, err
+	}
+
+	names := strings.Split(list, ",")
+	for _, name := range names {
+		known := slices.ContainsFunc(scenarios.Scenarios, func(s compat.Scenario) bool { return s.Name == name })
+		if !known {
+			return nil, fmt.Errorf("-scenarios names %q, which is no scenario", name)
+		}
+	}
+
+	return func(scenario compat.Scenario) bool { return slices.Contains(names, scenario.Name) }, nil
 }
 
 // enumerate prints every event of the run that StreamAllEvents yields, once with a zero filter
@@ -316,7 +345,14 @@ func connect(ctx context.Context, name string) (backend, error) {
 	return backend{}, fmt.Errorf("unknown backend %q", name)
 }
 
-func step(ctx context.Context, b backend, run string, index int, only string) ([]string, error) {
+func step(
+	ctx context.Context,
+	b backend,
+	run string,
+	index int,
+	only string,
+	listed func(compat.Scenario) bool,
+) ([]string, error) {
 	scenarios, err := compat.LoadScenarios()
 	if err != nil {
 		return nil, err
@@ -327,6 +363,10 @@ func step(ctx context.Context, b backend, run string, index int, only string) ([
 	for _, scenario := range scenarios.Scenarios {
 		// The interleaved run skips exclusive scenarios; a run with -only executes that one alone.
 		if scenario.Exclusive != (only != "") || (only != "" && scenario.Name != only) {
+			continue
+		}
+
+		if !listed(scenario) {
 			continue
 		}
 
@@ -353,7 +393,7 @@ func step(ctx context.Context, b backend, run string, index int, only string) ([
 	return failures, nil
 }
 
-func verify(ctx context.Context, b backend, run string) ([]string, error) {
+func verify(ctx context.Context, b backend, run string, listed func(compat.Scenario) bool) ([]string, error) {
 	scenarios, err := compat.LoadScenarios()
 	if err != nil {
 		return nil, err
@@ -372,6 +412,10 @@ func verify(ctx context.Context, b backend, run string) ([]string, error) {
 	var failures []string
 
 	for _, scenario := range scenarios.Scenarios {
+		if !listed(scenario) {
+			continue
+		}
+
 		expected, err := byName[scenario.Name].ForRun(run)
 		if err != nil {
 			return nil, err

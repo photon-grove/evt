@@ -79,8 +79,8 @@
     (K1, C3, X2 and so on) belong only in `adr/` and `internal/`, never in user-facing prose.
   - `packages/react-flow-diagrams/`: reusable React diagram package for docs.
   - `packages/evt` (`@photon-grove/evt`, moon project `evt-ts`): the TypeScript implementation,
-    built phase by phase from ADR 0009. `packages/evt-compat` (private) is its fixture runner. TS
-    checks itself against `compat/fixtures` and generates none.
+    built phase by phase from ADR 0009. `packages/evt-compat` (private) is its fixture runner and
+    live-run driver. TS checks itself against `compat/fixtures` and generates none.
   - `infra/local/`: Terraform stack for local DynamoDB-compatible integration testing.
   - `infra/local-postgres/`: Terraform stack for local PostgreSQL integration testing.
   - `go/examples/`: public examples; keep names and scenarios neutral.
@@ -169,7 +169,8 @@
     22.12 (TypeScript job)
 - CI integration checks start Moto or PostgreSQL, apply the local Terraform, and run
   `evt:integration` / `evt:integration-postgres`, plus `evt-rust:integration` /
-  `evt-rust:integration-postgres` when the storage format may have changed.
+  `evt-rust:integration-postgres` when the storage format may have changed or the TypeScript
+  packages changed (the TypeScript driver writes in the DynamoDB run).
 - A `changes` job classifies changed paths: Rust-only changes skip Go jobs, Go-only changes skip
   the Rust job, and only TypeScript, fixture and shared-config changes run the TypeScript job. Keep
   its path lists in `.github/workflows/ci.yml` in sync when adding directories. Go lives under

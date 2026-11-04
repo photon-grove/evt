@@ -3,15 +3,17 @@
 //! ```text
 //! evt-compat steps     [--only NAME]
 //! evt-compat exclusive
-//! evt-compat step      --backend dynamo|postgres --run RUN --index N [--only NAME]
-//! evt-compat verify    --backend dynamo|postgres --run RUN
+//! evt-compat step      --backend dynamo|postgres --run RUN --index N [--only NAME] [--scenarios LIST]
+//! evt-compat verify    --backend dynamo|postgres --run RUN [--scenarios LIST]
 //! evt-compat enumerate --backend dynamo|postgres --run RUN
 //! ```
 //!
 //! `step` executes step N of every interleaved scenario whose writer is `rust`, against streams the
 //! Go driver also writes to. A scenario marked exclusive holds store-wide state across its steps (a
 //! rebuild lock refuses every other scenario's commits), so the interleaved run skips it and
-//! `--only NAME` runs that scenario alone; `steps` prints the step count of the interleaved
+//! `--only NAME` runs that scenario alone. `--scenarios` limits `step` and `verify` to a
+//! comma-separated list of scenarios, for a pass in which the TypeScript driver writes the other
+//! language's steps of the scenarios it supports. `steps` prints the step count of the interleaved
 //! scenarios, or of the named one, and `exclusive` lists the exclusive scenarios. `verify` checks every stream against the golden fixtures: the raw stored items
 //! or rows, the events and snapshot read through the repository, and the loaded state. `enumerate`
 //! prints the run's events as `stream_all_events` yields them (unfiltered and filtered by entity
@@ -47,6 +49,8 @@ struct Args {
     index: usize,
     /// The one exclusive scenario to run, when set.
     only: String,
+    /// The scenarios `step` and `verify` take, or every scenario when empty.
+    scenarios: Vec<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -60,6 +64,7 @@ fn parse_args() -> Result<Args, String> {
         run: String::new(),
         index: 0,
         only: String::new(),
+        scenarios: Vec::new(),
     };
 
     while let Some(flag) = args.next() {
@@ -68,6 +73,13 @@ fn parse_args() -> Result<Args, String> {
             "--backend" => parsed.backend = value,
             "--run" => parsed.run = value,
             "--only" => parsed.only = value,
+            "--scenarios" => {
+                parsed.scenarios = if value.is_empty() {
+                    Vec::new()
+                } else {
+                    value.split(',').map(String::from).collect()
+                }
+            }
             "--index" => {
                 parsed.index = value
                     .parse()
@@ -100,12 +112,18 @@ fn selected(scenario: &evt_compat::Scenario, only: &str) -> bool {
     scenario.exclusive && scenario.name == only
 }
 
+/// Reports whether `--scenarios` takes the scenario: every scenario when the list is empty.
+fn listed(scenario: &evt_compat::Scenario, scenarios: &[String]) -> bool {
+    scenarios.is_empty() || scenarios.contains(&scenario.name)
+}
+
 async fn step<R, H, V, F>(
     repository: R,
     access: (H, V, F),
     run: &str,
     index: usize,
     only: &str,
+    listed_scenarios: &[String],
 ) -> Result<Failures, BoxError>
 where
     R: Repository + EventLog,
@@ -117,7 +135,8 @@ where
     let scenarios = Scenarios::load()?;
     let mut failures = Vec::new();
 
-    for scenario in scenarios.scenarios.iter().filter(|s| selected(s, only)) {
+    let taken = |s: &&evt_compat::Scenario| selected(s, only) && listed(s, listed_scenarios);
+    for scenario in scenarios.scenarios.iter().filter(taken) {
         let Some(step) = scenario.steps.get(index).filter(|step| step.by == WRITER) else {
             continue;
         };
@@ -316,12 +335,20 @@ fn comparable_outcome(row: OutcomeRow) -> Result<ComparableOutcome, BoxError> {
     ))
 }
 
-async fn verify(backend: Backend, run: &str) -> Result<Failures, BoxError> {
+async fn verify(
+    backend: Backend,
+    run: &str,
+    listed_scenarios: &[String],
+) -> Result<Failures, BoxError> {
     let scenarios = Scenarios::load()?;
     let fixtures = ScenarioFixtures::load()?;
     let mut failures = Vec::new();
 
-    for scenario in &scenarios.scenarios {
+    for scenario in scenarios
+        .scenarios
+        .iter()
+        .filter(|s| listed(s, listed_scenarios))
+    {
         let expected = fixtures
             .for_run(&scenario.name, run)
             .ok_or_else(|| format!("no fixture for {}", scenario.name))?;
@@ -528,6 +555,16 @@ async fn run(args: Args) -> Result<Failures, BoxError> {
         return Err("--run is required".into());
     }
 
+    // A name that is no scenario fails, so a typo can't leave a scenario unchecked.
+    let known = Scenarios::load()?;
+    if let Some(name) = args
+        .scenarios
+        .iter()
+        .find(|name| !known.scenarios.iter().any(|s| &s.name == *name))
+    {
+        return Err(format!("--scenarios names {name:?}, which is no scenario").into());
+    }
+
     let backend = connect(&args.backend).await?;
 
     match (args.command.as_str(), backend) {
@@ -538,7 +575,8 @@ async fn run(args: Args) -> Result<Failures, BoxError> {
                 repository.clone(),
             );
 
-            step(repository, access, &args.run, args.index, &args.only).await
+            let (run, only) = (&args.run, &args.only);
+            step(repository, access, run, args.index, only, &args.scenarios).await
         }
         ("step", Backend::Postgres(repository)) => {
             let access = (
@@ -547,9 +585,10 @@ async fn run(args: Args) -> Result<Failures, BoxError> {
                 repository.clone(),
             );
 
-            step(repository, access, &args.run, args.index, &args.only).await
+            let (run, only) = (&args.run, &args.only);
+            step(repository, access, run, args.index, only, &args.scenarios).await
         }
-        ("verify", backend) => verify(backend, &args.run).await,
+        ("verify", backend) => verify(backend, &args.run, &args.scenarios).await,
         ("enumerate", Backend::Dynamo(repository)) => enumerate(&repository, &args.run).await,
         ("enumerate", Backend::Postgres(repository)) => enumerate(&repository, &args.run).await,
         (other, _) => Err(format!("unknown command {other}").into()),

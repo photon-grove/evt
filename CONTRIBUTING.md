@@ -75,7 +75,8 @@ With both stacks up, `moon run evt-rust:integration evt-rust:integration-postgre
 conformance suite and the Go/Rust cross-language suite against each backend, and on PostgreSQL
 also the live parity checks in `crates/evt-compat/tests/postgres_atomicity.rs`. The cross-language
 half is `scripts/compat-integration.sh dynamo` and `scripts/compat-integration.sh postgres`, where
-Go and Rust take turns writing the same streams.
+Go and Rust take turns writing the same streams. On DynamoDB, the TypeScript driver first stands in
+for Go, and then for Rust, in the scenarios it supports.
 
 ## Storage format changes
 

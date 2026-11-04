@@ -32,7 +32,8 @@ jobs:
       # rust: the Rust crates and the shared compatibility fixtures.
       # ts: the TypeScript packages and the shared compatibility fixtures.
       # compat: anything that can change the shared storage format, which runs the
-      # cross-language suite against live backends.
+      # cross-language suite against live backends. The TypeScript packages set it too, since the
+      # TypeScript driver writes in that suite's DynamoDB run.
       - name: Classify changed files
         id: classify
         env:
@@ -66,7 +67,7 @@ jobs:
               .moon/* | package.json | pnpm-lock.yaml | pnpm-workspace.yaml)
                 go=true rust=true ts=true ;;
               packages/evt/* | packages/evt-compat/*)
-                ts=true ;;
+                ts=true compat=true ;;
               .prototools)
                 # It pins Go and golangci-lint, and Bun and Deno for the TypeScript job.
                 go=true ts=true ;;
