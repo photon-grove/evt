@@ -391,12 +391,21 @@ func DecodeRecordedIdentity(id CommandID, commandType, targets, principal *strin
 		return nil, corrupt("the recorded identity has a command type but no targets")
 	}
 
-	var decoded []EntityID
+	// Elements decode through pointers, so a null element is told apart from an empty string.
+	var decoded []*string
 	if err := json.Unmarshal([]byte(*targets), &decoded); err != nil || decoded == nil {
 		return nil, corrupt(fmt.Sprintf("the recorded targets are not a JSON array of strings: %q", *targets))
 	}
 
-	identity := &RecordedIdentity{Type: CommandType(*commandType), Targets: decoded}
+	identity := &RecordedIdentity{Type: CommandType(*commandType), Targets: make([]EntityID, 0, len(decoded))}
+	for _, target := range decoded {
+		if target == nil {
+			return nil, corrupt(fmt.Sprintf("the recorded targets hold a null: %q", *targets))
+		}
+
+		identity.Targets = append(identity.Targets, EntityID(*target))
+	}
+
 	if principal != nil {
 		value := PrincipalID(*principal)
 		identity.Principal = &value
@@ -1153,6 +1162,7 @@ func OutcomeItemSize(outcome Outcome, events []SerializedEvent) (int, error) {
 
 // OutcomeFromAttributes rebuilds an Outcome from the string attributes of a stored outcome item
 // (status, digest, response, events, rejection). Missing attributes decode to their empty values.
+// It leaves Identity nil: decode the recorded identity attributes with DecodeRecordedIdentity.
 // The command ID comes from the key, not the item.
 // A row that is not a valid outcome (see ValidateStoredOutcome) is a *CorruptOutcomeError.
 func OutcomeFromAttributes(id CommandID, status, digest, response, events, rejection string) (Outcome, error) {

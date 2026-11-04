@@ -87,6 +87,27 @@ func testIdentityRecorded(t *testing.T, repo evt.OutcomeRepository) {
 	require.NoError(t, err)
 	require.Equal(t, &evt.RecordedIdentity{Type: "ledger:audit", Targets: []evt.EntityID{}}, storedIdentity(t, repo, noop))
 
+	// The engine's own rejections record the identity too: a caller-stamped fence already stale
+	// persists the stale-fence rejection through the outcome-only transaction.
+	stale := env.commandID("stale")
+	staleIdentity := evt.CommandIdentity{Type: "ledger:rename", Targets: []evt.EntityID{first}}
+	outcome, err := env.store.ExecuteTransaction(ctx, staleIdentity, withPrincipal(stale, "user:9"),
+		func(_ context.Context, tx *snapshots.Transaction) ([]byte, error) {
+			return nil, tx.Fence(evt.ReadFence{EntityID: second, EntityType: ledgerType, Head: 9})
+		})
+	require.NoError(t, err)
+	require.Equal(t, evt.RejectionStaleFence, outcome.Rejection.Code)
+	require.Equal(t, &evt.RecordedIdentity{Type: "ledger:rename", Targets: []evt.EntityID{first}, Principal: principalOf("user:9")},
+		storedIdentity(t, repo, stale))
+
+	// So does a command driven by hand.
+	manual := env.commandID("manual")
+	tx, _, err := env.store.BeginCommand(ctx, evt.CommandIdentity{Type: "ledger:touch", Targets: []evt.EntityID{second}}, withCommand(manual))
+	require.NoError(t, err)
+	_, err = tx.Complete(ctx, nil)
+	require.NoError(t, err)
+	require.Equal(t, &evt.RecordedIdentity{Type: "ledger:touch", Targets: []evt.EntityID{second}}, storedIdentity(t, repo, manual))
+
 	// A replay returns the identity it recorded.
 	replayed, err := env.store.ExecuteWithOutcome(ctx, newLedger(env.id), env.id,
 		&ledgerCommand{Kind: "deposit", Amount: 1}, withPrincipal(single, "user:42"))
@@ -139,6 +160,23 @@ func testResolveForPrincipal(t *testing.T, repo evt.OutcomeRepository) {
 	absent, err := env.store.ResolveCommandForPrincipal(ctx, env.commandID("absent"), principalOf("user:42"))
 	require.NoError(t, err)
 	require.Nil(t, absent)
+
+	// An empty principal is no principal, as the row records it.
+	found, err = env.store.ResolveCommandForPrincipal(ctx, anonymous, principalOf(""))
+	require.NoError(t, err)
+	require.True(t, found.Replayed)
+
+	// Invalid input is refused before any read.
+	_, err = env.store.ResolveCommandForPrincipal(ctx, evt.CommandID(strings.Repeat("x", evt.MaxCommandIDBytes+1)), nil)
+
+	var tooLong *evt.CommandIDTooLongError
+	require.ErrorAs(t, err, &tooLong)
+
+	_, err = env.store.ResolveCommandForPrincipal(ctx, owned, principalOf("user\x00"))
+	require.ErrorIs(t, err, evt.ErrInvalidArgument, "a NUL in the principal")
+
+	_, err = snapshots.NewStore(repo, 0).ResolveCommandForPrincipal(ctx, owned, nil)
+	require.ErrorIs(t, err, evt.ErrInvalidArgument, "a store without outcomes")
 }
 
 func testIdentityLegacyRow(t *testing.T, repo evt.OutcomeRepository) {

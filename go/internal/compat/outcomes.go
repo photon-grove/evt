@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -33,6 +34,9 @@ type OutcomeFixtures struct {
 	// MalformedRows are outcome items no reader may replay: each must fail to decode in every
 	// language as a corrupt record.
 	MalformedRows []MalformedRow `json:"malformedRows"`
+
+	// IdentityBounds pin the recorded identity's bound, escapes counted.
+	IdentityBounds []IdentityBoundVector `json:"identityBounds"`
 
 	// RejectionNumbers pin the canonical text of the numbers in a stored rejection.
 	RejectionNumbers []RejectionNumberVector `json:"rejectionNumbers"`
@@ -264,6 +268,15 @@ func GenerateOutcomeFixtures() (OutcomeFixtures, error) {
 			CommandID: "cmd-0013", Status: evt.OutcomeAccepted, Digest: "d",
 			Identity: identity("non-ASCII and HTML-sensitive payload"),
 		}},
+		// The targets JSON escapes <, >, & and U+2028 exactly as the shared JSON rules do.
+		{"accepted, HTML-sensitive recorded identity", evt.Outcome{
+			CommandID: "cmd-0014", Status: evt.OutcomeAccepted, Digest: "d",
+			Identity: evt.RecordedIdentityOf(evt.DigestInput{
+				CommandType: "note:add<é>",
+				Targets:     []evt.EntityID{"x\u2028y", "a<b>&c", "naïve#1"},
+				Principal:   "user:<é>",
+			}),
+		}},
 		{"rejected stale fence, retries exhausted", evt.Outcome{
 			CommandID: "cmd-0009", Status: evt.OutcomeRejected, Digest: renameDigest, Rejection: &exhausted,
 			Identity: identity("rename, state-derived write set is not identity"),
@@ -306,6 +319,10 @@ func GenerateOutcomeFixtures() (OutcomeFixtures, error) {
 
 	fixtures.MalformedRows = malformedRows()
 
+	if fixtures.IdentityBounds, err = identityBounds(); err != nil {
+		return fixtures, err
+	}
+
 	numbers, err := rejectionNumbers()
 	if err != nil {
 		return fixtures, err
@@ -314,6 +331,58 @@ func GenerateOutcomeFixtures() (OutcomeFixtures, error) {
 	fixtures.RejectionNumbers = numbers
 
 	return fixtures, nil
+}
+
+// IdentityBoundVector is a recorded identity at the edge of its bound: Size is the bytes the bound
+// counts (the command type, the principal, and the encoded targets, escapes included), and Error is
+// "outcome-too-large" when CheckOutcome refuses it, empty when it passes.
+type IdentityBoundVector struct {
+	Name     string         `json:"name"`
+	Identity IdentityVector `json:"identity"`
+	Size     int            `json:"size"`
+	Error    string         `json:"error,omitempty"`
+}
+
+// identityBounds pins the bound at exactly MaxOutcomeBytes and one byte past it, with a thousand
+// < characters whose escapes (\u003c, six bytes each) count toward it.
+func identityBounds() ([]IdentityBoundVector, error) {
+	vectors := make([]IdentityBoundVector, 0, 2)
+
+	for _, test := range []struct {
+		name  string
+		extra int
+	}{{"at the bound", 0}, {"one byte past the bound", 1}} {
+		// "t" + `["` + 1000 × \u003c + filler + `"]` = 1 + 4 + 6000 + filler.
+		target := strings.Repeat("<", 1000) + strings.Repeat("a", evt.MaxOutcomeBytes-6005+test.extra)
+		identity := &evt.RecordedIdentity{Type: "t", Targets: []evt.EntityID{evt.EntityID(target)}}
+
+		encoded, err := identity.EncodeTargets()
+		if err != nil {
+			return nil, err
+		}
+
+		vector := IdentityBoundVector{
+			Name:     test.name,
+			Identity: IdentityVector{CommandType: "t", Targets: []string{target}},
+			Size:     len(identity.Type) + len(encoded),
+		}
+
+		err = evt.CheckOutcome(&evt.Outcome{CommandID: "c", Status: evt.OutcomeAccepted, Digest: "d", Identity: identity})
+
+		var tooLarge *evt.OutcomeTooLargeError
+
+		switch {
+		case err == nil:
+		case errors.As(err, &tooLarge) && tooLarge.What == "identity":
+			vector.Error = "outcome-too-large"
+		default:
+			return nil, fmt.Errorf("%s: %w", test.name, err)
+		}
+
+		vectors = append(vectors, vector)
+	}
+
+	return vectors, nil
 }
 
 // rejectionNumbers builds the canonical-number vectors from literal inputs, which DecodeRejection

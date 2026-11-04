@@ -118,7 +118,7 @@ func (store *Store) ResolveCommand(
 }
 
 // ResolveCommandForPrincipal reads a command's outcome row by command ID alone and answers it for
-// the asking principal (nil when there is none), for a caller that cannot rebuild the command's full
+// the asking principal (nil or empty when there is none), for a caller that cannot rebuild the command's full
 // identity. Nothing is run or written. It returns the stored outcome (Replayed) when the row's
 // recorded principal is the asking one (both absent counts as equal), nil, nil when the command has
 // no outcome, and *evt.OutcomePrincipalMismatchError otherwise: with Recorded true for a row of
@@ -137,6 +137,11 @@ func (store *Store) ResolveCommandForPrincipal(
 
 	if err = evt.CheckCommandID(commandID); err != nil {
 		return nil, err
+	}
+
+	// An empty principal is no principal, as an outcome row records it.
+	if principal != nil && *principal == "" {
+		principal = nil
 	}
 
 	if principal != nil {

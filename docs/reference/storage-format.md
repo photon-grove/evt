@@ -996,18 +996,23 @@ compare digests only, as before.
   command that names no stream, and `["claim#ada","profile#u-1"]` for the multi-stream example.
 - `principal` is the metadata's `principalId`. It is absent when the command had none, so a
   recorded row without `principal` belongs to a command with no principal.
-- A row without `commandType` (written before the fields existed) records no identity. Readers
+- A row with none of the three fields (written before they existed) records no identity. Readers
   accept it; it decodes with no recorded identity (Go: `Outcome.Identity == nil`; Rust:
-  `Outcome::identity` is `None`). A row with `commandType` but without `targets`, or with a
-  `targets` value that is not a JSON array of strings, is a malformed row (`CorruptOutcome` /
-  `InvalidRecord`).
+  `Outcome::identity` is `None`). Every other combination is a malformed row (`CorruptOutcome` /
+  `InvalidRecord`): `targets` or `principal` without `commandType`, `commandType` without
+  `targets`, or a `targets` value that is not a JSON array of strings (`null`, an object, or an
+  array holding a `null` or another non-string).
 - Every row the engine writes records its identity: accepted, rejected, the accepted no-op, the
   stale-fence and stale-version rejections the outcome-only transaction persists, and an oversized
   journal row's rejection. A custom digester changes the digest, not the recorded identity.
 - The three fields together are bounded before any write: the UTF-8 bytes of `commandType`,
-  `principal`, and the encoded `targets` array may total at most 65536 bytes, or the command fails
-  with `OutcomeTooLarge` and writes nothing, in both languages and on every backend. They count
-  toward the outcome item's size in the [commit budget](#writes).
+  `principal`, and the encoded `targets` array (escapes included, so `<` counts six bytes as
+  `\u003c`) may total at most 65536 bytes, or the command fails with `OutcomeTooLarge` and writes
+  nothing, in both languages and on every backend. The check runs when the outcome is committed,
+  after the handler or prepare step, so a command whose targets are that large, which committed
+  before the fields existed, now fails. `compat/fixtures/outcomes.json` pins the bound under
+  `identityBounds`. The fields count toward the outcome item's size in the
+  [commit budget](#writes).
 
 The recorded identity backs a lookup by command ID and principal (Go
 `Store.ResolveCommandForPrincipal(ctx, commandID, principal)`, Rust
@@ -1016,8 +1021,9 @@ the full identity. It reads the row like the pre-check and writes nothing:
 
 - No row: not found (`nil, nil` / `Ok(None)`). As for every outcome read, that is not proof the
   command did not apply.
-- A row whose recorded principal equals the asking principal (both absent counts as equal): the
-  stored outcome, marked replayed.
+- A row whose recorded principal equals the asking principal (both absent counts as equal, and an
+  empty asking principal is absent, as the writer records it): the stored outcome, marked
+  replayed.
 - A row with another principal: the typed `OutcomePrincipalMismatch` error (Go
   `*evt.OutcomePrincipalMismatchError`, `errors.Is(err, evt.ErrOutcomePrincipalMismatch)`; Rust
   `Error::OutcomePrincipalMismatch`), carrying the command ID and `recorded = true`, and never the
@@ -3312,11 +3318,19 @@ CREATE TABLE IF NOT EXISTS evt_events__evt_command_outcomes (
 
 -- A table created before the recorded identity gains its columns, so both shapes end up identical.
 -- The columns carry no constraint: readers enforce the rules (Recorded identity), as they do on
--- DynamoDB.
-ALTER TABLE evt_events__evt_command_outcomes
-    ADD COLUMN IF NOT EXISTS command_type text,
-    ADD COLUMN IF NOT EXISTS targets      jsonb,
-    ADD COLUMN IF NOT EXISTS principal    text;
+-- DynamoDB. The catalog check comes first, so a table that has them takes no lock.
+DO $$
+BEGIN
+    IF (SELECT count(*) FROM pg_attribute
+        WHERE attrelid = 'evt_events__evt_command_outcomes'::regclass
+          AND attname IN ('command_type', 'targets', 'principal')
+          AND NOT attisdropped) < 3 THEN
+        ALTER TABLE evt_events__evt_command_outcomes
+            ADD COLUMN IF NOT EXISTS command_type text,
+            ADD COLUMN IF NOT EXISTS targets      jsonb,
+            ADD COLUMN IF NOT EXISTS principal    text;
+    END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS evt_events__evt_features (
     id                integer PRIMARY KEY,
@@ -3441,9 +3455,12 @@ v0.9 rows. The DynamoDB items of [Command outcomes](#command-outcomes),
   `command_type`, `targets` (a `jsonb` array) and `principal` are the
   [recorded identity](#recorded-identity), `NULL` exactly where the DynamoDB attributes are
   absent. They were added after v0.9: `EnsureSchema` / `ensure_schema` / `ensureSchema` adds them
-  to an existing table with `ADD COLUMN IF NOT EXISTS` under the schema lock, and every row
-  already in the table keeps `NULL` (no identity recorded). An older writer's inserts, which name
-  none of the columns, stay valid, so writers can be upgraded one at a time after the schema. The
+  to an existing table with `ADD COLUMN IF NOT EXISTS` under the schema lock, after a catalog check
+  so a table that has them takes no `ACCESS EXCLUSIVE` lock, and every row already in the table
+  keeps `NULL` (no identity recorded). A writer that records the identity reads and writes the
+  columns on every command and fails (writing nothing) on a table that lacks them, so the schema
+  step must run before such writers. An older writer's inserts, which name none of the columns,
+  stay valid, so writers can be upgraded one at a time after the schema. The
   `CHECK` constraints mirror the once-in-final-state rule. The outcome insert is a plain `INSERT`
   into the commit transaction. A unique violation (`23505`) on the outcomes table means another
   writer recorded the outcome first: the commit is ambiguous, and the caller recovers by

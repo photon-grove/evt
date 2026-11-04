@@ -217,7 +217,11 @@ describe('PgRepository', () => {
     expect(statements).toHaveLength(11)
     const ddl = log.slice(log.indexOf('START TRANSACTION ISOLATION LEVEL READ COMMITTED') + 2, -1)
     expect(ddl.every((text) => /^(CREATE|DO|ALTER) /.test(text))).toBe(true)
-    expect(ddl.filter((text) => text.startsWith('ALTER TABLE orders__evt_command_outcomes'))).toHaveLength(1)
+    // The recorded-identity columns are added by a guarded DO block, so a schema that has them takes
+    // no lock on the outcomes table.
+    const upgrade = ddl.filter((text) => text.includes('ALTER TABLE orders__evt_command_outcomes'))
+    expect(upgrade).toHaveLength(1)
+    expect(upgrade[0]).toMatch(/^DO \$\$\nBEGIN\n    IF \(SELECT count\(\*\) FROM pg_attribute/)
     expect(ddl.find((text) => text.startsWith('DO '))).toMatch(/END IF;\nEND \$\$$/)
   })
 

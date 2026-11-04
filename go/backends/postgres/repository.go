@@ -315,10 +315,18 @@ CREATE TABLE IF NOT EXISTS %[1]s__evt_command_outcomes (
            OR (status = 'accepted' AND rejection IS NULL AND code IS NULL))
 );
 
-ALTER TABLE %[1]s__evt_command_outcomes
-    ADD COLUMN IF NOT EXISTS command_type text,
-    ADD COLUMN IF NOT EXISTS targets      jsonb,
-    ADD COLUMN IF NOT EXISTS principal    text;
+DO $$
+BEGIN
+    IF (SELECT count(*) FROM pg_attribute
+        WHERE attrelid = '%[1]s__evt_command_outcomes'::regclass
+          AND attname IN ('command_type', 'targets', 'principal')
+          AND NOT attisdropped) < 3 THEN
+        ALTER TABLE %[1]s__evt_command_outcomes
+            ADD COLUMN IF NOT EXISTS command_type text,
+            ADD COLUMN IF NOT EXISTS targets      jsonb,
+            ADD COLUMN IF NOT EXISTS principal    text;
+    END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS %[1]s__evt_features (
     id                integer PRIMARY KEY,
