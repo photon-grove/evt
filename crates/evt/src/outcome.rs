@@ -1235,7 +1235,8 @@ pub(crate) async fn pre_check<R: Repository>(
 
 /// Resolves the result of a commit that carried an outcome:
 ///
-/// - a lost outcome put ([`Error::OutcomeConflict`]) resolves through the winner's row;
+/// - a lost outcome put ([`Error::OutcomeConflict`]) resolves through the winner's row, or is a
+///   retryable [`Error::Transient`] when the row cannot be read within the recovery `window`;
 /// - an indeterminate failure ([`Error::Indeterminate`], which backends return only for a commit
 ///   whose result is genuinely unknown) is recovered by polling the row for the recovery
 ///   `window` (bounded backoff via [`Repository::backoff`]): present with the same digest, the

@@ -1985,10 +1985,25 @@ mod tests {
                 .await
                 .unwrap();
             assert!(outcome.replayed, "{outcome:?}");
+            assert_eq!(
+                repository.reads.load(std::sync::atomic::Ordering::SeqCst),
+                3,
+                "the first pre-read, the stalled reread, and the second attempt's pre-read"
+            );
+            assert_eq!(
+                repository
+                    .inner
+                    .events(&EntityId::new("c-1"))
+                    .await
+                    .unwrap()
+                    .len(),
+                1,
+                "committed once"
+            );
         }
 
         #[tokio::test]
-        async fn a_read_that_succeeds_ends_the_failed_read_before_it() {
+        async fn a_failed_read_ends_only_when_its_stream_is_read() {
             use std::sync::atomic::{AtomicUsize, Ordering};
 
             use crate::{CommandIdentity, Decision};
@@ -2004,23 +2019,55 @@ mod tests {
                 .with_snapshot_interval(0)
                 .with_outcomes(OutcomeConfig::new().with_retry(RetryPolicy::immediate(3)));
             let identity = CommandIdentity::new("counter:check").with_targets(["c-1", "c-2"]);
-            let calls = AtomicUsize::new(0);
 
-            // The step recovers from a failed read, reads another stream, then fails with an error
-            // identical to the first: that is its own failure now, returned without a retry.
+            // Reading another stream first does not end the failure: a step that reads every
+            // target before it passes the errors on is still retried.
+            let calls = AtomicUsize::new(0);
             let result = store
-                .execute_transaction(&identity, &command("recovered"), |tx| {
+                .execute_transaction(&identity, &command("other"), |tx| {
                     calls.fetch_add(1, Ordering::SeqCst);
 
                     Box::pin(async move {
-                        let failed = tx.read::<Counter>("c-1").await.unwrap_err();
+                        let first = tx.read::<Counter>("c-1").await;
                         tx.read::<Counter>("c-2").await?;
+                        first?;
+
+                        Ok(Decision::accept())
+                    })
+                })
+                .await;
+            assert!(
+                matches!(&result, Err(Error::SequenceGap { .. })),
+                "{result:?}"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                3,
+                "retried like a load failure"
+            );
+
+            // Reading the failed stream itself does: the step recovered, so an identical error it
+            // returns afterwards is its own, returned without a retry.
+            let mut recovered = Some(
+                Store::<Counter, _>::new(&inner, ())
+                    .load("c-1")
+                    .await
+                    .unwrap(),
+            );
+            let calls = AtomicUsize::new(0);
+            let result = store
+                .execute_transaction(&identity, &command("same"), |tx| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let loaded = recovered.take().expect("one attempt");
+
+                    Box::pin(async move {
+                        let failed = tx.read::<Counter>("c-1").await.unwrap_err();
+                        tx.read_loaded(loaded)?;
 
                         Err::<Decision, _>(failed)
                     })
                 })
                 .await;
-
             assert!(
                 matches!(&result, Err(Error::SequenceGap { .. })),
                 "{result:?}"
