@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.1](https://github.com/photon-grove/evt/compare/evt-ts-v0.1.0...evt-ts-v0.1.1) (2026-11-04)
+
+
+### Features
+
+* **ts:** add DynamoRepository to @photon-grove/evt/dynamodb ([#267](https://github.com/photon-grove/evt/issues/267)) ([e042fe5](https://github.com/photon-grove/evt/commit/e042fe551ee1d23c3c3a6a3f3ea3e04a6e5140a2))
+* **ts:** add retention TTL to DynamoRepository ([#269](https://github.com/photon-grove/evt/issues/269)) ([964723c](https://github.com/photon-grove/evt/commit/964723c324a4973bc971604d3ced1345385d5b72))
+* **ts:** validate the feature marker and check the rebuild lock in MemRepository ([#265](https://github.com/photon-grove/evt/issues/265)) ([315387a](https://github.com/photon-grove/evt/commit/315387a563fd3bab0871c99316d83a5c3d32a63a))
+
 ## 0.1.0 (2026-11-02)
 
 
