@@ -57,7 +57,8 @@ tasks:
   test:
     script: >-
       pnpm run test && node ../evt-compat/dist/fixtures.js && node ../evt-compat/dist/memory.js &&
-      node -e "require('@photon-grove/evt'); require('@photon-grove/evt/dynamodb'); require('@photon-grove/evt/memory'); require('@photon-grove/evt/testing')"
+      node -e "require('@photon-grove/evt'); require('@photon-grove/evt/dynamodb'); require('@photon-grove/evt/memory'); require('@photon-grove/evt/postgres');
+      require('@photon-grove/evt/testing')"
     deps:
       - build-compat
     inputs:

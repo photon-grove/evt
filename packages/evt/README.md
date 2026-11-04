@@ -11,9 +11,9 @@ held to the fixtures Go and Rust generate, byte for byte.
 npm install @photon-grove/evt
 ```
 
-So far it has the core, the in-memory and DynamoDB backends, and the testing helpers. Commit-wide
-projectors, the PostgreSQL backend, command outcomes and multi-stream transactions come in later
-releases, and the
+So far it has the core, the in-memory and DynamoDB backends, the PostgreSQL schema, and the testing
+helpers. Commit-wide projectors, the PostgreSQL repository, command outcomes and multi-stream
+transactions come in later releases, and the
 [feature matrix](https://github.com/photon-grove/evt/blob/main/docs/reference/feature-matrix.md)
 tracks each one. The
 [getting started guide](https://github.com/photon-grove/evt/blob/main/docs/guide/getting-started.md#the-same-model-in-typescript)
@@ -27,6 +27,7 @@ builds a bank account aggregate with it, end to end.
 | `@photon-grove/evt/memory`   | `MemRepository`, the in-memory backend for tests and local development     |
 | `@photon-grove/evt/testing`  | `scenario` and `Fixture`, the given/when/then helpers over `MemRepository` |
 | `@photon-grove/evt/dynamodb` | `DynamoRepository`, `viewProjector`, and the item and request codecs       |
+| `@photon-grove/evt/postgres` | The PostgreSQL schema: table names, derived relations and `schemaDdl`      |
 
 ## DynamoDB
 
