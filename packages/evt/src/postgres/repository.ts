@@ -686,11 +686,11 @@ function transient(error: unknown): unknown {
 }
 
 // The statements of a DDL script, one at a time, since a driver's extended protocol runs one per
-// call. Each ends at a semicolon that ends its line and comes before a blank line, a CREATE, a DO
-// or the end, which no statement inside the DO block's body is followed by.
+// call. Each ends at a semicolon that ends its line and comes before a blank line, a CREATE, an
+// ALTER, a DO or the end, which no statement inside the DO block's body is followed by.
 function statements(ddl: string): string[] {
   return ddl
-    .split(/;\n(?=\n|CREATE |DO |$)/)
+    .split(/;\n(?=\n|CREATE |ALTER |DO |$)/)
     .map((statement) => statement.trim())
     .filter((statement) => statement !== '')
 }

@@ -176,9 +176,17 @@ CREATE TABLE IF NOT EXISTS ${outcomesTable(tables)} (
     rejection  jsonb,
     code       text,
     created_at timestamptz NOT NULL DEFAULT now(),
+    command_type text,
+    targets      jsonb,
+    principal    text,
     CHECK ((status = 'rejected' AND rejection IS NOT NULL AND code IS NOT NULL)
            OR (status = 'accepted' AND rejection IS NULL AND code IS NULL))
 );
+
+ALTER TABLE ${outcomesTable(tables)}
+    ADD COLUMN IF NOT EXISTS command_type text,
+    ADD COLUMN IF NOT EXISTS targets      jsonb,
+    ADD COLUMN IF NOT EXISTS principal    text;
 
 CREATE TABLE IF NOT EXISTS ${featuresTable(tables)} (
     id                integer PRIMARY KEY,

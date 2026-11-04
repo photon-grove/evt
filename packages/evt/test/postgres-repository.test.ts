@@ -214,9 +214,10 @@ describe('PgRepository', () => {
 
     const statements = transaction(log).slice(1, -1)
     expect(statements[0]).toBe('SELECT pg_advisory_xact_lock(1702261762, hashtext($1))')
-    expect(statements).toHaveLength(10)
+    expect(statements).toHaveLength(11)
     const ddl = log.slice(log.indexOf('START TRANSACTION ISOLATION LEVEL READ COMMITTED') + 2, -1)
-    expect(ddl.every((text) => /^(CREATE|DO) /.test(text))).toBe(true)
+    expect(ddl.every((text) => /^(CREATE|DO|ALTER) /.test(text))).toBe(true)
+    expect(ddl.filter((text) => text.startsWith('ALTER TABLE orders__evt_command_outcomes'))).toHaveLength(1)
     expect(ddl.find((text) => text.startsWith('DO '))).toMatch(/END IF;\nEND \$\$$/)
   })
 
