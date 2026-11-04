@@ -244,37 +244,56 @@ func (store *Store) run(
 
 // captureAggregate remembers a pointer-to-struct entity's value so a later reset puts back what the
 // caller supplied, discarding events applied locally. The copy is deep over the entity's exported
-// fields — every map, slice, pointer, and nested struct — because those are exactly the state a
-// snapshot persists, so state a constructor initialized (a labels map, say) cannot be aliased and
-// kept dirty by Apply. Unexported fields are copied shallowly. Any other entity kind cannot be
-// reset: resettable is false and reset does nothing.
+// fields — every map, slice, pointer, and nested struct, including the fields promoted from an
+// embedded struct of an unexported type — because those are exactly the state a snapshot persists,
+// so state a constructor initialized (a labels map, say) cannot be aliased and kept dirty by Apply.
+// Other unexported fields, and an embedded pointer to an unexported type, are copied shallowly, and a
+// pointer back to the entity itself stays one. A dependency held in an exported field (a client, a
+// lock) is copied like state, so keep dependencies in unexported fields. Any other entity kind
+// cannot be reset: resettable is false and reset does nothing.
 func captureAggregate(aggregate evt.Aggregate) (reset func(), resettable bool) {
 	value := reflect.ValueOf(aggregate)
 	if !value.IsValid() || value.Kind() != reflect.Pointer || value.IsNil() || value.Elem().Kind() != reflect.Struct {
 		return func() {}, false
 	}
 
-	saved := deepCopy(value.Elem(), map[uintptr]reflect.Value{})
+	// A field that points back at the aggregate itself keeps pointing at the caller's aggregate,
+	// not at a detached copy of it.
+	root := func() copied { return copied{{typ: value.Type(), ptr: value.Pointer()}: value} }
+	saved := deepCopy(value.Elem(), root())
 
 	// Each reset installs a fresh copy, so a later attempt cannot alias what an earlier one saved.
-	return func() { value.Elem().Set(deepCopy(saved, map[uintptr]reflect.Value{})) }, true
+	return func() { value.Elem().Set(deepCopy(saved, root())) }, true
+}
+
+// copied remembers the copy made of each pointer, map, and slice, so a value that refers to itself
+// (through any of them) is copied once and its copy refers to itself the same way.
+type copied map[copiedKey]reflect.Value
+
+// copiedKey identifies shared storage: a slice is keyed by its length too, since two slices of
+// different lengths can start at the same address.
+type copiedKey struct {
+	typ    reflect.Type
+	ptr    uintptr
+	length int
 }
 
 // deepCopy returns a copy of v that shares no map, slice, or pointer storage with it, through its
-// exported fields. seen breaks pointer cycles.
-func deepCopy(v reflect.Value, seen map[uintptr]reflect.Value) reflect.Value {
+// exported fields (see captureAggregate).
+func deepCopy(v reflect.Value, seen copied) reflect.Value {
 	switch v.Kind() {
 	case reflect.Pointer:
 		if v.IsNil() {
 			return v
 		}
 
-		if copied, ok := seen[v.Pointer()]; ok {
-			return copied
+		key := copiedKey{typ: v.Type(), ptr: v.Pointer()}
+		if earlier, ok := seen[key]; ok {
+			return earlier
 		}
 
 		fresh := reflect.New(v.Type().Elem())
-		seen[v.Pointer()] = fresh
+		seen[key] = fresh
 		fresh.Elem().Set(deepCopy(v.Elem(), seen))
 
 		return fresh
@@ -284,7 +303,14 @@ func deepCopy(v reflect.Value, seen map[uintptr]reflect.Value) reflect.Value {
 			return v
 		}
 
+		key := copiedKey{typ: v.Type(), ptr: v.Pointer()}
+		if earlier, ok := seen[key]; ok {
+			return earlier
+		}
+
 		fresh := reflect.MakeMapWithSize(v.Type(), v.Len())
+		seen[key] = fresh
+
 		for iterator := v.MapRange(); iterator.Next(); {
 			fresh.SetMapIndex(deepCopy(iterator.Key(), seen), deepCopy(iterator.Value(), seen))
 		}
@@ -296,7 +322,16 @@ func deepCopy(v reflect.Value, seen map[uintptr]reflect.Value) reflect.Value {
 			return v
 		}
 
+		key := copiedKey{typ: v.Type(), ptr: v.Pointer(), length: v.Len()}
+		if earlier, ok := seen[key]; ok {
+			return earlier
+		}
+
 		fresh := reflect.MakeSlice(v.Type(), v.Len(), v.Len())
+		if v.Len() > 0 {
+			seen[key] = fresh
+		}
+
 		for i := range v.Len() {
 			fresh.Index(i).Set(deepCopy(v.Index(i), seen))
 		}
@@ -324,17 +359,29 @@ func deepCopy(v reflect.Value, seen map[uintptr]reflect.Value) reflect.Value {
 	case reflect.Struct:
 		fresh := reflect.New(v.Type()).Elem()
 		fresh.Set(v) // unexported fields, and every field's shallow value, first
-
-		for i := range v.NumField() {
-			if field := fresh.Field(i); field.CanSet() {
-				field.Set(deepCopy(v.Field(i), seen))
-			}
-		}
+		copyFields(fresh, v, seen)
 
 		return fresh
 
 	default:
 		return v
+	}
+}
+
+// copyFields deep-copies src's settable fields into dst, which already holds src's shallow value.
+// An embedded struct of an unexported type cannot be set as a whole, but the fields it promotes
+// can, as encoding/json sees them, so it is copied field by field.
+func copyFields(dst, src reflect.Value, seen copied) {
+	for i := range src.NumField() {
+		field := dst.Field(i)
+
+		switch {
+		case field.CanSet():
+			field.Set(deepCopy(src.Field(i), seen))
+
+		case src.Type().Field(i).Anonymous && field.Kind() == reflect.Struct:
+			copyFields(field, src.Field(i), seen)
+		}
 	}
 }
 
@@ -718,8 +765,17 @@ func (c *command) settle(ctx context.Context, commitErr error) (*evt.CommandOutc
 		// Another writer recorded this command ID first. Re-preparing can never resolve it; the
 		// winner's row does.
 		resolved, err := c.reread(context.WithoutCancel(ctx))
-		if err != nil {
+		if errors.Is(err, evt.ErrIdempotencyKeyReuse) || errors.Is(err, evt.ErrCorruptOutcome) || policy.IsPermanent(err) {
 			return nil, err
+		}
+
+		if err != nil {
+			// The row exists but this read failed (a timeout, say): the next attempt's outcome
+			// pre-read answers the command, so the failure is retryable.
+			return nil, &policy.ClassifiedError{
+				Class: policy.ClassTransient,
+				Err:   fmt.Errorf("read the outcome of command %s after another writer recorded it: %w", c.id, err),
+			}
 		}
 
 		if resolved == nil {
