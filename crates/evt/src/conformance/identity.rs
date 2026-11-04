@@ -136,6 +136,64 @@ async fn identity_recorded<R: Repository>(repo: &R) -> CaseResult {
         "a no-op's identity"
     );
 
+    // The engine's own rejections record the identity too: a caller-stamped fence already stale
+    // persists the stale-fence rejection through the outcome-only transaction.
+    let stale = command_id();
+    let outcome = store
+        .execute_transaction(
+            &CommandIdentity::new("ledger:rename").with_targets([b.clone()]),
+            &with_principal(&stale, "user:9"),
+            |tx| {
+                let a = a.clone();
+
+                Box::pin(async move {
+                    tx.fence(ReadFence::new(
+                        a,
+                        Ledger::TYPE,
+                        EventSequence(9),
+                        FenceProvenance::Caller,
+                    ))?;
+
+                    Ok(Decision::accept())
+                })
+            },
+        )
+        .await?;
+    ensure_eq!(
+        outcome.rejection().map(|rejection| rejection.code.clone()),
+        Some(crate::RejectionCode::STALE_FENCE),
+        "a stale caller fence is the stale-fence rejection"
+    );
+    ensure_eq!(
+        stored_identity(repo, &stale).await?,
+        recorded("ledger:rename", &[&b], Some("user:9")),
+        "a stale-fence rejection's identity"
+    );
+
+    // So does a command driven by hand.
+    let manual = command_id();
+    let mut tx = store.transaction();
+    match tx
+        .begin_command(
+            &CommandIdentity::new("ledger:touch").with_targets([a.clone()]),
+            &command_metadata(&manual),
+        )
+        .await?
+    {
+        Begin::Proceed => {}
+        Begin::Replayed(replayed) => {
+            return Err(Failure(format!(
+                "a new command is not replayed: {replayed:?}"
+            )));
+        }
+    }
+    tx.commit_with_outcome(None).await?;
+    ensure_eq!(
+        stored_identity(repo, &manual).await?,
+        recorded("ledger:touch", &[&a], None),
+        "a hand-driven command's identity"
+    );
+
     // A replay returns the identity it recorded.
     let replayed = store
         .execute_with_outcome(&id, Add(1), with_principal(&single, "user:42"))
@@ -207,6 +265,13 @@ async fn identity_resolve_for_principal<R: Repository>(repo: &R) -> CaseResult {
         "an absent command is not found: {absent:?}"
     );
 
+    // An empty principal is no principal, as the row records it.
+    let found = store
+        .resolve_command_for_principal(&anonymous, Some(&PrincipalId::new("")))
+        .await?
+        .ok_or_else(|| Failure("an empty principal finds a command without one".into()))?;
+    ensure!(found.replayed, "an empty principal matches no principal");
+
     // The command ID and principal are checked like a write's, before the read.
     expect_err(
         store
@@ -221,6 +286,13 @@ async fn identity_resolve_for_principal<R: Repository>(repo: &R) -> CaseResult {
             .await,
         "a principal with U+0000",
         |err| matches!(err, Error::InvalidArgument(_)),
+    )?;
+    expect_err(
+        Store::<Ledger, _>::new(repo, ())
+            .resolve_command_for_principal(&owned, None)
+            .await,
+        "a store without outcomes",
+        |err| matches!(err, Error::InvalidConfig(_)),
     )?;
 
     Ok(())

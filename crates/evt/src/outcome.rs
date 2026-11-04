@@ -432,20 +432,21 @@ impl RecordedIdentity {
             return corrupt("the recorded identity has a command type but no targets".into());
         };
 
-        // As Go's decoder takes it: a `null` element is the empty string, a `null` array is no
-        // array at all.
+        // Elements decode as options, so a `null` element is told apart from an empty string; a
+        // `null` array is no array at all.
         let Ok(decoded) = serde_json::from_str::<Vec<Option<String>>>(targets) else {
             return corrupt(format!(
                 "the recorded targets are not a JSON array of strings: {targets:?}"
             ));
         };
 
+        let Some(decoded) = decoded.into_iter().collect::<Option<Vec<String>>>() else {
+            return corrupt(format!("the recorded targets hold a null: {targets:?}"));
+        };
+
         Ok(Some(Self {
             command_type: command_type.to_owned(),
-            targets: decoded
-                .into_iter()
-                .map(|target| EntityId::new(target.unwrap_or_default()))
-                .collect(),
+            targets: decoded.into_iter().map(EntityId::new).collect(),
             principal: principal.map(PrincipalId::new),
         }))
     }
@@ -1708,6 +1709,13 @@ mod tests {
 
         assert_eq!(decode(None, None, None).unwrap(), None);
         assert_eq!(
+            decode(Some("t"), Some(r#"["a",""]"#), None)
+                .unwrap()
+                .map(|identity| identity.targets),
+            Some(vec![EntityId::new("a"), EntityId::new("")]),
+            "an empty target is not a null"
+        );
+        assert_eq!(
             decode(Some("t"), Some(r#"["a"]"#), Some("p")).unwrap(),
             Some(RecordedIdentity {
                 command_type: "t".into(),
@@ -1723,6 +1731,8 @@ mod tests {
             (Some("t"), Some("null"), None),
             (Some("t"), Some(r#"{"a":1}"#), None),
             (Some("t"), Some("[1]"), None),
+            (Some("t"), Some(r#"["a",null]"#), None),
+            (Some("t"), Some("[null]"), None),
         ] {
             assert!(
                 matches!(

@@ -606,6 +606,18 @@ struct OutcomeFixtures {
     malformed_rows: Vec<MalformedRow>,
     #[serde(default)]
     rejection_numbers: Vec<RejectionNumberVector>,
+    #[serde(default)]
+    identity_bounds: Vec<IdentityBoundVector>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IdentityBoundVector {
+    name: String,
+    identity: IdentityVector,
+    size: usize,
+    #[serde(default)]
+    error: String,
 }
 
 #[derive(Deserialize)]
@@ -867,11 +879,7 @@ fn outcome_rows_match_go_byte_for_byte() {
             }
         }
         outcome.event_ids = input.event_ids.iter().map(EventId::new).collect();
-        outcome.identity = input.identity.map(|identity| RecordedIdentity {
-            command_type: identity.command_type,
-            targets: identity.targets.iter().map(EntityId::new).collect(),
-            principal: identity.principal.map(PrincipalId::new),
-        });
+        outcome.identity = input.identity.map(recorded_identity);
 
         // The DynamoDB item, byte for byte, and its budget size.
         let item = dynamo::outcome_item(&outcome).unwrap();
@@ -919,6 +927,49 @@ fn outcome_rows_match_go_byte_for_byte() {
         });
         assert_eq!(pg, vector.postgres_row, "{name}: postgres row");
         assert_eq!(row.into_outcome().unwrap(), outcome, "{name}: decode row");
+    }
+}
+
+fn recorded_identity(identity: IdentityVector) -> RecordedIdentity {
+    RecordedIdentity {
+        command_type: identity.command_type,
+        targets: identity.targets.iter().map(EntityId::new).collect(),
+        principal: identity.principal.map(PrincipalId::new),
+    }
+}
+
+/// The recorded identity's bound counts the UTF-8 bytes of the command type, the principal, and
+/// the encoded targets, escapes included, and refuses one byte past 65536 exactly as Go does.
+#[test]
+fn the_recorded_identity_bound_matches_go() {
+    let vectors = outcome_fixtures().identity_bounds;
+    assert!(!vectors.is_empty());
+
+    for vector in vectors {
+        let name = &vector.name;
+        let identity = recorded_identity(vector.identity);
+
+        let size = identity.command_type.len()
+            + identity.encode_targets().unwrap().len()
+            + identity
+                .principal
+                .as_ref()
+                .map_or(0, |principal| principal.as_str().len());
+        assert_eq!(size, vector.size, "{name}: size");
+
+        let checked =
+            photon_evt::check_outcome(&Outcome::accepted("c", "d").with_identity(identity));
+        match vector.error.as_str() {
+            "" => assert!(checked.is_ok(), "{name}: {checked:?}"),
+            "outcome-too-large" => assert!(
+                matches!(
+                    checked,
+                    Err(Error::OutcomeTooLarge { what: "identity", size }) if size == vector.size
+                ),
+                "{name}: {checked:?}"
+            ),
+            other => panic!("{name}: unknown fixture error {other}"),
+        }
     }
 }
 

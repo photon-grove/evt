@@ -790,7 +790,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
     }
 
     /// Looks a command's outcome up by its command ID alone and answers it for the asking
-    /// principal (`None` when there is none), for a caller that cannot rebuild the command's full
+    /// principal (`None` or empty when there is none), for a caller that cannot rebuild the command's full
     /// identity. Nothing is run or written; the digest is not compared (use
     /// [`resolve_command`](Store::resolve_command) to check the full identity). It reads the
     /// command's outcome row (strongly consistent):
@@ -814,6 +814,8 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
         self.outcomes_config()?;
         check_command_id(command_id)?;
 
+        // An empty principal is no principal, as an outcome row records it.
+        let principal = principal.filter(|principal| !principal.is_empty());
         if let Some(principal) = principal {
             check_metadata(&Metadata::default().with_principal_id(principal.clone()))?;
         }
