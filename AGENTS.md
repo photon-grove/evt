@@ -119,7 +119,7 @@
 ## Tooling
 
 - Package manager: `pnpm` 10.x.
-- Node: 24.x, with Moon configured around Node `~24.5`. The TypeScript package also supports Node
+- Node: 26.x, with Moon configured around Node `~26.13`. The TypeScript package also supports Node
   22.12+, Bun and Deno, pinned in `.prototools` and in CI's TypeScript job.
 - Go toolchain: Go 1.26.4 via `go/go.mod`.
 - Rust toolchain: 1.99.0 via `rust-toolchain.toml` (crate MSRV 1.88, `rust-version` in `Cargo.toml`,

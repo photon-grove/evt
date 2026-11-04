@@ -3,6 +3,6 @@ go:
 javascript:
   packageManager: pnpm
 node:
-  version: '~24.5'
+  version: '~26.13'
 pnpm:
   version: '10'

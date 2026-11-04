@@ -87,7 +87,7 @@ The TypeScript example lives in `packages/evt/examples/`, with its tests beside 
   aggregate from `defineEvents` and `defineAggregate`, a `Store` over `MemRepository`, a
   rejection, and given/when/then tests from `@photon-grove/evt/testing`.
 
-  It runs on Node 24, which runs TypeScript files directly:
+  It runs on Node 26, which runs TypeScript files directly:
 
   ```sh
   pnpm --filter @photon-grove/evt run build
