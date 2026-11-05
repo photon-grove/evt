@@ -263,7 +263,7 @@ func Test_HasConditionalCheckFailure(t *testing.T) {
 	})
 }
 
-func Test_classifyCommitFailure_ATransactionConflictIsAnOptimisticConflict(t *testing.T) {
+func Test_classifyCommitFailure_ATransactionConflictIsTransientNotAConflict(t *testing.T) {
 	repo := &Repository{}
 
 	cancelled := &types.TransactionCanceledException{
@@ -273,11 +273,13 @@ func Test_classifyCommitFailure_ATransactionConflictIsAnOptimisticConflict(t *te
 		},
 	}
 
+	// Nothing is known to have moved, so fence-aware retry never exhausts it into a stale-fence
+	// rejection, as in Rust.
 	err := repo.classifyCommitFailure(context.Background(), nil, nil, commitLayout{}, cancelled)
 	require.ErrorIs(t, err, ErrTransactionConflict)
-	require.ErrorIs(t, err, evt.ErrOptimisticConflict, "fence-aware retry re-prepares on it, as in Rust")
+	require.NotErrorIs(t, err, evt.ErrOptimisticConflict)
 	require.ErrorIs(t, err, cancelled, "the SDK error stays matchable")
-	require.True(t, evt.IsOptimisticConflict(err))
+	require.False(t, evt.IsOptimisticConflict(err))
 	require.True(t, policy.IsTransient(err))
 
 	// Throttling is transient but says nothing about another writer moving state.

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -355,4 +356,100 @@ func TestWrongAttributeTypesAreACorruptRowNotAnEmptyValue(t *testing.T) {
 			})
 		}
 	}
+}
+
+// conflictingClient is a FakeDynamo that cancels the next `remaining` commits carrying a command
+// outcome with TransactionConflict on the rebuild-lock check (item 1), an item no command changes,
+// as DynamoDB does when another transaction is writing it at the same moment.
+type conflictingClient struct {
+	*compat.FakeDynamo
+
+	remaining int
+	cancelled int
+}
+
+func (c *conflictingClient) TransactWriteItems(
+	ctx context.Context,
+	params *dynamodb.TransactWriteItemsInput,
+	options ...func(*dynamodb.Options),
+) (*dynamodb.TransactWriteItemsOutput, error) {
+	if c.remaining == 0 || !carriesOutcome(params) {
+		return c.FakeDynamo.TransactWriteItems(ctx, params, options...)
+	}
+
+	c.remaining--
+	c.cancelled++
+
+	reasons := make([]types.CancellationReason, len(params.TransactItems))
+	for i := range reasons {
+		reasons[i] = types.CancellationReason{Code: strPtr("None")}
+	}
+	reasons[1] = types.CancellationReason{Code: strPtr("TransactionConflict")}
+
+	return nil, &types.TransactionCanceledException{
+		Message:             strPtr("Transaction cancelled, please refer cancellation reasons for specific reasons"),
+		CancellationReasons: reasons,
+	}
+}
+
+func carriesOutcome(params *dynamodb.TransactWriteItemsInput) bool {
+	for _, item := range params.TransactItems {
+		if item.Put == nil {
+			continue
+		}
+
+		if pk, ok := item.Put.Item["pk"].(*types.AttributeValueMemberS); ok && strings.HasPrefix(pk.Value, "command-outcome#") {
+			return true
+		}
+	}
+
+	return false
+}
+
+func TestATransactionConflictIsNeverRecordedAsAStaleFence(t *testing.T) {
+	client := &conflictingClient{FakeDynamo: compat.NewFakeDynamo()}
+	repo := dynamo.NewRepository(client, "events").WithLazyInitialization(true)
+	ctx := context.Background()
+
+	execute := func(attempts int, entity evt.EntityID, id evt.CommandID) (*evt.CommandOutcome, *scriptedAggregate, error) {
+		store := snapshots.NewStore(repo, 0).WithOutcomes().WithRetry(snapshots.ImmediateRetryPolicy(attempts))
+		aggregate := newScriptedAggregate(entity)
+		outcome, err := store.ExecuteWithOutcome(ctx, aggregate, entity, deposit(5), evt.Metadata{CommandID: &id})
+
+		return outcome, aggregate, err
+	}
+	recorded := func(id evt.CommandID) *evt.Outcome {
+		outcome, err := repo.GetOutcome(ctx, id)
+		require.NoError(t, err)
+
+		return outcome
+	}
+
+	// One attempt, and the command is unfenced: the conflict is returned as a transient error and
+	// nothing is recorded, so the same command ID runs again and commits.
+	client.remaining = 1
+	_, _, err := execute(1, "e-once", "once")
+	require.ErrorIs(t, err, dynamo.ErrTransactionConflict)
+	require.True(t, policy.IsTransient(err))
+	require.False(t, evt.IsOptimisticConflict(err))
+	require.Nil(t, recorded("once"), "no stale-fence rejection is recorded")
+
+	outcome, _, err := execute(1, "e-once", "once")
+	require.NoError(t, err)
+	require.Equal(t, evt.OutcomeAccepted, outcome.Status)
+	require.False(t, outcome.Replayed)
+
+	// Several attempts: it is retried like throttling, and the retry commits.
+	client.remaining, client.cancelled = 2, 0
+	outcome, aggregate, err := execute(3, "e-retried", "retried")
+	require.NoError(t, err)
+	require.Equal(t, evt.OutcomeAccepted, outcome.Status)
+	require.Equal(t, 2, client.cancelled)
+	require.Equal(t, 3, *aggregate.handled)
+
+	// Every attempt conflicts: the error is returned, still with nothing recorded.
+	client.remaining = 3
+	_, _, err = execute(3, "e-exhausted", "exhausted")
+	require.ErrorIs(t, err, dynamo.ErrTransactionConflict)
+	require.Nil(t, recorded("exhausted"))
 }

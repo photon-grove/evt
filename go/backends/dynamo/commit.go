@@ -426,8 +426,8 @@ func (repo *Repository) classifyCommitFailure(
 			return failure
 		}
 
-		// Another transaction was writing the same items: an optimistic-concurrency conflict, as
-		// in Rust, so fence-aware retry re-prepares the command.
+		// Another transaction was writing one of the items: transient, not an optimistic conflict,
+		// as in Rust. Fence-aware retry runs the command again but never records it as stale.
 		if hasTransactionConflict(err) {
 			return wrapClassifiedError(fmt.Errorf("%w: %w", ErrTransactionConflict, err))
 		}

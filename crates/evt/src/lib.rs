@@ -83,7 +83,7 @@ pub mod postgres;
 pub use aggregate::{Aggregate, Projector};
 pub use commit_id::CommitIdGenerator;
 pub use enumerate::{EventBatch, EventLog, StreamFilter};
-pub use error::{BoxError, Error, ExecuteError, ReplayPhase, RowTooLarge};
+pub use error::{BoxError, Error, ExecuteError, ReplayPhase, RowTooLarge, TransactionConflict};
 pub use event::{DomainEvent, PayloadError, SerializedEvent, SerializedSnapshot};
 pub use features::{
     COMMAND_OUTCOME_PREFIX, FEATURES_ID, FeatureManifest, FeatureMarker,

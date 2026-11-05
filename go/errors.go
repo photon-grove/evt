@@ -103,10 +103,12 @@ func (e *ConflictError) Error() string {
 }
 
 // ErrOptimisticConflict matches, with errors.Is, a failure that means another writer moved state
-// this attempt read or wrote: a colliding event sequence, a moved snapshot, a failed fence, a
-// continuity gap, or a concurrent transaction. Reloading and deciding again can succeed. A backend
-// reports such failures so that errors.Is(err, ErrOptimisticConflict) or IsConflictErr matches;
-// fence-aware retry (ADR 0004, C5) re-prepares a command on exactly these.
+// this attempt read or wrote: a colliding event sequence, a moved snapshot, a failed fence, or a
+// continuity gap. Reloading and deciding again can succeed. A backend reports such failures so
+// that errors.Is(err, ErrOptimisticConflict) or IsConflictErr matches; fence-aware retry (ADR 0004,
+// C5) re-prepares a command on exactly these. A commit that collided with a concurrent transaction
+// (DynamoDB's TransactionConflict) is not one: no state is known to have moved, so it is transient,
+// like throttling.
 var ErrOptimisticConflict = errors.New("optimistic concurrency conflict")
 
 // IsOptimisticConflict reports whether err is an optimistic-concurrency conflict: it matches

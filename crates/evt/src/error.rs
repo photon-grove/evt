@@ -535,7 +535,8 @@ pub enum Error {
     },
 
     /// The backend failed in a way that may succeed on retry, and running the operation again is
-    /// safe: throttling, a deadlock, a serialization failure, or a timed-out read. A commit is only
+    /// safe: throttling, a DynamoDB transaction conflict ([`TransactionConflict`]), a deadlock, a
+    /// serialization failure, or a timed-out read. A commit is only
     /// transient when the backend rejected it. A commit whose outcome is unknown, such as one that
     /// timed out, is [`Error::Backend`].
     #[error("transient backend failure: {0}")]
@@ -761,6 +762,41 @@ impl fmt::Display for RowTooLarge {
 }
 
 impl std::error::Error for RowTooLarge {}
+
+/// DynamoDB cancelled a write with `TransactionConflict`: another transaction was writing one of
+/// the same items at the same moment. It is the source of an [`Error::Transient`], never an
+/// [`Error::Conflict`]: nothing was written, and nothing the write was decided on is known to
+/// have gone stale. The colliding item can be one the command never changes, such as the
+/// feature-marker or rebuild-lock check every commit carries, or a fence it shares with another
+/// command.
+///
+/// Fence-aware retry runs the command again after a backoff, like throttling, and returns the
+/// error when the attempts run out. It is never recorded as a `stale-fence` rejection, so the
+/// same command ID can be sent again. Find it with
+/// `std::error::Error::source(&error)` and `downcast_ref::<TransactionConflict>()`.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "transaction conflict on entity {entity_id}: another writer was committing at the same time"
+)]
+#[non_exhaustive]
+pub struct TransactionConflict {
+    /// The entity of the item the write collided on, or the commit's first stream when the item
+    /// belongs to none (a control check or a projector operation).
+    pub entity_id: EntityId,
+    /// The backend's error, with the cancellation reasons.
+    #[source]
+    pub source: BoxError,
+}
+
+impl TransactionConflict {
+    /// A transaction conflict on `entity_id`, caused by the backend's `source`.
+    pub fn new(entity_id: EntityId, source: impl Into<BoxError>) -> Self {
+        Self {
+            entity_id,
+            source: source.into(),
+        }
+    }
+}
 
 /// The replay phase that failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
