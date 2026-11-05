@@ -7,11 +7,24 @@
 // messages. TypeScript runs every step itself, whichever writer the step names, as the Rust
 // fixture test does.
 
-import {type JsonValue, encodeEnvelope, encodeEvent, encodeSnapshot} from '@photon-grove/evt'
-import {headItem, eventItem, snapshotItem} from '@photon-grove/evt/dynamodb'
+import {
+  type JsonValue,
+  encodeEnvelope,
+  encodeEvent,
+  encodeSnapshot,
+  normalizeTransaction,
+} from '@photon-grove/evt'
+import {
+  type AttributeValue,
+  type TransactItem,
+  eventItem,
+  headItem,
+  snapshotItem,
+  transactionItems,
+} from '@photon-grove/evt/dynamodb'
 import {MemRepository, headFixtures} from '@photon-grove/evt/memory'
 
-import {type Checks, canonical, field, list, loadFixture, str} from './harness.js'
+import {type Checks, canonical, field, list, loadFixture, plain, str} from './harness.js'
 import {
   ORIGIN_SOURCE,
   type Observed,
@@ -25,12 +38,18 @@ import {
   optionalList,
   optionalString,
   streamId,
+  transactionCommit,
 } from './runner.js'
 
 const FIXTURE_RUN = 'fixture'
 
 // The expectations only the scenarios TypeScript doesn't support yet produce.
-const LATER_EXPECTATIONS = ['views', 'outcomes', 'transactions']
+const LATER_EXPECTATIONS = ['views', 'outcomes']
+
+// The marker version a fresh store's transactions check, and the table the fixture's actions
+// leave out.
+const MARKER_VERSION = 1n
+const TABLE = 'events'
 
 export async function scenarioChecks(checks: Checks): Promise<void> {
   const definitions = list(field(await loadFixture('../scenarios.json'), 'scenarios'))
@@ -67,6 +86,7 @@ async function runScenario(
   const runner = new Runner(repository, scenario, `compat-${FIXTURE_RUN}-${name}`)
 
   const steps = list(field(scenario, 'steps'))
+  const transactions: unknown[] = []
   for (const [index, step] of steps.entries()) {
     checkStep(step, index)
 
@@ -74,14 +94,25 @@ async function runScenario(
     const got = await runner.step(step)
     const label = `${name} step ${index} (${str(field(step, 'op'))})`
     checks.equal(label, canonical(got), canonical(want))
+
+    // The request a DynamoDB writer sends for the step, whether it commits or conflicts.
+    if (str(field(step, 'op')) === 'transaction') {
+      const transaction = normalizeTransaction(transactionCommit(runner.entityId, step))
+      const items = transactionItems(TABLE, transaction, MARKER_VERSION, () => undefined)
+      transactions.push({step: index, actions: items.map(action)})
+    }
   }
+  checks.equal(
+    `${name}: transactions`,
+    canonical(transactions),
+    canonical(optionalList(expected, 'transactions').map(plain)),
+  )
 
   checks.equal(`${name}: entity ID`, runner.entityId, str(field(expected, 'entityId')))
   compareObserved(checks, name, await observe(repository, runner, runner.entityId), expected)
 
   // Sibling streams in ascending order, as the fixture lists them.
-  const suffixes = [...new Set(steps.flatMap((step) => optionalString(step, 'suffix') ?? []))]
-    .filter((suffix) => suffix !== '')
+  const suffixes = [...new Set(steps.flatMap(stepSuffixes))].filter((suffix) => suffix !== '')
   suffixes.sort()
   const siblings = optionalList(expected, 'siblings')
   checks.equal(`${name}: sibling count`, siblings.length, suffixes.length)
@@ -94,6 +125,61 @@ async function runScenario(
       compareStream(checks, `${name} sibling ${suffix}`, observed, sibling)
     }
   }
+}
+
+// The streams a step names: its own, and a transaction's written and fenced ones.
+function stepSuffixes(step: JsonValue): string[] {
+  const nested = [...optionalList(step, 'streams'), ...optionalList(step, 'fences')]
+
+  return [step, ...nested].flatMap((value) => optionalString(value, 'suffix') ?? [])
+}
+
+// An action as the Go fixture generator records it: the operation, the key, the expressions and
+// their values. A Put's attribute names are left out, as Go leaves them.
+function action(item: TransactItem): unknown {
+  const [operation, body] = Object.entries(item)[0] as [
+    string,
+    {
+      Key?: Record<string, AttributeValue>
+      Item?: Record<string, AttributeValue>
+      UpdateExpression?: string
+      ConditionExpression?: string
+      ExpressionAttributeNames?: Record<string, string>
+      ExpressionAttributeValues?: Record<string, AttributeValue>
+    },
+  ]
+  const key = body.Key ?? body.Item ?? {}
+  const recorded: Record<string, unknown> = {
+    operation,
+    pk: attribute(key, 'pk', 'S'),
+    sk: Number(attribute(key, 'sk', 'N')),
+  }
+  if (body.UpdateExpression !== undefined) {
+    recorded.update = body.UpdateExpression
+  }
+  if (body.ConditionExpression !== undefined) {
+    recorded.condition = body.ConditionExpression
+  }
+  const names = body.ExpressionAttributeNames ?? {}
+  if (operation !== 'Put' && Object.keys(names).length > 0) {
+    recorded.names = names
+  }
+  const values = body.ExpressionAttributeValues ?? {}
+  if (Object.keys(values).length > 0) {
+    recorded.values = values
+  }
+
+  return recorded
+}
+
+function attribute(item: Record<string, AttributeValue>, name: string, type: 'S' | 'N'): string {
+  const value = item[name] as Record<string, unknown> | undefined
+  const text = value?.[type]
+  if (typeof text !== 'string') {
+    throw new Error(`the action's ${name} is not ${type}`)
+  }
+
+  return text
 }
 
 // The memory repository holds no items, so the stream's items are built from what it stores.

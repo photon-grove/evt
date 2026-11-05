@@ -29,13 +29,17 @@ import {
   SequenceGapError,
   type SerializedEvent,
   type SerializedSnapshot,
+  Store,
   type StoreInitializer,
   StreamHeadDriftError,
   type TransactionalRepository,
   StreamHeadsNotMigratedError,
   UnsupportedFeatureError,
+  defineAggregate,
+  defineEvents,
   emptyMetadata,
   eventId,
+  json,
   isConflict,
   isRetryable,
 } from '@photon-grove/evt'
@@ -94,6 +98,7 @@ export async function conformance(
       ['a read fence holds while its head does', () => readFences(repo)],
       ['a transaction built wrong is refused before any write', () => invalidTransactions(repo)],
       ['a transaction budgets its fences', () => transactionBudget(repo)],
+      ['a store transaction fences what it reads and writes once', () => storeTransaction(repo)],
     )
     if (fixtures) {
       cases.push([
@@ -332,6 +337,86 @@ async function transactionRanking(
     repo.commitTransaction({streams: [behind], fences: [fence(gapped, 0)]}),
     'a stale append comes before a stale fence',
     (failure) => failure instanceof ConflictError && failure.entityId === conflicted.id,
+  )
+}
+
+// A ledger aggregate of the namespace's own entity type, for the store's transaction API.
+function ledger(ns: string) {
+  return defineAggregate({
+    type: `${ns}-ledger`,
+    events: defineEvents({'ledger:added': {version: 1, codec: json<{amount: number}>()}}),
+    state: json<{total: number}>(),
+    initial: () => ({total: 0}),
+    handle: () => ({kind: 'accept', events: []}),
+    apply: (state, event) => ({total: state.total + event.data.amount}),
+  })
+}
+
+function added(amount: number) {
+  return {type: 'ledger:added' as const, data: {amount}}
+}
+
+async function storeTransaction(repo: TransactionalRepository): Promise<void> {
+  const ns = namespace()
+  const type = ledger(ns)
+  const other = defineAggregate({...ledger(ns), type: `${ns}-other`})
+  const store = new Store(repo, {snapshotInterval: 0})
+  const [a, b, watched] = [`${ns}-a`, `${ns}-b`, `${ns}-watched`]
+
+  // Two types in one commit, with one commit ID.
+  const first = store.transaction()
+  const readB = await first.read(other, b)
+  const readA = await first.read(type, a)
+  first.append(readB, [added(2)]).append(readA, [added(1), added(3)])
+  const committed = await first.commit()
+  ensure(committed.kind === 'committed', 'the first transaction commits')
+  const events = committed.kind === 'committed' ? committed.events : []
+  ensureEqual(
+    events.map((event) => `${event.entityId}/${event.sequence}`),
+    [`${a}/1`, `${a}/2`, `${b}/1`],
+    'the committed events, in write order',
+  )
+  ensureEqual(new Set(events.map((event) => event.metadata.commitId)).size, 1, 'one commit ID')
+  ensureEqual(await repo.events(a), events.slice(0, 2), 'events(a) as committed')
+  ensureEqual((await store.load(other, b)).state, {total: 2}, "b's state")
+
+  // A stream read but not written is fenced at its head: once another writer moves it, the
+  // commit fails, retryably, and writes nothing.
+  const seeded = store.transaction()
+  seeded.append(await seeded.read(type, watched), [added(1)])
+  await seeded.commit()
+  const fenced = store.transaction()
+  await fenced.read(type, watched)
+  fenced.append(await fenced.read(type, a), [added(4)])
+  const mover = store.transaction()
+  mover.append(await mover.read(type, watched), [added(1)])
+  await mover.commit()
+  const engine = await expectError(fenced.commit(), 'a moved read', (error) =>
+    fenceConflict(error, watched, 'engine'),
+  )
+  ensure(isRetryable(engine), 'an engine fence conflict is retryable')
+  ensureEqual(await repo.events(a), events.slice(0, 2), 'the fenced commit wrote nothing to a')
+
+  // A caller's fence holds at the head, and fails once the stream moves past it.
+  const held = store.transaction()
+  held.append(await held.read(other, b), [added(1)])
+  held.fence({entityId: watched, entityType: type.type, head: 2n})
+  ensure((await held.commit()).kind === 'committed', "a caller's fence at the head holds")
+  const outdated = store.transaction()
+  outdated.append(await outdated.read(other, b), [added(1)])
+  outdated.fence({entityId: watched, entityType: type.type, head: 1n})
+  const caller = await expectError(outdated.commit(), "a stale caller's fence", (error) =>
+    fenceConflict(error, watched, 'caller'),
+  )
+  ensure(!isRetryable(caller), "a caller's fence conflict isn't retryable")
+  ensureEqual((await repo.events(b)).length, 2, 'the stale commit wrote nothing to b')
+}
+
+function fenceConflict(error: unknown, entityId: string, provenance: string): boolean {
+  return (
+    error instanceof FenceConflictError &&
+    error.entityId === entityId &&
+    error.provenance === provenance
   )
 }
 

@@ -5,16 +5,20 @@ import {
   type Aggregate,
   type EventDefinitions,
   type EventOf,
-  type Projection,
   type Rejection,
-  encodeEventData,
   replayEvent,
 } from './aggregate.js'
 import {commitIds} from './commit-id.js'
 import {EvtError, SequenceGapError, SnapshotError, isConflict, isRetryable} from './errors.js'
-import {type SerializedEvent, eventId} from './event.js'
+import type {SerializedEvent} from './event.js'
 import {type Metadata, emptyMetadata} from './metadata.js'
-import type {CallOptions, NewSnapshot, ProjectorGroup, Repository} from './repository.js'
+import type {
+  CallOptions,
+  NewSnapshot,
+  ProjectorGroup,
+  Repository,
+  TransactionalRepository,
+} from './repository.js'
 import {
   DEFAULT_RETRY_POLICY,
   type RetryPolicy,
@@ -22,15 +26,14 @@ import {
   retryDelay,
   sleep,
 } from './retry.js'
-import {MAX_COMMIT_ITEM_BYTES, snapshotCommitSize, snapshotEventsDue} from './snapshots.js'
+import {commitSnapshot, projectCommit, serializeEvents} from './staging.js'
+import {Transaction} from './transaction.js'
 
 /** The default number of events between snapshots, as in Go and Rust. */
 export const DEFAULT_SNAPSHOT_INTERVAL = 5
 
 // How many times a load reads the stream when it finds a sequence gap.
 const LOAD_ATTEMPTS = 3
-
-const INT64_MAX = 2n ** 63n - 1n
 
 /** How a {@link Store} fills in what commands leave out. */
 export interface StoreOptions {
@@ -220,6 +223,28 @@ export class Store {
     /* oxlint-enable no-await-in-loop */
   }
 
+  /**
+   * Begins a transaction that reads streams of any aggregate types, appends to some of them, and
+   * commits them all at once, with a read fence on every stream it reads but doesn't write. The
+   * store's region, clock, commit IDs and snapshot interval apply to it, and each stream's
+   * aggregate projectors run in its commit. The repository must be a
+   * {@link TransactionalRepository}, as every one this package ships is, or this throws
+   * `invalidArgument`. {@link execute} stays the shortcut for one stream.
+   */
+  transaction(): Transaction {
+    const repository = this.repository
+    if (!isTransactional(repository)) {
+      throw new EvtError('invalidArgument', 'the repository has no commitTransaction')
+    }
+
+    return new Transaction({
+      repository,
+      load: (aggregate, entityId, options) => this.load(aggregate, entityId, options),
+      snapshotInterval: (aggregate) => this.snapshotInterval(aggregate),
+      metadata: (partial) => this.#metadata(partial),
+    })
+  }
+
   async #loadOnce<S, C, D extends EventDefinitions>(
     aggregate: Aggregate<S, C, D>,
     entityId: string,
@@ -284,48 +309,16 @@ export class Store {
     projections: ProjectorGroup[]
   } {
     const entityId = loaded.entityId
-    let sequence = loaded.sequence
-    let state = loaded.state
-    const events: SerializedEvent[] = []
-
-    for (const event of decided) {
-      if (sequence >= INT64_MAX) {
-        throw new EvtError(
-          'invalidCommit',
-          `invalid commit: entity ${entityId} is at the maximum event sequence`,
-        )
-      }
-      sequence++
-
-      const {version, payload} = encodeEventData(aggregate.events, event)
-      events.push({
-        id: eventId(entityId, sequence),
-        sequence,
-        type: event.type,
-        version,
-        entityId,
-        entityType: aggregate.type,
-        payload,
-        metadata: copyMetadata(metadata),
-      })
-      state = aggregate.apply(state, event)
-    }
-
+    const {events, state} = serializeEvents(
+      aggregate,
+      entityId,
+      loaded.sequence,
+      loaded.state,
+      decided,
+      metadata,
+    )
     const interval = this.snapshotInterval(aggregate)
-    let snapshot: NewSnapshot | null = null
-    if (snapshotEventsDue(loaded.sequence, decided.length, interval) > 0) {
-      snapshot = {
-        entityType: aggregate.type,
-        sequence: loaded.snapshotSequence + 1n,
-        payload: aggregate.state.encode(state),
-      }
-
-      // A snapshot over the per-item budget would fail every commit that carries it.
-      const size = snapshotCommitSize({...snapshot, entityId, eventSequence: sequence})
-      if (size > MAX_COMMIT_ITEM_BYTES) {
-        snapshot = null
-      }
-    }
+    const snapshot = commitSnapshot(aggregate, entityId, interval, loaded, events.length, state)
 
     const seenCommandIds = new Set(loaded.seenCommandIds)
     if (metadata.commandId !== null && metadata.commandId !== '') {
@@ -336,50 +329,14 @@ export class Store {
       state: {
         entityId,
         state,
-        sequence,
+        sequence: loaded.sequence + BigInt(events.length),
         snapshotSequence: snapshot ? snapshot.sequence : loaded.snapshotSequence,
         seenCommandIds,
       },
       events,
       snapshot,
-      projections: this.#project(aggregate, entityId, state, events, snapshot),
+      projections: projectCommit(aggregate, entityId, state, events, snapshot),
     }
-  }
-
-  // The operations the aggregate's projectors add to the commit, in declaration order.
-  #project<S, C, D extends EventDefinitions>(
-    aggregate: Aggregate<S, C, D>,
-    entityId: string,
-    state: S,
-    events: SerializedEvent[],
-    snapshot: NewSnapshot | null,
-  ): ProjectorGroup[] {
-    const projectors = aggregate.projectors ?? []
-    if (projectors.length === 0) {
-      return []
-    }
-
-    // Each projector gets its own frozen copy of the events, their metadata and every byte array,
-    // so none can change what another one sees, or what the commit writes.
-    const encodedState = snapshot?.payload ?? aggregate.state.encode(state)
-    const detached = (): Projection<S> =>
-      Object.freeze({
-        entityType: aggregate.type,
-        entityId,
-        state,
-        encodedState: encodedState.slice(),
-        events: Object.freeze(
-          events.map((event) =>
-            Object.freeze({
-              ...event,
-              payload: event.payload && event.payload.slice(),
-              metadata: Object.freeze(copyMetadata(event.metadata)),
-            }),
-          ),
-        ),
-      })
-
-    return projectors.flatMap((projector) => projector.project(detached()) ?? [])
   }
 
   // The command's metadata with the store's region and the clock's timestamp where it has none,
@@ -411,17 +368,11 @@ export class Store {
   }
 }
 
-// Each stored event gets its own metadata, so changing one changes no other.
-function copyMetadata(metadata: Metadata): Metadata {
-  return {
-    ...metadata,
-    trace: metadata.trace && new Map(metadata.trace),
-    origin: metadata.origin && {...metadata.origin},
-    extensions: new Map(metadata.extensions),
-  }
-}
-
 // RFC 3339 in UTC, to the second, as Go's time.RFC3339 formats a UTC time.
 function rfc3339Seconds(ms: number): string {
   return new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z')
+}
+
+function isTransactional(repository: Repository): repository is TransactionalRepository {
+  return typeof (repository as Partial<TransactionalRepository>).commitTransaction === 'function'
 }

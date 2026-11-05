@@ -99,6 +99,7 @@ export {
 } from './retry.js'
 export {MAX_COMMIT_ITEM_BYTES, snapshotCommitSize, snapshotEventsDue} from './snapshots.js'
 export {compareUtf8, utf8Length} from './utf8.js'
+export {type CallerFence, StreamRead, Transaction, type TransactionResult} from './transaction.js'
 export {
   DEFAULT_SNAPSHOT_INTERVAL,
   type ExecuteOptions,
