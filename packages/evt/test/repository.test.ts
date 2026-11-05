@@ -5,6 +5,7 @@ import {
   CommitTooLargeError,
   ConflictError,
   EvtError,
+  FenceConflictError,
   SequenceGapError,
   StreamHeadDriftError,
   isConflict,
@@ -18,6 +19,8 @@ import {
   checkBudget,
   checkNotReserved,
   commitSizes,
+  normalizeTransaction,
+  rankFailures,
   validateCommit,
 } from '../src/repository.ts'
 import {MAX_COMMIT_ITEM_BYTES, snapshotCommitSize} from '../src/snapshots.ts'
@@ -206,5 +209,70 @@ describe('error classes', () => {
     expect(drift.code).toBe('streamHeadDrift')
     expect(drift.message).toBe('stream head drift on entity a: stored head absent, derived head 3')
     expect(new SequenceGapError('a', 1n, 3n).message).toContain('skips from sequence 1 to 3')
+  })
+})
+
+function group(name: string) {
+  return {backend: name, operations: [name], sizes: [1]}
+}
+
+function fence(entityId: string, head: bigint) {
+  return {entityId, entityType: 't', head, provenance: 'engine'} as const
+}
+
+describe('transactions', () => {
+  test('sort streams and fences by UTF-8 bytes, and drop what writes nothing', () => {
+    // U+FF5E sorts after U+10000 by UTF-16 code units, and before it by UTF-8 bytes.
+    const astral = '\u{10000}'
+    const wide = '\uff5e'
+    const normalized = normalizeTransaction({
+      streams: [
+        {entityId: astral, events: [event(astral, 1)]},
+        {entityId: 'quiet', events: []},
+        {entityId: wide, events: [event(wide, 1)]},
+      ],
+      fences: [fence('z', 0n), fence(astral, 4n), fence('a', 2n)],
+    })
+
+    expect(normalized.streams.map((stream) => stream.entityId)).toEqual([wide, astral])
+    // The fence on a written stream is dropped: its head update conditions on the head.
+    expect(normalized.fences.map((each) => each.entityId)).toEqual(['a', 'z'])
+  })
+
+  test('keep projector groups in declaration order, and a fence on a stream without events', () => {
+    const normalized = normalizeTransaction({
+      streams: [
+        {entityId: 'b', events: [event('b', 1)], projections: [group('b')]},
+        {entityId: 'quiet', events: []},
+        {entityId: 'a', events: [event('a', 1)], projections: [group('a')]},
+      ],
+      fences: [fence('quiet', 3n), fence('b', 0n)],
+    })
+
+    expect(normalized.projections.map((each) => each.backend)).toEqual(['b', 'a'])
+    expect(normalized.streams.every((stream) => stream.projections === undefined)).toBe(true)
+    expect(normalized.fences.map((each) => each.entityId)).toEqual(['quiet'])
+  })
+
+  test('refuse a fence at the largest int64, which no head reaches', () => {
+    expect(() =>
+      normalizeTransaction({streams: [], fences: [fence('a', 2n ** 63n - 1n)]}),
+    ).toThrow(EvtError)
+    expect(() => normalizeTransaction({streams: [], fences: [fence('a', 2n ** 63n - 2n)]})).not
+      .toThrow()
+  })
+
+  test('rank drift over a gap over the first other failure', () => {
+    const conflict = new ConflictError('a', 'stale')
+    const fenced = new FenceConflictError('b', 1n, 'caller')
+    const gap = new SequenceGapError('c', 1n, 3n)
+    const drift = new StreamHeadDriftError('d', 1n, 2n)
+
+    expect(rankFailures([conflict, fenced, gap, drift])).toBe(drift)
+    expect(rankFailures([conflict, fenced, gap])).toBe(gap)
+    expect(rankFailures([fenced, conflict])).toBe(fenced)
+    expect(rankFailures([])).toBeUndefined()
+    expect(isConflict(fenced) && !isRetryable(fenced)).toBe(true)
+    expect(isRetryable(new FenceConflictError('b', 1n, 'engine'))).toBe(true)
   })
 })

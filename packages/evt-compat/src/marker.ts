@@ -11,6 +11,7 @@ import {
   emptyMetadata,
   encodeManifest,
   eventId,
+  normalizeTransaction,
 } from '@photon-grove/evt'
 import {
   type CommitTtl,
@@ -21,6 +22,7 @@ import {
   manifestFromItem,
   markerItem,
   snapshotTransaction,
+  transactionItems,
 } from '@photon-grove/evt/dynamodb'
 import {pgTables, schemaDdl} from '@photon-grove/evt/postgres'
 
@@ -64,10 +66,10 @@ export async function markerVectors(checks: Checks): Promise<void> {
   }
 }
 
-// The streamHeads vectors this package's writers produce so far: single-stream commits and
-// snapshot writes, with and without retention. Multi-stream commits with fences wait for
-// transactions.
+// The streamHeads vectors this package's writers produce: single-stream commits, a transaction
+// that writes several streams and fences others, and snapshot writes, with and without retention.
 const HEAD_VECTORS = new Set([
+  'streams-and-fences',
   'create',
   'append',
   'create-with-snapshot',
@@ -115,13 +117,30 @@ export async function headVectors(checks: Checks): Promise<void> {
         return
       }
 
-      const [stream, ...others] = list(field(request, 'streams'))
-      if (stream === undefined || others.length > 0) {
-        throw new Error('the vector writes more than one stream')
+      const streams = list(field(request, 'streams'))
+      const fences = request instanceof Map ? request.get('fences') : undefined
+      if (streams.length !== 1 || fences !== undefined) {
+        // A transaction: the streams and fences in the order the request lists them, which
+        // normalizing sorts.
+        const transaction = normalizeTransaction({
+          streams: streams.map(headCommit),
+          fences: (fences === undefined ? [] : list(fences)).map((fence) => ({
+            entityId: str(field(fence, 'entityId')),
+            entityType: 'account',
+            head: int(field(fence, 'head')),
+            provenance: 'engine' as const,
+          })),
+        })
+        const items = transactionItems(HEAD_TABLE, transaction, 1n, (commit) =>
+          commitTtl(request, commit),
+        )
+        checks.equal(name, canonical(items.map(normalize)), want)
+
+        return
       }
 
       // The vectors' sizes are the commit budget's, which packages/evt's tests check.
-      const commit = headCommit(stream)
+      const commit = headCommit(streams[0]!)
       const ttl = commitTtl(request, commit)
       const got = commitTransaction(HEAD_TABLE, commit, 1n, ttl).map(normalize)
       checks.equal(name, canonical(got), want)

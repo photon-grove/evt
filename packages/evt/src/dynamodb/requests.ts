@@ -1,14 +1,15 @@
 // The `TransactWriteItems` actions of a commit and of a snapshot write, built from the storage
 // format alone (storage format, "Writes"). Every commit opens with the two control checks, the
-// feature marker's and the rebuild lock's, then its projector operations, then writes the stream:
-// its head update, its event puts, and its snapshot put when it has one.
+// feature marker's and the rebuild lock's, then its projector operations, then writes each stream:
+// its head update, its event puts, and its snapshot put when it has one. A transaction then checks
+// the head of every stream it fenced.
 
 import type {SerializedEvent, SerializedSnapshot} from '../event.js'
 import {int64Argument, safeIntegerArgument} from '../fields.js'
 import {EvtError} from '../errors.js'
-import type {Commit} from '../repository.js'
+import type {Commit, NormalizedTransaction, ProjectorGroup, ReadFence} from '../repository.js'
 import type {TransactItem} from './client.js'
-import {type HeadAction, headUpdate} from './head.js'
+import {type HeadAction, headFence, headUpdate} from './head.js'
 import {HEAD_SORT_KEY, type Item, SNAPSHOT_SORT_KEY, eventItem, snapshotItem} from './item.js'
 import {FEATURES_PK, REBUILD_LOCK_PK} from './marker.js'
 import {DYNAMODB_BACKEND} from './views.js'
@@ -102,8 +103,7 @@ export interface SnapshotTtl {
 /**
  * The actions of a commit with at least one event, in order, by a writer that validated the
  * feature manifest at `markerVersion`. `ttl` is given only for a stream with retention. A projector
- * group for any backend but DynamoDB is refused. Exported for the compatibility fixtures: its
- * signature changes when commits span streams.
+ * group for any backend but DynamoDB is refused. Exported for the compatibility fixtures.
  */
 export function commitTransaction(
   table: string,
@@ -111,16 +111,83 @@ export function commitTransaction(
   markerVersion: bigint,
   ttl?: CommitTtl,
 ): TransactItem[] {
-  const first = commit.events[0]
-  const last = commit.events.at(-1)
-  if (first === undefined || last === undefined) {
+  if (commit.events.length === 0) {
     throw new RangeError('a commit transaction needs at least one event')
   }
 
+  const transaction = {streams: [commit], fences: [], projections: commit.projections ?? []}
+
+  return transactionItems(table, transaction, markerVersion, () => ttl)
+}
+
+/** Where each stream's and fence's actions sit in a transaction, to classify a cancellation. */
+export interface TransactionLayout {
+  /** The index after the control checks and the projector operations. */
+  readonly projectorEnd: number
+  readonly streams: readonly StreamLayout[]
+  readonly fences: readonly {readonly index: number; readonly fence: ReadFence}[]
+}
+
+/** A written stream's actions in a transaction. */
+export interface StreamLayout {
+  readonly commit: Commit
+  /** The head update's index. Its event puts follow it. */
+  readonly head: number
+  /** The index after its last event put. */
+  readonly eventsEnd: number
+  /** The snapshot put's index, when it writes one. */
+  readonly snapshot: number | null
+}
+
+/**
+ * The actions of a normalized transaction that writes or fences at least one stream, in order:
+ * the control checks, the projector operations in declaration order, every written stream's head
+ * update, event puts and snapshot put, then a check on every fenced stream's head. `ttl` gives a
+ * written stream's `ttl`s when it has retention. Exported for the compatibility fixtures.
+ */
+export function transactionItems(
+  table: string,
+  transaction: NormalizedTransaction,
+  markerVersion: bigint,
+  ttl: (commit: Commit) => CommitTtl | undefined,
+): TransactItem[] {
+  return buildTransaction(table, transaction, markerVersion, ttl).items
+}
+
+/** {@link transactionItems}, with where each stream's and fence's actions sit. */
+export function buildTransaction(
+  table: string,
+  transaction: NormalizedTransaction,
+  markerVersion: bigint,
+  ttl: (commit: Commit) => CommitTtl | undefined,
+): {items: TransactItem[]; layout: TransactionLayout} {
   const items = [markerCheck(table, markerVersion), rebuildLockCheck(table)]
-  items.push(...projectorItems(commit))
+  items.push(...projectorItems(transaction.projections))
+  const projectorEnd = items.length
+
+  const streams: StreamLayout[] = []
+  for (const commit of transaction.streams) {
+    const head = items.length
+    items.push(...streamItems(table, commit, ttl(commit)))
+    const eventsEnd = head + 1 + commit.events.length
+    streams.push({commit, head, eventsEnd, snapshot: items.length > eventsEnd ? eventsEnd : null})
+  }
+
+  const fences = transaction.fences.map((fence) => {
+    items.push(fenceCheck(table, fence))
+
+    return {index: items.length - 1, fence}
+  })
+
+  return {items, layout: {projectorEnd, streams, fences}}
+}
+
+// A written stream's actions: its head update, its event puts and its snapshot put.
+function streamItems(table: string, commit: Commit, ttl: CommitTtl | undefined): TransactItem[] {
+  const first = commit.events[0]!
+  const last = commit.events.at(-1)!
   const head = headUpdate(commit.entityId, first.sequence, last.sequence, ttl?.head)
-  items.push(headUpdateItem(table, head))
+  const items = [headUpdateItem(table, head)]
   for (const event of commit.events) {
     items.push(eventPut(table, event, ttl?.items))
   }
@@ -138,6 +205,23 @@ export function commitTransaction(
   }
 
   return items
+}
+
+// The check on a fenced stream's head item: it still has the head the transaction read.
+function fenceCheck(table: string, fence: ReadFence): TransactItem {
+  const action = headFence(fence.entityId, fence.head)
+  const check: NonNullable<TransactItem['ConditionCheck']> = {
+    TableName: table,
+    Key: headKey(fence.entityId),
+    ConditionExpression: action.conditionExpression,
+  }
+  if (action.values.length > 0) {
+    check.ExpressionAttributeValues = Object.fromEntries(
+      action.values.map(([placeholder, value]) => [placeholder, number(value)]),
+    )
+  }
+
+  return {ConditionCheck: check}
 }
 
 /**
@@ -204,10 +288,10 @@ function snapshotGuard(
   }
 }
 
-/** The DynamoDB actions of a commit's projector groups, in order. */
-export function projectorItems(commit: Commit): TransactItem[] {
+/** The DynamoDB actions of projector groups, in order. */
+export function projectorItems(groups: readonly ProjectorGroup[]): TransactItem[] {
   const items: TransactItem[] = []
-  for (const group of commit.projections ?? []) {
+  for (const group of groups) {
     if (group.backend !== DYNAMODB_BACKEND) {
       throw new EvtError(
         'invalidCommit',

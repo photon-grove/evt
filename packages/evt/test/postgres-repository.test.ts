@@ -40,6 +40,8 @@ interface Fake {
   client: PgClient
   // Every statement, the pool's and its connections', in the order they ran.
   log: string[]
+  // Each statement's values, by the same index.
+  values: (unknown[] | undefined)[]
   released: (Error | undefined)[]
 }
 
@@ -49,9 +51,11 @@ function fake(
   options: {fail?: (text: string) => unknown; pooled?: boolean; delay?: number} = {},
 ): Fake {
   const log: string[] = []
+  const values: (unknown[] | undefined)[] = []
   const released: (Error | undefined)[] = []
-  const query = async (text: string): Promise<PgResult> => {
+  const query = async (text: string, params?: unknown[]): Promise<PgResult> => {
     log.push(text)
+    values.push(params)
     if (options.delay !== undefined) {
       await new Promise((resolve) => setTimeout(resolve, options.delay))
     }
@@ -71,7 +75,7 @@ function fake(
     })
   }
 
-  return {client, log, released}
+  return {client, log, values, released}
 }
 
 // The first words of each statement a transaction ran, from its START TRANSACTION on.
@@ -102,6 +106,30 @@ describe('PgRepository', () => {
       'COMMIT',
     ])
     expect(released).toEqual([undefined])
+  })
+
+  test('locks every stream of a transaction once, in byte order, before the marker', async () => {
+    const {client, log, values} = fake()
+    const b = {...event(1), id: eventId('b', 1n), entityId: 'b'}
+    const a = {...event(1), id: eventId('a', 1n), entityId: 'a'}
+    await new PgRepository(client).commitTransaction({
+      streams: [
+        {entityId: 'b', events: [b]},
+        {entityId: 'a', events: [a]},
+      ],
+      fences: [
+        {entityId: 'c', entityType: 'ledger', head: 0n, provenance: 'engine'},
+        {entityId: 'a', entityType: 'ledger', head: 5n, provenance: 'engine'},
+      ],
+    })
+
+    const start = log.indexOf('START TRANSACTION ISOLATION LEVEL READ COMMITTED')
+    const locks = log.slice(start + 1, start + 4)
+    expect(locks.every((text) => text.startsWith('SELECT pg_advisory_xact_lock(1702261760'))).toBe(
+      true,
+    )
+    expect(values.slice(start + 1, start + 4)).toEqual([['a'], ['b'], ['c']])
+    expect(log[start + 4]).toMatch(/^SELECT pg_advisory_xact_lock_shared/)
   })
 
   test('rolls back an aborted commit and sends no COMMIT', async () => {

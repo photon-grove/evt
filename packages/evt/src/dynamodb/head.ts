@@ -72,6 +72,21 @@ export function headUpdate(
   }
 }
 
+/** The condition of a fence on a stream with no head: it still has none. */
+export const FENCE_ABSENT_CONDITION = 'attribute_not_exists(head)'
+
+/** The condition of a fence on a stream with a head: it still equals the one observed. */
+export const FENCE_CONDITION = 'head = :head'
+
+/** The `ConditionCheck` a transaction fences a stream it read at `head` with. */
+export function headFence(entityId: string, head: bigint): HeadAction {
+  const check = {entityId, updateExpression: null, names: []}
+
+  return head === 0n
+    ? {...check, conditionExpression: FENCE_ABSENT_CONDITION, values: []}
+    : {...check, conditionExpression: FENCE_CONDITION, values: [[':head', head]]}
+}
+
 /**
  * An action's size in the commit budget, by the rule for any update, delete or condition check:
  * its key attributes plus its expression strings, name placeholders (the placeholder and the

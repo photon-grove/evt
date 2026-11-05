@@ -34,7 +34,12 @@ import {
 } from '../src/errors.ts'
 import {type SerializedEvent, eventId} from '../src/event.ts'
 import {emptyMetadata} from '../src/metadata.ts'
-import {commitSizes} from '../src/repository.ts'
+import {
+  type Commit,
+  commitSizes,
+  normalizeTransaction,
+  transactionSizes,
+} from '../src/repository.ts'
 
 function event(sequence: number): SerializedEvent {
   return {
@@ -636,6 +641,7 @@ describe('the commit budget', () => {
 
   interface Request {
     streams?: Stream[]
+    fences?: {entityId: string; head: number}[]
     clockUnixNano?: number
     retentionNanos?: Record<string, number>
   }
@@ -663,8 +669,7 @@ describe('the commit budget', () => {
     ])
   })
 
-  test.each(singleStream)('sizes $name as the vector does', ({request, sizes}) => {
-    const stream = request.streams![0]!
+  function commitOf(stream: Stream): Commit {
     const events: SerializedEvent[] = []
     for (let i = 0; i < stream.count; i++) {
       const sequence = BigInt(stream.first + i)
@@ -693,14 +698,37 @@ describe('the commit budget', () => {
             payload: new TextEncoder().encode('{}'),
           }
 
+    return {entityId: stream.entityId, events, snapshot}
+  }
+
+  test.each(singleStream)('sizes $name as the vector does', ({request, sizes}) => {
+    const stream = request.streams![0]!
+
     // The clock and the retention are whole milliseconds, exact as JSON numbers.
     const retention = request.retentionNanos?.[stream.entityType]
     const ttl =
       retention === undefined ? undefined : expiry(request.clockUnixNano! / 1e6, retention / 1e6)
 
     // Go lists the head update after the stream's puts, and the budget only sums them.
-    const got = commitSizes({entityId: stream.entityId, events, snapshot}, () => ttl)
+    const got = commitSizes(commitOf(stream), () => ttl)
     expect(ascending(got)).toEqual(ascending(sizes!))
+  })
+
+  test('sizes a transaction with fences as the vector does', () => {
+    const vector = vectors.find(({name}) => name === 'streams-and-fences')!
+    const {streams = [], fences = []} = vector.request
+    const transaction = normalizeTransaction({
+      streams: streams.map(commitOf),
+      fences: fences.map(({entityId, head}) => ({
+        entityId,
+        entityType: 'account',
+        head: BigInt(head),
+        provenance: 'engine' as const,
+      })),
+    })
+
+    const got = transactionSizes(transaction, () => undefined)
+    expect(ascending(got)).toEqual(ascending(vector.sizes!))
   })
 })
 

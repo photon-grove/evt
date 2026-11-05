@@ -141,6 +141,11 @@ of `AbortSignal`, which the DOM library, `@types/node`, and Bun's and Deno's typ
 - **Rebuilds.** While a projection rebuild holds the store, every commit fails with a
   `RebuildInProgressError`. It's retryable, so `executeWithRetry` runs the command again after its
   backoff, though a rebuild usually outlasts the default policy's attempts.
+- **Transactions.** Every repository is a `TransactionalRepository`: `commitTransaction({streams,
+  fences})` appends to several streams atomically, and checks a read fence on each stream it read
+  but doesn't write, which fails with a `FenceConflictError` once another writer moves that stream.
+  A fence the engine filled is retryable, and one the caller stamped isn't. A fence on an entity
+  type with retention is refused with a `RetentionConflictError`.
 - **Sequences** are `bigint`s, because Go and Rust store them as 64-bit integers.
 
 Errors are `EvtError`s with a `code`. `isConflict` and `isRetryable` tell them apart.
