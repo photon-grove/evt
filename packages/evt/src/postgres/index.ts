@@ -2,6 +2,13 @@
 // `pg`'s Pool, or anything shaped like it, as a PgClient.
 
 export {type PgClient, type PgConnection, type PgQueryable, type PgResult} from './client.js'
+export {
+  type OutcomeRow,
+  insertOutcomeSql,
+  outcomeFromRow,
+  outcomeRow,
+  selectOutcomeSql,
+} from './outcome.js'
 export {POSTGRES_BACKEND, PgRepository, type PgRepositoryOptions} from './repository.js'
 
 export {

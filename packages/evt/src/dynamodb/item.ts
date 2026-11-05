@@ -261,7 +261,8 @@ function payloadText(payload: Uint8Array | null, what: string): string {
   }
 }
 
-function requiredString(item: Item, name: string): string {
+/** A string attribute, refused as `invalidRecord` when it's missing or of another type. */
+export function requiredString(item: Item, name: string): string {
   const value = optionalString(item, name)
   if (value === undefined) {
     throw invalid(`item has no ${name} attribute`)
@@ -279,7 +280,8 @@ function requiredNumber(item: Item, name: string): bigint {
   return value
 }
 
-function optionalString(item: Item, name: string): string | undefined {
+/** A string attribute, undefined when it's missing or NULL, refused when of another type. */
+export function optionalString(item: Item, name: string): string | undefined {
   const value = item[name]
   if (value === undefined || 'NULL' in value) {
     return undefined

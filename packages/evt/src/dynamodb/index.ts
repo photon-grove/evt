@@ -36,6 +36,14 @@ export {
   type UpdateAction,
 } from './client.js'
 export {FEATURES_PK, REBUILD_LOCK_PK, manifestFromItem, markerItem} from './marker.js'
+export {
+  OUTCOME_CONDITION,
+  OUTCOME_SORT_KEY,
+  outcomeFromItem,
+  outcomeItem,
+  outcomeItemSize,
+  outcomeKey,
+} from './outcome.js'
 export {DynamoRepository, type DynamoRepositoryOptions} from './repository.js'
 export {DYNAMODB_BACKEND, transactItemSize, viewProjector} from './views.js'
 export {

@@ -4083,6 +4083,10 @@ These differences are deliberate and covered by tests. Keep them documented here
   the version its type declares (`PayloadError::VersionMismatch`), and so does TypeScript (a
   `ReplayError`). Go decodes it into the current struct. Deploy readers before writers when an event version changes.
 - Floats. Not normalized across languages, as described under [JSON encoding](#json-encoding).
+- Rejection details in TypeScript. TypeScript writes every object in a rejection's `details`, at
+  any depth, with its keys sorted by UTF-8 bytes, as Rust writes a `serde_json::Value`. Go sorts
+  the keys of its `details` map, but a struct nested inside it keeps its field order. Details built
+  from maps and plain values store the same bytes in all three languages.
 - Duplicate-command window. Both languages only see command IDs in events after the latest
   snapshot. This is shared behavior, listed here because it surprises readers. The `dedupe-window`
   scenario covers it. Superseded in v0.9 by command outcomes

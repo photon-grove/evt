@@ -334,7 +334,8 @@ error before any write and is never split.
 
 - A store with outcomes enabled requires a command ID on every command (a missing one is an
   `ErrInvalidArgument` returned before any read or write) of at most 512 UTF-8 bytes
-  (`CommandIDTooLongError` / `Error::CommandIdTooLong`, before even the outcome key is built)
+  (`CommandIDTooLongError` / `Error::CommandIdTooLong` / TypeScript `CommandIdTooLongError`, before
+  even the outcome key is built)
 - The outcome row `command-outcome#<id>` (`sk = 1`; PostgreSQL `{events}__evt_command_outcomes`) is
   written once, in its final state, inside the commit transaction as its last action, conditioned
   on `attribute_not_exists(pk)`. It has no snapshot and no `ttl`, never compacts, and is the one
@@ -374,7 +375,8 @@ error before any write and is never split.
   snapshots and compacted away; on an upgraded log the load-time event window remains the only
   guard for pre-v0.9 IDs, and it sees only those after the latest snapshot
 - A lost outcome put is never a generic optimistic-concurrency conflict and is never resolved by
-  re-preparing the command: it is `OutcomeConflict`, and it outranks every other failed item in the
+  re-preparing the command: it is `OutcomeConflict` (TypeScript `OutcomeConflictError`), and it
+  outranks every other failed item in the
   commit's classification, so the engine resolves it by re-reading the row. A re-read that fails
   is retryable where it can be, so the next attempt's outcome pre-read answers the command: Go
   makes any failure not classified permanent transient, and Rust makes a re-read that stalls past
@@ -385,7 +387,7 @@ error before any write and is never split.
 - Only a genuinely indeterminate failure of an outcome-bearing commit is recovered — a timeout or
   cancelled context, a dispatch or connection failure, a truncated response, a 5xx or server fault,
   a connection dropped during PostgreSQL's `COMMIT` (Go `*AmbiguousWriteError`, Rust
-  `Error::Indeterminate`). A definitive failure (validation, a missing table or relation,
+  `Error::Indeterminate`, TypeScript `IndeterminateError`). A definitive failure (validation, a missing table or relation,
   authorization, a constraint error other than the outcome-row conflict) is returned as is
 - Every PostgreSQL transaction that writes or checks a fence runs at `READ COMMITTED`, set
   explicitly, so its fence reads after an advisory-lock wait see what committed during the wait,

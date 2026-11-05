@@ -38,6 +38,13 @@
  *   written.
  * - `replay`: a stored event failed to upcast or decode while an aggregate loaded.
  * - `snapshot`: a stored snapshot failed to decode while an aggregate loaded.
+ * - `outcomeConflict`: a commit's command outcome lost its condition: another writer already
+ *   recorded an outcome for the command ID. Nothing was written.
+ * - `outcomeTooLarge`: a command outcome's response, rejection or recorded identity is over
+ *   65536 bytes. Nothing was written.
+ * - `commandIdTooLong`: a command ID is over 512 UTF-8 bytes. Nothing was written.
+ * - `indeterminate`: a commit that carries a command outcome failed in a way that leaves it
+ *   unknown whether it applied, such as a timeout or a connection lost during `COMMIT`.
  */
 export type EvtErrorCode =
   | 'invalidJson'
@@ -62,6 +69,10 @@ export type EvtErrorCode =
   | 'projectorOnlyCommit'
   | 'replay'
   | 'snapshot'
+  | 'outcomeConflict'
+  | 'outcomeTooLarge'
+  | 'commandIdTooLong'
+  | 'indeterminate'
 
 export class EvtError extends Error {
   override readonly name: string = 'EvtError'
@@ -405,6 +416,70 @@ export class SnapshotError extends EvtError {
   constructor(entityId: string, cause: unknown) {
     super('snapshot', `decoding snapshot for entity ${entityId}: ${messageOf(cause)}`, {cause})
     this.entityId = entityId
+  }
+}
+
+/**
+ * A commit's outcome put lost its condition: another writer already recorded an outcome for the
+ * command ID. It's never a generic conflict, and running the command again can't resolve it: read
+ * the stored outcome instead. Nothing was written.
+ */
+export class OutcomeConflictError extends EvtError {
+  override readonly name = 'OutcomeConflictError'
+  override readonly code = 'outcomeConflict'
+  readonly commandId: string
+
+  constructor(commandId: string) {
+    super('outcomeConflict', `an outcome is already recorded for command ${commandId}`)
+    this.commandId = commandId
+  }
+}
+
+/** Which part of a command outcome is over its bound. */
+export type OutcomePart = 'response' | 'rejection' | 'identity'
+
+/**
+ * A command outcome's response, encoded rejection or recorded identity is over 65536 bytes.
+ * Refused before any write, on every backend. Nothing was written.
+ */
+export class OutcomeTooLargeError extends EvtError {
+  override readonly name = 'OutcomeTooLargeError'
+  override readonly code = 'outcomeTooLarge'
+  readonly what: OutcomePart
+  readonly size: number
+
+  constructor(what: OutcomePart, size: number) {
+    super('outcomeTooLarge', `the outcome's ${what} is ${size} bytes, over the 65536-byte bound`)
+    this.what = what
+    this.size = size
+  }
+}
+
+/** A command ID is over 512 UTF-8 bytes. Refused before any read or write. */
+export class CommandIdTooLongError extends EvtError {
+  override readonly name = 'CommandIdTooLongError'
+  override readonly code = 'commandIdTooLong'
+  readonly length: number
+
+  constructor(length: number) {
+    super('commandIdTooLong', `the command ID is ${length} bytes, over the 512-byte bound`)
+    this.length = length
+  }
+}
+
+/**
+ * A commit that carries a command outcome failed in a way that leaves it unknown whether it
+ * applied: a timeout, a lost connection or response, a server fault, an abort while the write was
+ * in flight, or a PostgreSQL connection lost during `COMMIT`. The commit may still land, so read
+ * the outcome row before deciding it didn't. A definitive refusal is never reported this way. The
+ * backend's error is its cause.
+ */
+export class IndeterminateError extends EvtError {
+  override readonly name = 'IndeterminateError'
+  override readonly code = 'indeterminate'
+
+  constructor(options?: {cause?: unknown}) {
+    super('indeterminate', `commit result unknown: ${messageOf(options?.cause)}`, options)
   }
 }
 

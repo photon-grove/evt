@@ -10,6 +10,7 @@
 /* oxlint-disable no-await-in-loop */
 
 import {
+  CommandIdTooLongError,
   CommitTooLargeError,
   CompactionUncoveredError,
   ConflictError,
@@ -18,7 +19,11 @@ import {
   FeatureManifestChangedError,
   FenceConflictError,
   HistoryDependentProjectionError,
+  JsonNumber,
   type NewSnapshot,
+  type Outcome,
+  OutcomeConflictError,
+  type OutcomeRepository,
   RebuildInProgressError,
   type ReadFence,
   type Repository,
@@ -38,6 +43,7 @@ import {
   defineAggregate,
   defineEvents,
   emptyMetadata,
+  encodeRejection,
   eventId,
   json,
   isConflict,
@@ -107,6 +113,22 @@ export async function conformance(
       ])
     }
   }
+  if (recordsOutcomes(repo)) {
+    cases.push(
+      [
+        'an outcome commits with its streams and reads back as stored',
+        () => outcomeRoundTrip(repo),
+      ],
+      ['an outcome-only commit writes the row alone', () => outcomeOnly(repo)],
+      [
+        'a recorded outcome outranks a stream failure and writes nothing',
+        () => outcomeConflict(repo),
+      ],
+      ['a failed commit leaves no outcome row', () => outcomeAtomicity(repo)],
+      ['outcome bounds are refused before any write', () => outcomeBounds(repo)],
+      ['racing outcome puts: one records, the rest are outcome conflicts', () => outcomeRace(repo)],
+    )
+  }
 
   for (const [name, run] of cases) {
     await checks.case(`conformance: ${name}`, run)
@@ -117,6 +139,223 @@ class Failure extends Error {}
 
 function transactional(repo: Repository): repo is TransactionalRepository {
   return typeof (repo as Partial<TransactionalRepository>).commitTransaction === 'function'
+}
+
+function isTransient(error: unknown): boolean {
+  return error instanceof EvtError && error.code === 'transient'
+}
+
+function recordsOutcomes(repo: Repository): repo is OutcomeRepository {
+  return transactional(repo) && typeof (repo as Partial<OutcomeRepository>).outcome === 'function'
+}
+
+function outcome(commandId: string, overrides: Partial<Outcome> = {}): Outcome {
+  return {
+    commandId,
+    status: 'accepted',
+    digest: `${commandId}-digest`,
+    response: null,
+    eventIds: [],
+    rejection: null,
+    identity: {commandType: 'ledger:add', targets: [], principal: null},
+    ...overrides,
+  }
+}
+
+// An outcome as text, its rejection in the stored encoding, for comparing a row read back.
+function outcomeText(stored: Outcome | null): string {
+  if (stored === null) {
+    return 'null'
+  }
+
+  return canonical({
+    ...stored,
+    response: stored.response === null ? null : Array.from(stored.response),
+    eventIds: [...stored.eventIds],
+    rejection: stored.rejection === null ? null : encodeRejection(stored.rejection),
+    identity: stored.identity && {...stored.identity, targets: [...stored.identity.targets]},
+  })
+}
+
+async function outcomeRoundTrip(repo: OutcomeRepository): Promise<void> {
+  const ns = namespace()
+  const a = new Stream(ns, 'a')
+  const b = new Stream(ns, 'b')
+  const commandId = `${ns}-cmd`
+  // Binary bytes, a rejection whose numbers and keys every backend must store alike, and an
+  // identity with characters the JSON writer escapes.
+  const response = new Uint8Array([0, 255, 128, 10])
+  const recorded = outcome(commandId, {
+    status: 'rejected',
+    response,
+    rejection: {
+      code: 'apply-conflict',
+      message: 'decided on a stale base <&>',
+      details: {
+        z: {precise: new JsonNumber('9007199254740993'), scaled: new JsonNumber('1.50e1')},
+        a: [new JsonNumber('-0'), 'é'],
+      },
+    },
+    identity: {commandType: 'ledger:<add>', targets: [b.id, a.id], principal: 'user:42'},
+  })
+
+  await repo.commitTransaction({
+    streams: [
+      {entityId: b.id, events: b.events(1, 2)},
+      {entityId: a.id, events: a.events(1, 1)},
+    ],
+    outcome: recorded,
+  })
+
+  const stored = await repo.outcome(commandId)
+  ensureEqual(
+    outcomeText(stored),
+    outcomeText({...recorded, eventIds: [eventId(a.id, 1n), eventId(b.id, 1n), eventId(b.id, 2n)]}),
+    'the stored outcome, its event IDs by stream bytes',
+  )
+  ensureEqual(
+    stored?.rejection && encodeRejection(stored.rejection),
+    '{"code":"apply-conflict","message":"decided on a stale base \\u003c\\u0026\\u003e",' +
+      '"details":{"a":[0,"é"],"z":{"precise":9007199254740993,"scaled":15.0}}}',
+    'the stored rejection, canonical on every backend',
+  )
+  ensure((await repo.outcome(`${ns}-other`)) === null, 'an unrecorded command has no outcome')
+}
+
+async function outcomeOnly(repo: OutcomeRepository): Promise<void> {
+  const ns = namespace()
+  const fenced = new Stream(ns, 'fenced')
+  await fenced.commit(repo, fenced.events(1, 1))
+  const commandId = `${ns}-cmd`
+
+  await repo.commitTransaction({
+    fences: [fence(fenced, 1)],
+    streams: [],
+    outcome: outcome(commandId),
+  })
+  ensureEqual(
+    outcomeText(await repo.outcome(commandId)),
+    outcomeText(outcome(commandId)),
+    'the accepted no-op',
+  )
+  ensureEqual(await repo.events(fenced.id), fenced.events(1, 1), 'the fenced stream is untouched')
+
+  // A moved fence fails the outcome-only commit like any other, and records nothing.
+  const moved = `${ns}-moved`
+  await expectError(
+    repo.commitTransaction({streams: [], fences: [fence(fenced, 0)], outcome: outcome(moved)}),
+    'an outcome-only commit whose fence moved',
+    (error) => fenceConflict(error, fenced.id, 'engine'),
+  )
+  ensure((await repo.outcome(moved)) === null, 'the failed outcome-only commit recorded nothing')
+
+  // The single-stream path records one too.
+  const single = `${ns}-single`
+  await repo.commit({entityId: fenced.id, events: [], outcome: outcome(single)})
+  ensure((await repo.outcome(single))?.eventIds.length === 0, 'the single-stream no-op')
+}
+
+async function outcomeConflict(repo: OutcomeRepository): Promise<void> {
+  const ns = namespace()
+  const a = new Stream(ns, 'a')
+  const commandId = `${ns}-cmd`
+  await repo.commit({entityId: a.id, events: a.events(1, 1), outcome: outcome(commandId)})
+
+  for (const [what, events] of [
+    ['a stale stream', a.events(1, 1)],
+    ['a fresh stream', a.events(2, 2)],
+  ] as const) {
+    await expectError(
+      repo.commit({entityId: a.id, events, outcome: outcome(commandId, {digest: 'another'})}),
+      `a second outcome for the command, beside ${what}`,
+      (error) => error instanceof OutcomeConflictError && error.commandId === commandId,
+    )
+  }
+  ensureEqual(await repo.events(a.id), a.events(1, 1), 'the lost commits wrote no event')
+  ensure(
+    (await repo.outcome(commandId))?.digest === `${commandId}-digest`,
+    "the first writer's outcome stands",
+  )
+}
+
+async function outcomeAtomicity(repo: OutcomeRepository): Promise<void> {
+  const ns = namespace()
+  const a = new Stream(ns, 'a')
+  await a.commit(repo, a.events(1, 1))
+  const commandId = `${ns}-cmd`
+
+  await expectError(
+    repo.commit({entityId: a.id, events: a.events(1, 1), outcome: outcome(commandId)}),
+    'a stale commit with an outcome',
+    stale,
+  )
+  ensure((await repo.outcome(commandId)) === null, 'the stale commit recorded no outcome')
+}
+
+async function outcomeBounds(repo: OutcomeRepository): Promise<void> {
+  const ns = namespace()
+  const a = new Stream(ns, 'a')
+  const long = `${ns}-${'x'.repeat(512)}`
+
+  await expectError(
+    repo.commit({entityId: a.id, events: a.events(1, 1), outcome: outcome(long)}),
+    'a command ID over 512 bytes',
+    (error) => error instanceof CommandIdTooLongError,
+  )
+  await expectError(repo.outcome(long), 'reading a command ID over 512 bytes', (error) => {
+    return error instanceof CommandIdTooLongError
+  })
+  await expectError(
+    repo.commit({
+      entityId: a.id,
+      events: a.events(1, 1),
+      outcome: outcome(`${ns}-nul`, {
+        status: 'rejected',
+        rejection: {code: 'c', message: 'm', details: {key: 'a\u0000b'}},
+      }),
+    }),
+    'a rejection holding U+0000',
+    coded('invalidArgument'),
+  )
+  await expectError(
+    repo.commit({
+      entityId: a.id,
+      events: a.events(1, 1),
+      outcome: outcome(`${ns}-large`, {response: new Uint8Array(65537)}),
+    }),
+    'a response over 65536 bytes',
+    coded('outcomeTooLarge'),
+  )
+  ensure((await repo.events(a.id)).length === 0, 'no refused commit wrote an event')
+}
+
+async function outcomeRace(repo: OutcomeRepository): Promise<void> {
+  const ns = namespace()
+  const commandId = `${ns}-cmd`
+  const writers = [1, 2, 3, 4].map((writer) =>
+    repo.commitTransaction({
+      streams: [],
+      outcome: outcome(commandId, {digest: `writer-${writer}`}),
+    }),
+  )
+  const results = await Promise.allSettled(writers)
+
+  // DynamoDB may cancel a concurrent writer with a TransactionConflict, which is transient: it
+  // records nothing, and a retry would find the winner's row.
+  const won = results.flatMap((result, i) => (result.status === 'fulfilled' ? [i + 1] : []))
+  ensure(won.length <= 1, `at most one writer records the outcome: ${won.length} did`)
+  for (const result of results) {
+    const lost = result.status === 'rejected' ? result.reason : undefined
+    if (lost !== undefined && !(lost instanceof OutcomeConflictError) && !isTransient(lost)) {
+      throw new Failure(`a losing writer: got ${describe(lost)}`)
+    }
+  }
+  const stored = await repo.outcome(commandId)
+  ensureEqual(
+    stored?.digest ?? null,
+    won[0] === undefined ? null : `writer-${won[0]}`,
+    "the stored outcome is the winner's",
+  )
 }
 
 function fence(stream: Stream, head: number, provenance: ReadFence['provenance'] = 'engine') {
