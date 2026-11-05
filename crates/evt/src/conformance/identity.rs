@@ -12,7 +12,7 @@ use crate::outcome::RecordedIdentity;
 pub(super) async fn identity_cases<R: Repository>(repo: &R) -> Vec<(&'static str, CaseResult)> {
     vec![
         (
-            "every outcome records its identity: single-aggregate, multi-stream, rejected, no-op, replayed",
+            "every outcome records its identity: single-aggregate, multi-stream, rejected, stale, no-op, replayed",
             Box::pin(identity_recorded(repo)).await,
         ),
         (
@@ -168,6 +168,36 @@ async fn identity_recorded<R: Repository>(repo: &R) -> CaseResult {
         stored_identity(repo, &stale).await?,
         recorded("ledger:rename", &[&b], Some("user:9")),
         "a stale-fence rejection's identity"
+    );
+
+    // And a client-expected version already stale persists the stale-version rejection the same
+    // way.
+    let expected = command_id();
+    let outcome = store
+        .execute_transaction(
+            &CommandIdentity::new("ledger:retitle").with_targets([b.clone()]),
+            &with_principal(&expected, "user:9"),
+            |tx| {
+                let b = b.clone();
+
+                Box::pin(async move {
+                    tx.read::<Ledger>(&b).await?;
+                    tx.expect(b, EventSequence(0))?;
+
+                    Ok(Decision::accept())
+                })
+            },
+        )
+        .await?;
+    ensure_eq!(
+        outcome.rejection().map(|rejection| rejection.code.clone()),
+        Some(crate::RejectionCode::STALE_VERSION),
+        "a stale expected version is the stale-version rejection"
+    );
+    ensure_eq!(
+        stored_identity(repo, &expected).await?,
+        recorded("ledger:retitle", &[&b], Some("user:9")),
+        "a stale-version rejection's identity"
     );
 
     // So does a command driven by hand.

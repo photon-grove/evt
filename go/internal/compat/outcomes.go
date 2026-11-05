@@ -66,6 +66,9 @@ type RetryDefaults struct {
 	BaseDelayMs int    `json:"baseDelayMs"`
 	MaxDelayMs  int    `json:"maxDelayMs"`
 	StaleCode   string `json:"staleCode"`
+
+	// StaleVersionCode is the default code of the stale-version rejection.
+	StaleVersionCode string `json:"staleVersionCode"`
 }
 
 // OutcomeLimits mirrors evt.MaxCommandIDBytes and evt.MaxOutcomeBytes.
@@ -135,6 +138,8 @@ func GenerateOutcomeFixtures() (OutcomeFixtures, error) {
 			BaseDelayMs: int(snapshots.DefaultRetryBaseDelay / time.Millisecond),
 			MaxDelayMs:  int(snapshots.DefaultRetryMaxDelay / time.Millisecond),
 			StaleCode:   string(evt.RejectionStaleFence),
+
+			StaleVersionCode: string(evt.RejectionStaleVersion),
 		},
 	}
 
@@ -195,6 +200,11 @@ func GenerateOutcomeFixtures() (OutcomeFixtures, error) {
 	}
 
 	callerFence, exhausted := evt.CallerFenceStaleRejection(), evt.RetriesExhaustedRejection(5)
+	// Two streams out of order, so the vector pins the sort as well as the shape.
+	staleVersion := evt.StaleVersionRejection([]evt.StaleVersion{
+		{EntityID: "profile#u-1", Expected: 4, Actual: 6},
+		{EntityID: "claim#ada", Expected: 0, Actual: 1},
+	})
 
 	// identity is what a row records for a digest vector's input, so the two stay in step.
 	identity := func(name string) *evt.RecordedIdentity {
@@ -279,6 +289,10 @@ func GenerateOutcomeFixtures() (OutcomeFixtures, error) {
 		}},
 		{"rejected stale fence, retries exhausted", evt.Outcome{
 			CommandID: "cmd-0009", Status: evt.OutcomeRejected, Digest: renameDigest, Rejection: &exhausted,
+			Identity: identity("rename, state-derived write set is not identity"),
+		}},
+		{"rejected stale version", evt.Outcome{
+			CommandID: "cmd-0011", Status: evt.OutcomeRejected, Digest: renameDigest, Rejection: &staleVersion,
 			Identity: identity("rename, state-derived write set is not identity"),
 		}},
 		// A rejection recorded with its failure events (RejectWithEvents): the same row as an

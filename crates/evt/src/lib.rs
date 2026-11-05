@@ -100,7 +100,7 @@ pub use numbers::canonical_numbers;
 pub use outcome::{
     CommandIdentity, CommandOutcome, DigestInput, Digester, MAX_COMMAND_ID_BYTES,
     MAX_OUTCOME_BYTES, Outcome, OutcomeCommand, OutcomeConfig, OutcomeStatus, RecordedIdentity,
-    Rejection, RejectionCode, ToRejection, canonical_digest_bytes, canonical_json,
+    Rejection, RejectionCode, StaleVersion, ToRejection, canonical_digest_bytes, canonical_json,
     check_command_id, check_outcome, decode_event_ids, default_digest, encode_event_ids,
 };
 pub use projection::{

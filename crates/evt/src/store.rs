@@ -611,7 +611,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
                     &self.repository,
                     &pending,
                     config.recovery_wait(),
-                    Rejection::retries_exhausted(budget.attempts()),
+                    config.stale_fence(Rejection::retries_exhausted(budget.attempts())),
                 )
                 .await;
             };
@@ -977,7 +977,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
                     &self.repository,
                     &pending,
                     config.recovery_wait(),
-                    Rejection::retries_exhausted(budget.attempts()),
+                    config.stale_fence(Rejection::retries_exhausted(budget.attempts())),
                 )
                 .await;
             };

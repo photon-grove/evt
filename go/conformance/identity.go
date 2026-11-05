@@ -100,6 +100,21 @@ func testIdentityRecorded(t *testing.T, repo evt.OutcomeRepository) {
 	require.Equal(t, &evt.RecordedIdentity{Type: "ledger:rename", Targets: []evt.EntityID{first}, Principal: principalOf("user:9")},
 		storedIdentity(t, repo, stale))
 
+	// And a client-expected version already stale persists the stale-version rejection the same way.
+	expected := env.commandID("expected")
+	outcome, err = env.store.ExecuteTransaction(ctx, evt.CommandIdentity{Type: "ledger:retitle", Targets: []evt.EntityID{first}},
+		withPrincipal(expected, "user:9"), func(ctx context.Context, tx *snapshots.Transaction) ([]byte, error) {
+			if readErr := tx.Read(ctx, newLedger(first), first); readErr != nil {
+				return nil, readErr
+			}
+
+			return nil, tx.Expect(first, 0)
+		})
+	require.NoError(t, err)
+	require.Equal(t, evt.RejectionStaleVersion, outcome.Rejection.Code)
+	require.Equal(t, &evt.RecordedIdentity{Type: "ledger:retitle", Targets: []evt.EntityID{first}, Principal: principalOf("user:9")},
+		storedIdentity(t, repo, expected))
+
 	// So does a command driven by hand.
 	manual := env.commandID("manual")
 	tx, _, err := env.store.BeginCommand(ctx, evt.CommandIdentity{Type: "ledger:touch", Targets: []evt.EntityID{second}}, withCommand(manual))

@@ -38,6 +38,10 @@ type Transaction struct {
 	fences  []evt.ReadFence
 	used    bool
 
+	// expected holds the client-expected heads declared with Expect, checked when the command is
+	// accepted.
+	expected map[evt.EntityID]evt.EventSequence
+
 	// command is set by BeginCommand on a store with outcomes enabled.
 	command *command
 
@@ -147,6 +151,70 @@ func (tx *Transaction) Fence(fence evt.ReadFence) error {
 	tx.fences = append(tx.fences, fence)
 
 	return nil
+}
+
+// Expect declares the head a client last saw for a stream the transaction reads (or will read
+// before it completes). It is checked only when the command is accepted: if the head this attempt
+// loaded differs, Complete records a stale-version rejection (evt.StaleVersionRejection, with the
+// store's WithStaleVersionCode) instead of committing, through the same fenced, outcome-only
+// commit as Reject. Reject and RejectWithEvents never consult it, so a domain rejection wins over a
+// stale version. Under Store.ExecuteTransaction every attempt checks the expectations against its
+// own load, so an acceptance never commits once an expected stream has moved.
+//
+// Expect needs a store with outcomes (WithOutcomes). Completing a transaction that expects a
+// stream it never read is an *evt.InvalidArgumentError, and so is expecting a negative head or
+// expecting one stream at two different heads.
+func (tx *Transaction) Expect(entityID evt.EntityID, head evt.EventSequence) error {
+	if tx.used {
+		return fmt.Errorf("snapshots: transaction is already consumed")
+	}
+
+	if tx.store.outcomes == nil {
+		return &evt.InvalidArgumentError{
+			Argument: "expect",
+			Message:  "client-expected versions are recorded as command outcomes; enable WithOutcomes and begin the transaction with BeginCommand",
+		}
+	}
+
+	if head < 0 {
+		return &evt.InvalidArgumentError{Argument: "expect", Message: fmt.Sprintf("expected head %d of %s is negative", head, entityID)}
+	}
+
+	if earlier, exists := tx.expected[entityID]; exists && earlier != head {
+		return &evt.InvalidArgumentError{
+			Argument: "expect",
+			Message:  fmt.Sprintf("%s is expected at head %d and %d", entityID, earlier, head),
+		}
+	}
+
+	if tx.expected == nil {
+		tx.expected = make(map[evt.EntityID]evt.EventSequence)
+	}
+	tx.expected[entityID] = head
+
+	return nil
+}
+
+// staleVersions compares the client-expected heads with the heads this transaction loaded and
+// returns the streams that differ.
+func (tx *Transaction) staleVersions() ([]evt.StaleVersion, error) {
+	var stale []evt.StaleVersion
+
+	for entityID, expected := range tx.expected {
+		stream, read := tx.streams[entityID]
+		if !read {
+			return nil, &evt.InvalidArgumentError{
+				Argument: "expect",
+				Message:  fmt.Sprintf("%s has an expected head but the transaction never read it", entityID),
+			}
+		}
+
+		if actual := streamHead(stream.cc); actual != expected {
+			stale = append(stale, evt.StaleVersion{EntityID: entityID, Expected: expected, Actual: actual})
+		}
+	}
+
+	return stale, nil
 }
 
 // Commit stamps the commit ID once, prepares every written stream's events, projector
@@ -287,6 +355,21 @@ func (tx *Transaction) finish(
 		return nil, err
 	}
 
+	// A command that would be accepted on a stream the client saw at another head is refused as
+	// stale. A domain rejection is recorded as it is, whatever the client expected.
+	if status == evt.OutcomeAccepted && len(tx.expected) > 0 {
+		stale, err := tx.staleVersions()
+		if err != nil {
+			return nil, err
+		}
+
+		if len(stale) > 0 {
+			staleVersion := evt.StaleVersionRejection(stale)
+			staleVersion.Code = tx.store.outcomes.staleVersionCode
+			status, response, rejection, withEvents = evt.OutcomeRejected, nil, &staleVersion, false
+		}
+	}
+
 	metadata := evt.CommitMetadata(tx.command.metadata)
 
 	var (
@@ -332,6 +415,8 @@ func (tx *Transaction) checkLegacyDuplicate() error {
 // stale by definition), events, or snapshots — and the old command ID stays terminal; the remedy
 // is a new command ID.
 func (c *command) staleFence(ctx context.Context, rejection evt.Rejection) (*evt.CommandOutcome, error) {
+	rejection.Code = c.store.outcomes.staleFenceCode
+
 	return c.commit(ctx, evt.SerializedResult{}, evt.OutcomeRejected, nil, &rejection)
 }
 

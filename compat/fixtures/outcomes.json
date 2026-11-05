@@ -7,7 +7,8 @@
     "maxAttempts": 5,
     "baseDelayMs": 25,
     "maxDelayMs": 1000,
-    "staleCode": "stale-fence"
+    "staleCode": "stale-fence",
+    "staleVersionCode": "stale-version"
   },
   "digests": [
     {
@@ -756,6 +757,67 @@
         "events": "[]",
         "principal": "user:42",
         "rejection": "{\"code\":\"stale-fence\",\"message\":\"the state this command was decided on kept changing; retries were exhausted\",\"details\":{\"attempts\":5}}",
+        "response": null,
+        "status": "rejected",
+        "targets": "[\"profile#u-1\"]"
+      }
+    },
+    {
+      "name": "rejected stale version",
+      "input": {
+        "commandId": "cmd-0011",
+        "status": "rejected",
+        "digest": "00c8f624f35c034dcd5dee3924a4c78245a8b40aab4c1661db5948bf07b55ed0",
+        "response": null,
+        "eventIds": [],
+        "rejection": "{\"code\":\"stale-version\",\"message\":\"a client-expected stream version is stale\",\"details\":{\"streams\":[{\"actual\":1,\"entityId\":\"claim#ada\",\"expected\":0},{\"actual\":6,\"entityId\":\"profile#u-1\",\"expected\":4}]}}",
+        "identity": {
+          "commandType": "profile:rename",
+          "targets": [
+            "profile#u-1"
+          ],
+          "principal": "user:42"
+        }
+      },
+      "rejectionJson": "{\"code\":\"stale-version\",\"message\":\"a client-expected stream version is stale\",\"details\":{\"streams\":[{\"actual\":1,\"entityId\":\"claim#ada\",\"expected\":0},{\"actual\":6,\"entityId\":\"profile#u-1\",\"expected\":4}]}}",
+      "dynamoItem": {
+        "code": {
+          "S": "stale-version"
+        },
+        "commandType": {
+          "S": "profile:rename"
+        },
+        "digest": {
+          "S": "00c8f624f35c034dcd5dee3924a4c78245a8b40aab4c1661db5948bf07b55ed0"
+        },
+        "pk": {
+          "S": "command-outcome#cmd-0011"
+        },
+        "principal": {
+          "S": "user:42"
+        },
+        "rejection": {
+          "S": "{\"code\":\"stale-version\",\"message\":\"a client-expected stream version is stale\",\"details\":{\"streams\":[{\"actual\":1,\"entityId\":\"claim#ada\",\"expected\":0},{\"actual\":6,\"entityId\":\"profile#u-1\",\"expected\":4}]}}"
+        },
+        "sk": {
+          "N": "1"
+        },
+        "status": {
+          "S": "rejected"
+        },
+        "targets": {
+          "S": "[\"profile#u-1\"]"
+        }
+      },
+      "itemSize": 404,
+      "postgresRow": {
+        "code": "stale-version",
+        "command_id": "cmd-0011",
+        "command_type": "profile:rename",
+        "digest": "00c8f624f35c034dcd5dee3924a4c78245a8b40aab4c1661db5948bf07b55ed0",
+        "events": "[]",
+        "principal": "user:42",
+        "rejection": "{\"code\":\"stale-version\",\"message\":\"a client-expected stream version is stale\",\"details\":{\"streams\":[{\"actual\":1,\"entityId\":\"claim#ada\",\"expected\":0},{\"actual\":6,\"entityId\":\"profile#u-1\",\"expected\":4}]}}",
         "response": null,
         "status": "rejected",
         "targets": "[\"profile#u-1\"]"
