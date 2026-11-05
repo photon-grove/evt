@@ -7,6 +7,7 @@ import {
   ConflictError,
   CompactionUncoveredError,
   EvtError,
+  FenceConflictError,
   HistoryDependentProjectionError,
   RebuildInProgressError,
   SequenceGapError,
@@ -27,11 +28,17 @@ import type {Metadata} from '../metadata.js'
 import {
   type CallOptions,
   type Commit,
-  type Repository,
+  type NormalizedTransaction,
+  type ReadFence,
   type StoreInitializer,
+  type TransactionCommit,
+  type TransactionalRepository,
   checkBudget,
+  checkFenceRetention,
   checkNotReserved,
-  commitSizes,
+  normalizeTransaction,
+  rankFailures,
+  transactionSizes,
   validateCommit,
 } from '../repository.js'
 
@@ -75,7 +82,7 @@ let controlsOf: (repo: MemRepository) => Controls
  * on its feature manifest, so {@link initialize} is needed only where code treats every backend
  * alike.
  */
-export class MemRepository implements Repository, StoreInitializer {
+export class MemRepository implements TransactionalRepository, StoreInitializer {
   readonly #streams = new Map<string, Stream>()
   readonly #controls: Controls = {manifest: null, rebuild: {generation: 0n, lock: null}}
 
@@ -95,44 +102,80 @@ export class MemRepository implements Repository, StoreInitializer {
     options?.signal?.throwIfAborted()
     validateCommit(commit)
     checkNotReserved(commit.entityId)
-    if (commit.events.length === 0) {
-      return
+    if (commit.events.length > 0) {
+      this.#write(normalizeTransaction({streams: [commit]}))
     }
+  }
 
+  async commitTransaction(transaction: TransactionCommit, options?: CallOptions): Promise<void> {
+    options?.signal?.throwIfAborted()
+    const normalized = normalizeTransaction(transaction)
+    if (normalized.streams.length > 0 || normalized.fences.length > 0) {
+      this.#write(normalized)
+    }
+  }
+
+  // Writes a transaction, or refuses it with nothing written, in the order the live backends
+  // check: the budget, the marker and the fences' retention, the rebuild lock, then every stream
+  // and fence, ranked.
+  #write(transaction: NormalizedTransaction): void {
     // Every backend budgets a commit the same way, so an oversized one fails before any write.
-    checkBudget(commitSizes(commit, () => undefined))
+    checkBudget(transactionSizes(transaction, () => undefined))
 
     // The control rows come first, as the two checks that open every live commit: the marker,
     // then the rebuild lock, which an unsettled generation fails, a force-released one included.
     this.#checkManifest()
+    const retention = this.#controls.manifest?.retention ?? []
+    checkFenceRetention(transaction, (entityType) => retention.includes(entityType))
     const {rebuild} = this.#controls
     if (rebuild.lock !== null || rebuild.generation % 2n !== 0n) {
       throw new RebuildInProgressError()
     }
 
-    const held = this.#streams.get(commit.entityId) ?? emptyStream()
-    checkWrite(commit, held)
-
-    // Copy everything before the first write, so a copy that throws leaves the stream as it was.
-    const events = commit.events.map(cloneEvent)
-    const last = events.at(-1)!.sequence
-    const snapshot = commit.snapshot && {
-      entityType: commit.snapshot.entityType,
-      entityId: commit.entityId,
-      sequence: commit.snapshot.sequence,
-      eventSequence: last,
-      payload: copy(commit.snapshot.payload),
+    const failures: EvtError[] = []
+    for (const stream of transaction.streams) {
+      const failure = checkWrite(stream, this.#streams.get(stream.entityId) ?? emptyStream())
+      if (failure !== null) {
+        failures.push(failure)
+      }
+    }
+    for (const fence of transaction.fences) {
+      const failure = checkFence(fence, this.#streams.get(fence.entityId) ?? emptyStream())
+      if (failure !== null) {
+        failures.push(failure)
+      }
+    }
+    const failure = rankFailures(failures)
+    if (failure !== undefined) {
+      throw failure
     }
 
-    for (const event of events) {
-      held.events.set(event.sequence, event)
-    }
-    held.head = held.head > last ? held.head : last
-    if (snapshot) {
-      held.snapshot = snapshot
-    }
+    // Copy everything before the first write, so a copy that throws leaves every stream as it was.
+    const writes = transaction.streams.map((commit) => {
+      const events = commit.events.map(cloneEvent)
+      const last = events.at(-1)!.sequence
+      const snapshot = commit.snapshot && {
+        entityType: commit.snapshot.entityType,
+        entityId: commit.entityId,
+        sequence: commit.snapshot.sequence,
+        eventSequence: last,
+        payload: copy(commit.snapshot.payload),
+      }
 
-    this.#streams.set(commit.entityId, held)
+      return {entityId: commit.entityId, events, last, snapshot}
+    })
+
+    for (const {entityId, events, last, snapshot} of writes) {
+      const held = this.#streams.get(entityId) ?? emptyStream()
+      for (const event of events) {
+        held.events.set(event.sequence, event)
+      }
+      held.head = held.head > last ? held.head : last
+      if (snapshot) {
+        held.snapshot = snapshot
+      }
+      this.#streams.set(entityId, held)
+    }
   }
 
   async events(entityId: string, options?: CallOptions): Promise<SerializedEvent[]> {
@@ -272,29 +315,47 @@ export class MemRepository implements Repository, StoreInitializer {
   }
 }
 
-// Refuses a commit the stored stream doesn't accept, as the live backends' conditions do. The
-// head update needs no head for a create and the head to be the sequence before the first event
-// for an append. Then no event may exist already, and a snapshot must follow the stored one.
-function checkWrite(commit: Commit, held: Stream): void {
+// The failure of a commit the stored stream doesn't accept, as the live backends' conditions find
+// it, or null. The head update needs no head for a create and the head to be the sequence before
+// the first event for an append. Then no event may exist already, and a snapshot must follow the
+// stored one.
+function checkWrite(commit: Commit, held: Stream): EvtError | null {
   const first = commit.events[0]!.sequence
   const headPasses = first <= 1n ? held.head === 0n : held.head === first - 1n
   if (!headPasses) {
-    throw probe(commit.entityId, held, first)
+    return probe(commit.entityId, held, first)
   }
 
   // The head update passed and an event put would fail: an event sits above the head.
   if (commit.events.some((event) => held.events.has(event.sequence))) {
-    throw drift(commit.entityId, held.head, derivedHead(held))
+    return drift(commit.entityId, held.head, derivedHead(held))
   }
 
   const snapshot = commit.snapshot
   const stored = held.snapshot?.sequence ?? 0n
   if (snapshot && snapshot.sequence !== stored + 1n) {
-    throw new ConflictError(
+    return new ConflictError(
       commit.entityId,
       `snapshot sequence moved: stored ${stored}, commit writes ${snapshot.sequence}`,
     )
   }
+
+  return null
+}
+
+// The failure of a fence whose stream's head moved, or null: drift when the head disagrees with
+// the log, and otherwise a fence conflict.
+function checkFence(fence: ReadFence, held: Stream): EvtError | null {
+  if (held.head === fence.head) {
+    return null
+  }
+
+  const derived = derivedHead(held)
+  if (held.head !== derived) {
+    return drift(fence.entityId, held.head, derived)
+  }
+
+  return new FenceConflictError(fence.entityId, fence.head, fence.provenance)
 }
 
 // Classifies a failed head update the way the live backends' failure-path probe does: a stored

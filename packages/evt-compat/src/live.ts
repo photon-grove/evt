@@ -1,33 +1,46 @@
 // The TypeScript driver of the cross-language run (scripts/compat-integration.sh, ADR 0009):
 //
 //   live.js scenarios
-//   live.js step   --backend dynamo --run RUN --index N --as go|rust
-//   live.js verify --backend dynamo --run RUN
+//   live.js step   --backend dynamo|postgres --run RUN --index N --as go|rust
+//   live.js verify --backend dynamo|postgres --run RUN
 //
 // TypeScript joins the run as a stand-in. step executes step N of every scenario TypeScript
 // supports whose writer is the language --as names, and stamps that language's name into the
 // event's origin and commit ID, so the streams match the fixtures byte for byte. In such a pass
 // the other language's driver writes its own steps of the same scenarios, limited to the list
 // scenarios prints (-scenarios or --scenarios). verify checks the streams of the supported
-// scenarios against the golden fixtures: the raw DynamoDB items, the SNS messages, the events and
-// snapshot read through the repository, and the loaded state.
+// scenarios against the golden fixtures: the events and snapshot read through the repository, the
+// loaded state and the head, and what the backend stores: the raw DynamoDB items and the SNS
+// messages they publish, or the PostgreSQL event and snapshot rows.
 //
-// It runs against a local DynamoDB emulator, such as Moto, at AWS_ENDPOINT_URL, never real AWS.
-// TypeScript has no PostgreSQL repository and no event-log enumeration yet, so it joins neither
-// the PostgreSQL run nor the enumeration check.
+// It runs against a local DynamoDB emulator, such as Moto, at AWS_ENDPOINT_URL, never real AWS,
+// or a local PostgreSQL server at DATABASE_URL, in the default tables the Go and Rust drivers use.
+// TypeScript has no event-log enumeration yet, so it doesn't join the enumeration check.
 
 // Each step needs the one before it, so the driver awaits in loops on purpose.
 /* oxlint-disable no-await-in-loop */
 import {type AttributeValue, DynamoDB} from '@aws-sdk/client-dynamodb'
 import process from 'node:process'
+import {Pool} from 'pg'
 
-import {type JsonValue, encodeEnvelope, encodeEvent, encodeSnapshot} from '@photon-grove/evt'
+import {
+  type JsonValue,
+  type Repository,
+  decodeEvent,
+  decodeSnapshot,
+  encodeEnvelope,
+  encodeEvent,
+  encodeMetadata,
+  encodeSnapshot,
+  parseJson,
+} from '@photon-grove/evt'
 import {
   DynamoRepository,
   type Item,
   eventFromItem,
   headFromItem,
 } from '@photon-grove/evt/dynamodb'
+import {PgRepository, streamHeadsTable} from '@photon-grove/evt/postgres'
 
 import {Checks, canonical, field, list, loadFixture, loadFixtureForRun, str} from './harness.js'
 import {
@@ -53,38 +66,44 @@ interface Args {
   as: string
 }
 
+/** A backend the run writes, and how to read a stream back as it stores it. */
+interface Backend {
+  readonly repository: Repository
+  observe(runner: Runner, id: string): Promise<Observed>
+  /** Compares what the backend stores for a stream beyond what `observe` reads. */
+  checkRows(checks: Checks, name: string, id: string, expected: JsonValue): Promise<void>
+  close(): Promise<void>
+}
+
 const cli = parseArgs(process.argv.slice(2))
 
 if (cli.command === 'scenarios') {
   console.log(SUPPORTED_SCENARIOS.join(','))
 } else {
-  if (cli.backend !== 'dynamo') {
-    throw new Error(`the TypeScript driver runs only against dynamo, not ${cli.backend || '-'}`)
-  }
   if (cli.run === '') {
     throw new Error('--run is required')
   }
 
-  const table = process.env['EVT_COMPAT_DYNAMO_TABLE'] ?? 'evt-local-event-log'
-  const client = dynamoClient()
-  // Lazily initializing, as the Go and Rust drivers are, so a fresh table takes the first write.
-  const repository = new DynamoRepository(client, table, {lazyInitialization: true})
+  const backend = await openBackend(cli.backend)
   const checks = new Checks()
   let quiet = false
-
-  switch (cli.command) {
-    case 'step':
-      if (!WRITERS.includes(cli.as)) {
-        throw new Error(`--as must be go or rust, not ${cli.as || '-'}`)
-      }
-      // An index with no step of the stood-in language's checks nothing, so it reports nothing.
-      quiet = (await runStep(checks, repository, cli)) === 0
-      break
-    case 'verify':
-      await verify(checks, repository, client, table, cli.run)
-      break
-    default:
-      throw new Error(`unknown command ${cli.command}`)
+  try {
+    switch (cli.command) {
+      case 'step':
+        if (!WRITERS.includes(cli.as)) {
+          throw new Error(`--as must be go or rust, not ${cli.as || '-'}`)
+        }
+        // An index with no step of the stood-in language's checks nothing, so it reports nothing.
+        quiet = (await runStep(checks, backend.repository, cli)) === 0
+        break
+      case 'verify':
+        await verify(checks, backend, cli.run)
+        break
+      default:
+        throw new Error(`unknown command ${cli.command}`)
+    }
+  } finally {
+    await backend.close()
   }
 
   if (!quiet) {
@@ -130,17 +149,36 @@ function parseArgs(argv: string[]): Args {
   return parsed
 }
 
-// Only a local emulator: a loopback address or a .localhost name.
-function dynamoClient(): DynamoDB {
-  const endpoint = process.env['AWS_ENDPOINT_URL'] ?? 'http://localhost:4566'
-  const host = URL.canParse(endpoint) ? new URL(endpoint).hostname : ''
-  const local = ['localhost', '127.0.0.1', '[::1]'].includes(host) || host.endsWith('.localhost')
-  if (!local) {
-    throw new Error(`AWS_ENDPOINT_URL must name a local DynamoDB emulator: ${endpoint}`)
+async function openBackend(name: string): Promise<Backend> {
+  switch (name) {
+    case 'dynamo':
+      return dynamoBackend()
+    case 'postgres':
+      return postgresBackend()
+    default:
+      throw new Error(`--backend must be dynamo or postgres, not ${name || '-'}`)
+  }
+}
+
+// Only a local server: a loopback address or a .localhost name.
+function local(url: string, variable: string, what: string): string {
+  const host = URL.canParse(url) ? new URL(url).hostname : ''
+  if (!['localhost', '127.0.0.1', '[::1]'].includes(host) && !host.endsWith('.localhost')) {
+    throw new Error(`${variable} must name a local ${what}: ${url}`)
   }
 
+  return url
+}
+
+function dynamoBackend(): Backend {
+  const endpoint = local(
+    process.env['AWS_ENDPOINT_URL'] ?? 'http://localhost:4566',
+    'AWS_ENDPOINT_URL',
+    'DynamoDB emulator',
+  )
+
   // One attempt, as the Go driver makes, so a refused request fails the step instead of retrying.
-  return new DynamoDB({
+  const client = new DynamoDB({
     endpoint,
     region: process.env['AWS_REGION'] ?? 'us-west-2',
     maxAttempts: 1,
@@ -149,6 +187,126 @@ function dynamoClient(): DynamoDB {
       secretAccessKey: process.env['AWS_SECRET_ACCESS_KEY'] ?? 'test',
     },
   })
+  const table = process.env['EVT_COMPAT_DYNAMO_TABLE'] ?? 'evt-local-event-log'
+  // Lazily initializing, as the Go and Rust drivers are, so a fresh table takes the first write.
+  const repository = new DynamoRepository(client, table, {lazyInitialization: true})
+
+  return {
+    repository,
+    // A stream as the table stores it and as the repository reads it back.
+    async observe(runner, id) {
+      const items = await partition(client, table, id)
+      const head = items.find((item) => sortKey(item) === '-1')
+      const eventItems = items.filter((item) => !['-1', '0'].includes(sortKey(item)))
+      const snapshot = await repository.snapshot(id)
+
+      return {
+        ...(await runner.load(id)),
+        events: (await repository.events(id)).map(encodeEvent),
+        snapshot: snapshot && encodeSnapshot(snapshot),
+        head: head === undefined ? null : headFromItem(head).head,
+        dynamoItems: items,
+        snsMessages: eventItems.map((item) => encodeEnvelope(eventFromItem(item), ORIGIN_SOURCE)),
+      }
+    },
+    // The items are compared with the stream itself.
+    async checkRows() {},
+    async close() {
+      client.destroy()
+    },
+  }
+}
+
+async function postgresBackend(): Promise<Backend> {
+  // The local-only placeholder credentials infra/local-postgres creates, as the Go driver uses.
+  const url = local(
+    process.env['DATABASE_URL'] || 'postgres://evt:evt@localhost:5432/evt_local',
+    'DATABASE_URL',
+    'PostgreSQL server',
+  )
+  const pool = new Pool({connectionString: url, max: 2})
+  const repository = new PgRepository(pool)
+  try {
+    // As the Go and Rust drivers do: whichever language writes first creates the schema.
+    await repository.ensureSchema()
+  } catch (error) {
+    await pool.end()
+    throw error
+  }
+
+  return {
+    repository,
+    async observe(runner, id) {
+      const snapshot = await repository.snapshot(id)
+      const {rows} = await pool.query<{head: string}>(
+        `SELECT head::text AS head FROM ${streamHeadsTable(repository.tables)} ` +
+          'WHERE entity_id = $1',
+        [id],
+      )
+
+      return {
+        ...(await runner.load(id)),
+        events: (await repository.events(id)).map(encodeEvent),
+        snapshot: snapshot && encodeSnapshot(snapshot),
+        head: rows[0] === undefined ? null : BigInt(rows[0].head),
+      }
+    },
+    // The event and snapshot rows as stored, as the Go driver compares them: each event's
+    // metadata as JSON, since jsonb normalizes its text.
+    async checkRows(checks, name, id, expected) {
+      const {events, snapshots} = repository.tables
+      const stored = await pool.query<Record<string, string>>(
+        'SELECT entity_id, sequence::text AS sequence, event_id, event_type, ' +
+          "version::text AS version, entity_type, encode(payload, 'hex') AS payload, " +
+          `metadata::text AS metadata FROM ${events} WHERE entity_id = $1 ` +
+          // The column, not the text alias, which would put 10 before 9.
+          `ORDER BY ${events}.sequence`,
+        [id],
+      )
+      const want = list(field(expected, 'events')).map((encoded) => {
+        const event = decodeEvent(str(encoded))
+        return {
+          entity_id: event.entityId,
+          sequence: event.sequence.toString(),
+          event_id: event.id,
+          event_type: event.type,
+          version: event.version.toString(),
+          entity_type: event.entityType,
+          payload: hex(event.payload),
+          metadata: parseJson(encodeMetadata(event.metadata)),
+        }
+      })
+      const got = stored.rows.map((row) =>
+        Object.assign({}, row, {metadata: parseJson(row['metadata']!)}),
+      )
+      checks.equal(`${name}: event rows`, canonical(got), canonical(want))
+
+      const snapshot = await pool.query<Record<string, string>>(
+        'SELECT entity_id, entity_type, sequence::text AS sequence, ' +
+          "event_sequence::text AS event_sequence, encode(payload, 'hex') AS payload " +
+          `FROM ${snapshots} WHERE entity_id = $1`,
+        [id],
+      )
+      const encoded = field(expected, 'snapshot')
+      const wantSnapshot = encoded === null ? null : decodeSnapshot(str(encoded))
+      checks.equal(
+        `${name}: snapshot row`,
+        canonical(snapshot.rows[0] ?? null),
+        canonical(
+          wantSnapshot && {
+            entity_id: wantSnapshot.entityId,
+            entity_type: wantSnapshot.entityType,
+            sequence: wantSnapshot.sequence.toString(),
+            event_sequence: wantSnapshot.eventSequence.toString(),
+            payload: hex(wantSnapshot.payload),
+          },
+        ),
+      )
+    },
+    async close() {
+      await pool.end()
+    },
+  }
 }
 
 async function supportedScenarios(): Promise<JsonValue[]> {
@@ -165,11 +323,7 @@ async function supportedScenarios(): Promise<JsonValue[]> {
   })
 }
 
-async function runStep(
-  checks: Checks,
-  repository: DynamoRepository,
-  args: Args,
-): Promise<number> {
+async function runStep(checks: Checks, repository: Repository, args: Args): Promise<number> {
   let executed = 0
   for (const scenario of await supportedScenarios()) {
     const name = str(field(scenario, 'name'))
@@ -190,13 +344,7 @@ async function runStep(
   return executed
 }
 
-async function verify(
-  checks: Checks,
-  repository: DynamoRepository,
-  client: DynamoDB,
-  table: string,
-  run: string,
-): Promise<void> {
+async function verify(checks: Checks, backend: Backend, run: string): Promise<void> {
   const fixtures = await loadFixtureForRun('scenarios.json', run)
   const expectations = new Map(
     list(field(fixtures, 'scenarios')).map((expected) => [str(field(expected, 'name')), expected]),
@@ -210,39 +358,18 @@ async function verify(
       continue
     }
 
-    const runner = new Runner(repository, scenario, `compat-${run}-${name}`)
+    const runner = new Runner(backend.repository, scenario, `compat-${run}-${name}`)
     checks.equal(`${name}: entity ID`, runner.entityId, str(field(expected, 'entityId')))
-    const observe = (id: string) => observeStream(repository, client, table, runner, id)
-    compareObserved(checks, name, await observe(runner.entityId), expected)
+    compareObserved(checks, name, await backend.observe(runner, runner.entityId), expected)
+    await backend.checkRows(checks, name, runner.entityId, expected)
 
     // Every other stream the scenario touches.
     for (const sibling of optionalList(expected, 'siblings')) {
       const id = str(field(sibling, 'entityId'))
-      compareStream(checks, `${name} sibling ${id}`, await observe(id), sibling)
+      const label = `${name} sibling ${id}`
+      compareStream(checks, label, await backend.observe(runner, id), sibling)
+      await backend.checkRows(checks, label, id, sibling)
     }
-  }
-}
-
-// A stream as the table stores it and as the repository reads it back.
-async function observeStream(
-  repository: DynamoRepository,
-  client: DynamoDB,
-  table: string,
-  runner: Runner,
-  id: string,
-): Promise<Observed> {
-  const items = await partition(client, table, id)
-  const head = items.find((item) => sortKey(item) === '-1')
-  const eventItems = items.filter((item) => !['-1', '0'].includes(sortKey(item)))
-  const snapshot = await repository.snapshot(id)
-
-  return {
-    ...(await runner.load(id)),
-    events: (await repository.events(id)).map(encodeEvent),
-    snapshot: snapshot && encodeSnapshot(snapshot),
-    head: head === undefined ? null : headFromItem(head).head,
-    dynamoItems: items,
-    snsMessages: eventItems.map((item) => encodeEnvelope(eventFromItem(item), ORIGIN_SOURCE)),
   }
 }
 
@@ -270,4 +397,9 @@ async function partition(client: DynamoDB, table: string, pk: string): Promise<I
   } while (start !== undefined)
 
   return items
+}
+
+// Bytes as lowercase hex, as encode(payload, 'hex') writes them. A null payload is stored empty.
+function hex(bytes: Uint8Array | null): string {
+  return Array.from(bytes ?? [], (byte) => byte.toString(16).padStart(2, '0')).join('')
 }

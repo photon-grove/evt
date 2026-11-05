@@ -16,11 +16,14 @@ import {
   EvtError,
   type FeatureManifest,
   FeatureManifestChangedError,
+  FenceConflictError,
   HistoryDependentProjectionError,
   type NewSnapshot,
   RebuildInProgressError,
+  type ReadFence,
   type Repository,
   ReservedEntityIdError,
+  RetentionConflictError,
   STREAM_HEADS_FEATURE,
   STREAM_HEADS_VERSION,
   SequenceGapError,
@@ -28,6 +31,7 @@ import {
   type SerializedSnapshot,
   type StoreInitializer,
   StreamHeadDriftError,
+  type TransactionalRepository,
   StreamHeadsNotMigratedError,
   UnsupportedFeatureError,
   emptyMetadata,
@@ -54,6 +58,7 @@ export async function conformance(
   const cases: [string, () => Promise<void>][] = [
     ['isolate entities', () => isolateEntities(repo)],
     ['commit and read', () => commitAndRead(repo)],
+    ['reads order events by sequence, past nine', () => numericOrder(repo)],
     ['metadata survives commit and read', () => metadataRoundTrip(repo)],
     ['reject events from another entity or of another type', () => foreignEvents(repo)],
     ['reject events out of order', () => outOfOrderEvents(repo)],
@@ -83,6 +88,20 @@ export async function conformance(
       () => streamHeadDrift(repo, fixtures),
     ])
   }
+  if (transactional(repo)) {
+    cases.push(
+      ['a transaction writes every stream or none', () => transactionAtomicity(repo)],
+      ['a read fence holds while its head does', () => readFences(repo)],
+      ['a transaction built wrong is refused before any write', () => invalidTransactions(repo)],
+      ['a transaction budgets its fences', () => transactionBudget(repo)],
+    )
+    if (fixtures) {
+      cases.push([
+        'a transaction reports drift, then a gap, then a conflict',
+        () => transactionRanking(repo, fixtures),
+      ])
+    }
+  }
 
   for (const [name, run] of cases) {
     await checks.case(`conformance: ${name}`, run)
@@ -90,6 +109,231 @@ export async function conformance(
 }
 
 class Failure extends Error {}
+
+function transactional(repo: Repository): repo is TransactionalRepository {
+  return typeof (repo as Partial<TransactionalRepository>).commitTransaction === 'function'
+}
+
+function fence(stream: Stream, head: number, provenance: ReadFence['provenance'] = 'engine') {
+  return {entityId: stream.id, entityType: stream.entityType, head: BigInt(head), provenance}
+}
+
+async function transactionAtomicity(repo: TransactionalRepository): Promise<void> {
+  const ns = namespace()
+  const a = new Stream(ns, 'a')
+  const b = new Stream(ns, 'b')
+  await repo.commitTransaction({
+    streams: [
+      {entityId: b.id, events: b.events(1, 1)},
+      {entityId: a.id, events: a.events(1, 2), snapshot: a.newSnapshot(1, '{"n":2}')},
+    ],
+  })
+  ensureEqual(await repo.events(a.id), a.events(1, 2), 'events(a) after the transaction')
+  ensureEqual(await repo.events(b.id), b.events(1, 1), 'events(b) after the transaction')
+  ensure((await repo.snapshot(a.id))?.eventSequence === 2n, "a's snapshot covers its last event")
+
+  // b's append is stale, so a's isn't written either.
+  await expectError(
+    repo.commitTransaction({
+      streams: [
+        {entityId: a.id, events: a.events(3, 3)},
+        {entityId: b.id, events: b.events(1, 1)},
+      ],
+    }),
+    'a transaction with a stale stream',
+    stale,
+  )
+  ensureEqual(await repo.events(a.id), a.events(1, 2), 'the stale transaction wrote nothing to a')
+}
+
+async function readFences(repo: TransactionalRepository): Promise<void> {
+  const ns = namespace()
+  const read = new Stream(ns, 'read')
+  const write = new Stream(ns, 'write')
+  const absent = new Stream(ns, 'absent')
+  await read.commit(repo, read.events(1, 2))
+
+  // Fences at the stored heads pass: 2 on the read stream, 0 on a stream with no events.
+  await repo.commitTransaction({
+    streams: [{entityId: write.id, events: write.events(1, 1)}],
+    fences: [fence(read, 2), fence(absent, 0)],
+  })
+
+  // Another writer moves the read stream, and the fence at its old head fails, retryable because
+  // the engine observed it. A caller-stamped fence fails the same way, and isn't retryable.
+  await read.commit(repo, read.events(3, 3))
+  for (const provenance of ['engine', 'caller'] as const) {
+    const error = await expectError(
+      repo.commitTransaction({
+        streams: [{entityId: write.id, events: write.events(2, 2)}],
+        fences: [fence(read, 2, provenance)],
+      }),
+      `a ${provenance} fence at a moved head`,
+      (failure) => failure instanceof FenceConflictError,
+    )
+    const conflict = error as FenceConflictError
+    ensure(conflict.entityId === read.id && conflict.head === 2n, 'it names the stream and head')
+    ensure(conflict.provenance === provenance, `its provenance is ${provenance}`)
+    ensure(isConflict(conflict), 'a fence conflict is a conflict')
+    ensure(isRetryable(conflict) === (provenance === 'engine'), 'only an engine fence retries')
+  }
+  ensureEqual(await repo.events(write.id), write.events(1, 1), 'a failed fence wrote nothing')
+
+  // A fence on a stream the transaction writes is dropped: its head update conditions on it.
+  await repo.commitTransaction({
+    streams: [{entityId: write.id, events: write.events(2, 2)}],
+    fences: [fence(write, 9)],
+  })
+
+  // A stream listed with no events writes nothing, so its fence stays and is checked.
+  await expectError(
+    repo.commitTransaction({
+      streams: [
+        {entityId: read.id, events: []},
+        {entityId: write.id, events: write.events(3, 3)},
+      ],
+      fences: [fence(read, 2)],
+    }),
+    'a stale fence on a stream listed without events',
+    (failure) => failure instanceof FenceConflictError,
+  )
+
+  // A transaction that only fences checks its fences and writes nothing.
+  await repo.commitTransaction({streams: [], fences: [fence(read, 3), fence(absent, 0)]})
+  await absent.commit(repo, absent.events(1, 1))
+  await expectError(
+    repo.commitTransaction({streams: [], fences: [fence(absent, 0)]}),
+    'a fence on a stream created since',
+    (failure) => failure instanceof FenceConflictError,
+  )
+}
+
+async function invalidTransactions(repo: TransactionalRepository): Promise<void> {
+  const ns = namespace()
+  const a = new Stream(ns, 'a')
+  const b = new Stream(ns, 'b')
+  const invalid = coded('invalidCommit')
+  const refusals: [string, Promise<void>, (error: unknown) => boolean][] = [
+    [
+      'a stream written twice',
+      repo.commitTransaction({
+        streams: [
+          {entityId: a.id, events: a.events(1, 1)},
+          {entityId: a.id, events: a.events(2, 2)},
+        ],
+      }),
+      invalid,
+    ],
+    [
+      'a stream fenced twice',
+      repo.commitTransaction({streams: [], fences: [fence(b, 0), fence(b, 1)]}),
+      invalid,
+    ],
+    ['a fence below 0', repo.commitTransaction({streams: [], fences: [fence(b, -1)]}), invalid],
+    [
+      'a snapshot without events',
+      repo.commitTransaction({
+        streams: [{entityId: a.id, events: [], snapshot: a.newSnapshot(1, '{}')}],
+      }),
+      invalid,
+    ],
+    [
+      'a fence in a reserved namespace',
+      repo.commitTransaction({
+        streams: [],
+        fences: [{...fence(b, 0), entityId: 'SYSTEM#FEATURES'}],
+      }),
+      (error) => error instanceof ReservedEntityIdError,
+    ],
+  ]
+  for (const [what, call, matches] of refusals) {
+    await expectError(call, what, matches)
+  }
+
+  // A transaction that writes nothing and fences nothing is a no-op.
+  await repo.commitTransaction({streams: [{entityId: a.id, events: []}]})
+  ensure((await repo.events(a.id)).length === 0, 'the refused transactions wrote nothing')
+}
+
+async function transactionBudget(repo: TransactionalRepository): Promise<void> {
+  const ns = namespace()
+  const written = new Stream(ns, 'written')
+
+  // The two control checks, the head update and the event, then one check per fence: 100 actions
+  // fit, 101 don't.
+  const fences = (count: number) =>
+    Array.from({length: count}, (_, i) => fence(new Stream(ns, `fenced-${i}`), 0))
+  await expectError(
+    repo.commitTransaction({
+      streams: [{entityId: written.id, events: written.events(1, 1)}],
+      fences: fences(97),
+    }),
+    'a transaction of 101 actions',
+    (error) => error instanceof CommitTooLargeError,
+  )
+  ensure((await repo.events(written.id)).length === 0, 'the oversized transaction wrote nothing')
+
+  await repo.commitTransaction({
+    streams: [{entityId: written.id, events: written.events(1, 1)}],
+    fences: fences(96),
+  })
+}
+
+async function transactionRanking(
+  repo: TransactionalRepository,
+  fixtures: HeadFixtures,
+): Promise<void> {
+  const ns = namespace()
+  // Sorted by ID, the conflict stream comes first, then the gap, then the drift, as in Rust's
+  // suite. Each write below fails on its stream's head statement, which every backend classifies
+  // by the same probe.
+  const conflicted = new Stream(ns, 'a-conflict')
+  const gapped = new Stream(ns, 'b-gap')
+  const drifted = new Stream(ns, 'c-drift')
+  await conflicted.commit(repo, conflicted.events(1, 2))
+  await gapped.commit(repo, gapped.events(1, 1))
+  await drifted.commit(repo, drifted.events(1, 2))
+  await fixtures.appendBypassingHead(drifted.event(3, 3))
+
+  const behind = {entityId: conflicted.id, events: conflicted.events(2, 2)} // the head is 2, not 1
+  const skipping = {entityId: gapped.id, events: gapped.events(3, 3)} // the head is 1, not 2
+  const ahead = {entityId: drifted.id, events: drifted.events(4, 4)} // the head is 2, the log 3
+
+  await expectError(
+    repo.commitTransaction({streams: [behind, skipping]}),
+    'a gap outranks a conflict that comes first',
+    (error) => error instanceof SequenceGapError && error.entityId === gapped.id,
+  )
+  const error = await expectError(
+    repo.commitTransaction({streams: [behind, skipping, ahead]}),
+    'drift outranks a gap and a conflict',
+    (failure) => failure instanceof StreamHeadDriftError && failure.entityId === drifted.id,
+  )
+  const drift = error as StreamHeadDriftError
+  ensure(drift.stored === 2n && drift.derived === 3n, 'the drift reports head 2 and log 3')
+
+  // A fence reads the stored head: at the drifted stream's log head it fails as drift, and at
+  // its stored head it passes.
+  await expectError(
+    repo.commitTransaction({streams: [], fences: [fence(drifted, 3)]}),
+    "a fence at a drifted stream's log head",
+    (failure) => failure instanceof StreamHeadDriftError && failure.entityId === drifted.id,
+  )
+  await repo.commitTransaction({streams: [], fences: [fence(drifted, 2)]})
+
+  // A stale fence is a conflict like a stale append: below a gap, and among conflicts the first
+  // in transaction order, the written streams in byte order, then the fences.
+  await expectError(
+    repo.commitTransaction({streams: [skipping], fences: [fence(conflicted, 1)]}),
+    'a gap outranks a stale fence',
+    (failure) => failure instanceof SequenceGapError && failure.entityId === gapped.id,
+  )
+  await expectError(
+    repo.commitTransaction({streams: [behind], fences: [fence(gapped, 0)]}),
+    'a stale append comes before a stale fence',
+    (failure) => failure instanceof ConflictError && failure.entityId === conflicted.id,
+  )
+}
 
 function ensure(condition: boolean, what: string): void {
   if (!condition) {
@@ -252,6 +496,21 @@ async function commitAndRead(repo: Repository): Promise<void> {
   for (const [after, want] of reads) {
     ensureEqual(await repo.eventsAfter(stream.id, after), want, `eventsAfter(${after})`)
   }
+}
+
+// Sequences in the tens, so a backend that orders them as text (10 before 9) fails.
+async function numericOrder(repo: Repository): Promise<void> {
+  const stream = new Stream(namespace(), 'order')
+  await stream.commit(repo, stream.events(1, 12))
+
+  ensureEqual(await repo.events(stream.id), stream.events(1, 12), 'events() past nine')
+  ensureEqual(await repo.eventsAfter(stream.id, 8n), stream.events(9, 12), 'eventsAfter(8)')
+  const latest = await repo.latest(stream.id, 4)
+  ensureEqual(
+    latest.map((event) => event.sequence),
+    [12n, 11n, 10n, 9n],
+    'latest(4) past nine',
+  )
 }
 
 async function metadataRoundTrip(repo: Repository): Promise<void> {
@@ -978,6 +1237,7 @@ export async function markerConformance(
       () => historyDependentRefusal(repo, controls),
     ],
     ['the retention set is stored sorted and deduplicated', () => retentionSet(repo, controls)],
+    ['a fence on a retained entity type is refused', () => fenceRetention(repo, controls)],
     [
       'an unsettled rebuild generation refuses commits, and only commits',
       () => rebuildInProgress(repo, controls),
@@ -1182,6 +1442,41 @@ async function retentionSet(
   // A store-wide set changes nothing for a commit that carries no fences.
   const stream = new Stream(ns, '1', 'session')
   await settled(() => stream.commit(repo, stream.events(1, 1)))
+
+  await controls.declare(streamHeadsOnly)
+}
+
+async function fenceRetention(
+  repo: Repository & StoreInitializer,
+  controls: ControlFixtures,
+): Promise<void> {
+  if (!transactional(repo)) {
+    return
+  }
+
+  const ns = namespace()
+  const written = new Stream(ns, 'written')
+  const kept = new Stream(ns, 'kept', 'session')
+  await controls.declare((draft) => draft.retention.push(kept.entityType))
+  await settled(() => kept.commit(repo, kept.events(1, 1)))
+
+  // A fence can't protect a stream TTL deletes in no order. The refusal comes from the manifest,
+  // so it outranks the rebuild lock.
+  const fenced = () =>
+    repo.commitTransaction({
+      streams: [{entityId: written.id, events: written.events(1, 1)}],
+      fences: [fence(kept, 1)],
+    })
+  const retained = (error: unknown) =>
+    error instanceof RetentionConflictError && error.entityType === kept.entityType
+  await expectError(fenced(), 'a fence on a retained type', retained)
+  await controls.setRebuild({generation: 1n, lock: 'held'})
+  try {
+    await expectError(fenced(), 'a fence on a retained type during a rebuild', retained)
+  } finally {
+    await controls.setRebuild({generation: 2n, lock: null})
+  }
+  ensure((await repo.events(written.id)).length === 0, 'the refused transactions wrote nothing')
 
   await controls.declare(streamHeadsOnly)
 }

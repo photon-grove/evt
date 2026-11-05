@@ -43,4 +43,5 @@ export {
   type SnapshotTtl,
   commitTransaction,
   snapshotTransaction,
+  transactionItems,
 } from './requests.js'

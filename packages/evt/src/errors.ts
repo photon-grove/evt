@@ -15,6 +15,10 @@
  * - `conflict`: optimistic concurrency failed. Another writer committed since the stream was
  *   read. Reload and run the command again.
  * - `sequenceGap`: a commit or a load skips a sequence. A conflict.
+ * - `fenceConflict`: another writer moved a stream the transaction read but didn't write. A
+ *   conflict, retryable when the engine observed the fenced head.
+ * - `retentionConflict`: a transaction fenced a stream whose entity type has retention, which a
+ *   fence can't protect. Nothing was written.
  * - `streamHeadDrift`: a stream's head disagrees with its events or snapshot. Never retried.
  * - `commitTooLarge`: the commit is over the transaction budget. Nothing was written.
  * - `compactionUncovered`: no snapshot covers the events compaction was asked to delete.
@@ -42,6 +46,8 @@ export type EvtErrorCode =
   | 'invalidCommit'
   | 'conflict'
   | 'sequenceGap'
+  | 'fenceConflict'
+  | 'retentionConflict'
   | 'streamHeadDrift'
   | 'commitTooLarge'
   | 'compactionUncovered'
@@ -283,6 +289,48 @@ export class RebuildInProgressError extends EvtError {
   }
 }
 
+/** Where a read fence's head came from (ADR 0004): the engine's own read, or the caller. */
+export type FenceProvenance = 'engine' | 'caller'
+
+/**
+ * A read fence failed: another writer moved a stream the transaction read but didn't write past
+ * the head it observed. A fence the engine filled is retryable, since loading again observes the
+ * new head. A caller-stamped one isn't: the caller's input is stale. Nothing was written.
+ */
+export class FenceConflictError extends EvtError {
+  override readonly name = 'FenceConflictError'
+  override readonly code = 'fenceConflict'
+  readonly entityId: string
+  /** The head the transaction fenced the stream at. */
+  readonly head: bigint
+  readonly provenance: FenceProvenance
+
+  constructor(entityId: string, head: bigint, provenance: FenceProvenance) {
+    super('fenceConflict', `read fence failed for ${entityId} at head ${head} (${provenance})`)
+    this.entityId = entityId
+    this.head = head
+    this.provenance = provenance
+  }
+}
+
+/**
+ * A transaction fenced a stream whose entity type has retention: TTL deletes items in no order, so
+ * a fence on a retained stream protects nothing. Nothing was written.
+ */
+export class RetentionConflictError extends EvtError {
+  override readonly name = 'RetentionConflictError'
+  override readonly code = 'retentionConflict'
+  readonly entityType: string
+
+  constructor(entityType: string) {
+    super(
+      'retentionConflict',
+      `read fences refused for retention-enabled entity type ${entityType}`,
+    )
+    this.entityType = entityType
+  }
+}
+
 /**
  * Compaction was refused because the store declares the entity's type history-dependent: its
  * projectors' rebuild replays the events compaction would delete. Nothing was deleted.
@@ -360,16 +408,27 @@ export class SnapshotError extends EvtError {
   }
 }
 
-/** Whether an error is an optimistic-concurrency conflict: a `conflict` or a `sequenceGap`. */
+/**
+ * Whether an error is an optimistic-concurrency conflict: a `conflict`, a `sequenceGap` or a
+ * `fenceConflict`.
+ */
 export function isConflict(error: unknown): boolean {
-  return error instanceof EvtError && (error.code === 'conflict' || error.code === 'sequenceGap')
+  return (
+    error instanceof EvtError &&
+    (error.code === 'conflict' || error.code === 'sequenceGap' || error.code === 'fenceConflict')
+  )
 }
 
 /**
- * Whether reloading and running the command again may succeed: after a conflict, while a rebuild
- * holds the store, after the feature manifest changed under the writer, or after throttling.
+ * Whether reloading and running the command again may succeed: after a conflict (a fence the
+ * caller stamped excepted), while a rebuild holds the store, after the feature manifest changed
+ * under the writer, or after throttling.
  */
 export function isRetryable(error: unknown): boolean {
+  // A caller-stamped fence stays stale however often the command runs again.
+  if (error instanceof FenceConflictError) {
+    return error.provenance === 'engine'
+  }
   if (isConflict(error)) {
     return true
   }

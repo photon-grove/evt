@@ -14,6 +14,7 @@ import {
   ConflictError,
   EvtError,
   FeatureManifestChangedError,
+  FenceConflictError,
   HistoryDependentProjectionError,
   RebuildInProgressError,
   SequenceGapError,
@@ -34,12 +35,17 @@ import {int64Argument} from '../fields.js'
 import {
   type CallOptions,
   type Commit,
-  type Repository,
+  type NormalizedTransaction,
   type StoreInitializer,
+  type TransactionCommit,
+  type TransactionalRepository,
   checkBudget,
+  checkFenceRetention,
   checkNotReserved,
-  commitSizes,
   isReserved,
+  normalizeTransaction,
+  rankFailures,
+  transactionSizes,
   validateCommit,
 } from '../repository.js'
 import type {DynamoClient, Page, RequestOptions, TransactItem} from './client.js'
@@ -57,10 +63,12 @@ import {FEATURES_PK, manifestFromItem, markerItem} from './marker.js'
 import {DYNAMODB_BACKEND, transactItemSize} from './views.js'
 import {
   type CommitTtl,
-  commitTransaction,
+  type StreamLayout,
+  type TransactionLayout,
   controlKey,
   headKey,
   projectorItems,
+  buildTransaction,
   snapshotTransaction,
 } from './requests.js'
 
@@ -121,7 +129,7 @@ const MAX_SNAPSHOT_GUARD_RETRIES = 4
  * declares a feature, the next write fails, validates the manifest again, and either refuses an
  * unsupported feature or fails once with a retryable {@link FeatureManifestChangedError}.
  */
-export class DynamoRepository implements Repository, StoreInitializer {
+export class DynamoRepository implements TransactionalRepository, StoreInitializer {
   readonly #client: DynamoClient
   readonly #table: string
   readonly #lazy: boolean
@@ -187,29 +195,64 @@ export class DynamoRepository implements Repository, StoreInitializer {
     options?.signal?.throwIfAborted()
     validateCommit(commit)
     checkNotReserved(commit.entityId)
-    if (commit.events.length === 0) {
-      return
+    if (commit.events.length > 0) {
+      await this.#write(normalizeTransaction({streams: [commit]}), options)
     }
+  }
 
-    // One `ttl` for the whole commit, so its head's is never below one of its own items.
-    const entityType = commit.events[0]!.entityType
-    const ttl = this.#ttlFor(entityType)
+  /**
+   * Commits every stream and checks every fence in one `TransactWriteItems` call: the control
+   * checks, the projector operations, each written stream's actions, then a check on each fenced
+   * stream's head. A fence on a type this repository retains is refused before any request, and
+   * one on a type the store's manifest retains after the marker's validation.
+   */
+  async commitTransaction(transaction: TransactionCommit, options?: CallOptions): Promise<void> {
+    options?.signal?.throwIfAborted()
+    const normalized = normalizeTransaction(transaction)
+    if (normalized.streams.length > 0 || normalized.fences.length > 0) {
+      await this.#write(normalized, options)
+    }
+  }
+
+  async #write(transaction: NormalizedTransaction, options?: CallOptions): Promise<void> {
+    // One `ttl` per entity type for the whole transaction, so a stream's head's is never below one
+    // of its own items.
+    const ttls = new Map<string, number | undefined>()
+    const ttlFor = (entityType: string): number | undefined => {
+      if (!ttls.has(entityType)) {
+        ttls.set(entityType, this.#ttlFor(entityType))
+      }
+
+      return ttls.get(entityType)
+    }
 
     // Every backend budgets a commit the same way, so an oversized one fails before any request.
     // The projector operations are sized from the actions this repository sends, which refuses a
     // group for another backend here too.
-    const sizes = projectorItems(commit).map(transactItemSize)
-    const group = {backend: DYNAMODB_BACKEND, operations: sizes, sizes}
-    const budgeted = {...commit, projections: [group]}
-    checkBudget(commitSizes(budgeted, (type) => (type === entityType ? ttl : undefined)))
+    const sizes = projectorItems(transaction.projections).map(transactItemSize)
+    const projections = [{backend: DYNAMODB_BACKEND, operations: sizes, sizes}]
+    checkBudget(transactionSizes({...transaction, projections}, ttlFor))
+
+    // A fence on a type this repository retains needs no request to refuse.
+    checkFenceRetention(transaction, (entityType) => this.#retention.has(entityType))
 
     const request = requestOptions(options)
     const version = await this.#markerVersion(request)
-    const items = commitTransaction(this.#table, commit, version, this.#commitTtl(commit, ttl))
+    if (transaction.fences.length > 0) {
+      // The store's manifest may retain a type this repository doesn't. The marker check holds it
+      // at the version read here, or fails the transaction.
+      const manifest = await this.#readManifest(request)
+      const retention = manifest?.retention ?? []
+      checkFenceRetention(transaction, (entityType) => retention.includes(entityType))
+    }
+
+    const {items, layout} = buildTransaction(this.#table, transaction, version, (commit) =>
+      this.#commitTtl(commit, ttlFor(commit.events[0]!.entityType)),
+    )
     try {
       await this.#client.transactWriteItems({TransactItems: items}, request)
     } catch (error) {
-      throw await this.#classifyCommit(commit, error, request)
+      throw await this.#classifyCommit(layout, error, request)
     }
   }
 
@@ -520,7 +563,14 @@ export class DynamoRepository implements Repository, StoreInitializer {
     return new FeatureManifestChangedError({cause})
   }
 
-  async #classifyCommit(commit: Commit, error: unknown, request: RequestOptions): Promise<unknown> {
+  // Maps a cancelled transaction to the error it reports. The control checks outrank everything.
+  // Then every failed stream and fence is classified, and the ranking reports the first drift, else
+  // the first gap, else the first other failure, in transaction order.
+  async #classifyCommit(
+    layout: TransactionLayout,
+    error: unknown,
+    request: RequestOptions,
+  ): Promise<unknown> {
     const codes = cancellationCodes(error)
     if (codes === null) {
       return error
@@ -528,9 +578,10 @@ export class DynamoRepository implements Repository, StoreInitializer {
 
     const failed = codes.indexOf(CONDITION_FAILED)
     if (failed === -1) {
-      if (codes.includes('TransactionConflict')) {
+      const colliding = codes.indexOf('TransactionConflict')
+      if (colliding !== -1) {
         return new ConflictError(
-          commit.entityId,
+          entityAt(layout, colliding),
           'transaction conflict: another writer was committing at the same time',
         )
       }
@@ -549,17 +600,57 @@ export class DynamoRepository implements Repository, StoreInitializer {
       return new RebuildInProgressError()
     }
 
-    // The projector operations, then the stream's head update, its event puts and its snapshot
-    // put.
-    const projected = projectorItems(commit).length
-    const head = 2 + projected
-    const eventsEnd = head + 1 + commit.events.length
-    const eventFailed = codes.slice(head + 1, eventsEnd).includes(CONDITION_FAILED)
+    const failures: EvtError[] = []
+    for (const stream of layout.streams) {
+      const failure = await this.#streamFailure(stream, codes, request)
+      if (failure !== null) {
+        failures.push(failure)
+      }
+    }
+    for (const {index, fence} of layout.fences) {
+      if (codes[index] !== CONDITION_FAILED) {
+        continue
+      }
+
+      const verdict = await this.#probe(fence.entityId, false, request)
+      failures.push(
+        verdict.drift ?? new FenceConflictError(fence.entityId, fence.head, fence.provenance),
+      )
+    }
+
+    const ranked = rankFailures(failures)
+    if (ranked !== undefined) {
+      return ranked
+    }
+
+    // Only a projector operation's condition failed: its own error, as Go reports it.
+    if (failed < layout.projectorEnd) {
+      return error
+    }
+
+    return new ConflictError(
+      entityAt(layout, failed),
+      'conditional check failed: the sequence or snapshot changed since it was read',
+    )
+  }
+
+  // What a written stream contributes to a failed transaction, or null when none of its actions
+  // failed. A failed head update is classified by the probe. A head update that passed while an
+  // event put failed is an event above the head, unless retention explains it. A failed snapshot
+  // put alone is an ordinary conflict.
+  async #streamFailure(
+    stream: StreamLayout,
+    codes: string[],
+    request: RequestOptions,
+  ): Promise<EvtError | null> {
+    const {commit} = stream
     const {entityId} = commit
     const first = commit.events[0]!.sequence
     const retained = this.#retention.has(commit.events[0]!.entityType)
+    const eventFailed = codes.slice(stream.head + 1, stream.eventsEnd).includes(CONDITION_FAILED)
+    const snapshotFailed = stream.snapshot !== null && codes[stream.snapshot] === CONDITION_FAILED
 
-    if (codes[head] === CONDITION_FAILED) {
+    if (codes[stream.head] === CONDITION_FAILED) {
       const verdict = await this.#probe(entityId, retained, request)
       if (verdict.drift) {
         return verdict.drift
@@ -567,29 +658,26 @@ export class DynamoRepository implements Repository, StoreInitializer {
       if (verdict.healthy && first > 1n && verdict.stored < first - 1n) {
         return new SequenceGapError(entityId, verdict.stored, first)
       }
-    } else if (codes[head] === 'None' && eventFailed) {
-      // The head update passed and an event put failed: an event sits above the head. With
-      // retention, TTL can delete the head before an expired event, so a create passes its head
-      // condition and fails on the leftover item: a conflict until TTL deletes the rest.
-      // The probe already read the remaining items when it found the head item absent below the
-      // head its log derives; read them only if it didn't.
+
+      return conflict(entityId)
+    }
+
+    if (eventFailed && codes[stream.head] === 'None') {
+      // With retention, TTL can delete the head before an expired event, so a create passes its
+      // head condition and fails on the leftover item: a conflict until TTL deletes the rest. The
+      // probe already read the remaining items when it found the head item absent below the head
+      // its log derives; read them only if it didn't.
       const verdict = await this.#probe(entityId, retained, request)
       const expired =
         retained && (verdict.expired ?? (await this.#remainingItemsExpired(entityId, request)))
       if (!expired) {
         return verdict.drift ?? drift(entityId, verdict.head, verdict.derived)
       }
+
+      return conflict(entityId)
     }
 
-    // Only a projector operation's condition failed: its own error, as Go reports it.
-    if (failed < head && !codes.slice(head).includes(CONDITION_FAILED)) {
-      return error
-    }
-
-    return new ConflictError(
-      entityId,
-      'conditional check failed: the sequence or snapshot changed since it was read',
-    )
+    return eventFailed || snapshotFailed ? conflict(entityId) : null
   }
 
   // Classifies a stream whose head update failed, as the failure-path probe does: a stored head
@@ -981,6 +1069,30 @@ interface Verdict {
   derived: bigint
   /** What `#remainingItemsExpired` found, when the probe read the remaining items. */
   expired?: boolean
+}
+
+function conflict(entityId: string): ConflictError {
+  return new ConflictError(
+    entityId,
+    'conditional check failed: the sequence or snapshot changed since it was read',
+  )
+}
+
+// The stream an action of a transaction belongs to, for a failure no stream check explains: the
+// written or fenced stream at that index, or else the transaction's first.
+function entityAt(layout: TransactionLayout, index: number): string {
+  for (const stream of layout.streams) {
+    if (index >= stream.head && (index < stream.eventsEnd || index === stream.snapshot)) {
+      return stream.commit.entityId
+    }
+  }
+
+  const fenced = layout.fences.find((each) => each.index === index)
+  if (fenced !== undefined) {
+    return fenced.fence.entityId
+  }
+
+  return layout.streams[0]?.commit.entityId ?? layout.fences[0]?.fence.entityId ?? ''
 }
 
 function drift(entityId: string, head: bigint | null, derived: bigint): StreamHeadDriftError {
