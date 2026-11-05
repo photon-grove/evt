@@ -12,8 +12,12 @@ use crate::outcome::RecordedIdentity;
 pub(super) async fn identity_cases<R: Repository>(repo: &R) -> Vec<(&'static str, CaseResult)> {
     vec![
         (
-            "every outcome records its identity: single-aggregate, multi-stream, rejected, stale, no-op, replayed",
+            "every outcome records its identity: single-aggregate, multi-stream, rejected, no-op, replayed",
             Box::pin(identity_recorded(repo)).await,
+        ),
+        (
+            "the engine's stale-fence and stale-version rejections record the identity",
+            Box::pin(identity_recorded_by_engine_rejections(repo)).await,
         ),
         (
             "an outcome resolves by command ID for its own principal only",
@@ -136,8 +140,57 @@ async fn identity_recorded<R: Repository>(repo: &R) -> CaseResult {
         "a no-op's identity"
     );
 
-    // The engine's own rejections record the identity too: a caller-stamped fence already stale
-    // persists the stale-fence rejection through the outcome-only transaction.
+    // So does a command driven by hand.
+    let manual = command_id();
+    let mut tx = store.transaction();
+    match tx
+        .begin_command(
+            &CommandIdentity::new("ledger:touch").with_targets([a.clone()]),
+            &command_metadata(&manual),
+        )
+        .await?
+    {
+        Begin::Proceed => {}
+        Begin::Replayed(replayed) => {
+            return Err(Failure(format!(
+                "a new command is not replayed: {replayed:?}"
+            )));
+        }
+    }
+    tx.commit_with_outcome(None).await?;
+    ensure_eq!(
+        stored_identity(repo, &manual).await?,
+        recorded("ledger:touch", &[&a], None),
+        "a hand-driven command's identity"
+    );
+
+    // A replay returns the identity it recorded.
+    let replayed = store
+        .execute_with_outcome(&id, Add(1), with_principal(&single, "user:42"))
+        .await?;
+    ensure!(replayed.replayed, "the repeat is replayed: {replayed:?}");
+    ensure_eq!(
+        replayed.outcome.identity,
+        stored_identity(repo, &single).await?,
+        "the replayed identity"
+    );
+
+    Ok(())
+}
+
+/// The engine's own rejections record the identity too, through the outcome-only transaction.
+async fn identity_recorded_by_engine_rejections<R: Repository>(repo: &R) -> CaseResult {
+    let store = outcome_store(repo);
+    let ns = namespace();
+    let (a, b) = (
+        EntityId::new(format!("{ns}-a")),
+        EntityId::new(format!("{ns}-b")),
+    );
+    store
+        .execute(&b, Add(1), command_metadata(&command_id()))
+        .await?;
+
+    // A caller-stamped fence already stale persists the stale-fence rejection.
     let stale = command_id();
     let outcome = store
         .execute_transaction(
@@ -198,41 +251,6 @@ async fn identity_recorded<R: Repository>(repo: &R) -> CaseResult {
         stored_identity(repo, &expected).await?,
         recorded("ledger:retitle", &[&b], Some("user:9")),
         "a stale-version rejection's identity"
-    );
-
-    // So does a command driven by hand.
-    let manual = command_id();
-    let mut tx = store.transaction();
-    match tx
-        .begin_command(
-            &CommandIdentity::new("ledger:touch").with_targets([a.clone()]),
-            &command_metadata(&manual),
-        )
-        .await?
-    {
-        Begin::Proceed => {}
-        Begin::Replayed(replayed) => {
-            return Err(Failure(format!(
-                "a new command is not replayed: {replayed:?}"
-            )));
-        }
-    }
-    tx.commit_with_outcome(None).await?;
-    ensure_eq!(
-        stored_identity(repo, &manual).await?,
-        recorded("ledger:touch", &[&a], None),
-        "a hand-driven command's identity"
-    );
-
-    // A replay returns the identity it recorded.
-    let replayed = store
-        .execute_with_outcome(&id, Add(1), with_principal(&single, "user:42"))
-        .await?;
-    ensure!(replayed.replayed, "the repeat is replayed: {replayed:?}");
-    ensure_eq!(
-        replayed.outcome.identity,
-        stored_identity(repo, &single).await?,
-        "the replayed identity"
     );
 
     Ok(())
