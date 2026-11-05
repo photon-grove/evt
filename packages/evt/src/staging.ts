@@ -19,8 +19,9 @@ const INT64_MAX = 2n ** 63n - 1n
 
 /**
  * Serializes decided events continuing the stream after `after`, each with its own copy of
- * `metadata`, and folds them into `state`. It changes nothing it's given, so a failure leaves the
- * caller's state as it was.
+ * `metadata`, and then folds them into `state`. Every event is encoded before any is applied, so
+ * when one fails to encode, `state` is untouched, even for an aggregate whose `apply` changes the
+ * state it's given.
  */
 export function serializeEvents<S, C, D extends EventDefinitions>(
   aggregate: Aggregate<S, C, D>,
@@ -53,6 +54,9 @@ export function serializeEvents<S, C, D extends EventDefinitions>(
       payload,
       metadata: copyMetadata(metadata),
     })
+  }
+
+  for (const event of decided) {
     state = aggregate.apply(state, event)
   }
 

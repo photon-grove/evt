@@ -274,6 +274,31 @@ describe('Store.transaction', () => {
     expect(await repository.events('b')).toEqual([])
   })
 
+  test('a failed append leaves the state alone, even when apply changes it in place', async () => {
+    const mutating = defineAggregate({
+      ...account,
+      apply(state, event) {
+        state.balanceCents += event.data.amountCents
+        return state
+      },
+    })
+    const repository = new MemRepository()
+    const tx = store(repository, 1).transaction()
+    const a = await tx.read(mutating, 'a')
+
+    // The second event can't be encoded, so the first one mustn't reach the state either.
+    const bad = {type: 'account:withdrawn', data: {amountCents: 1}} as unknown as ReturnType<
+      typeof deposit
+    >
+    expect(code(thrown(() => tx.append(a, [deposit(1), bad])))).toBe('invalidArgument')
+    expect(a.state).toEqual({balanceCents: 0})
+
+    tx.append(a, [deposit(2)])
+    await tx.commit()
+    const snapshot = await repository.snapshot('a')
+    expect(decoder.decode(snapshot?.payload ?? new Uint8Array())).toBe('{"balanceCents":2}')
+  })
+
   test('commits once, whether the commit succeeds or fails', async () => {
     const s = store()
     const done = s.transaction()
