@@ -4,13 +4,19 @@
 // compat/fixtures/scenarios.json records it.
 
 import {
+  type Commit,
   type JsonValue,
   type Metadata,
+  type ReadFence,
   type Repository,
   type SerializedEvent,
   Store,
   StreamHeadDriftError,
+  type TransactionCommit,
+  type TransactionalRepository,
   emptyMetadata,
+  encodeEvent,
+  encodeSnapshot,
   eventId,
   isConflict,
   stringifyJson,
@@ -33,6 +39,8 @@ export const SUPPORTED_SCENARIOS: readonly string[] = [
   'snapshots-disabled',
   'stream-heads-snapshot-guard',
   'latest-n',
+  'multi-stream',
+  'read-fences',
 ]
 
 export const ORIGIN_SOURCE = 'evt-compat'
@@ -64,7 +72,14 @@ const STEP_KEYS = new Set([
   'eventSequence',
   'suffix',
   'n',
+  'streams',
+  'fences',
 ])
+
+// The keys this runner reads of a transaction step's streams, their events and its fences.
+const STREAM_KEYS = new Set(['suffix', 'sequence', 'events', 'snapshot'])
+const EVENT_KEYS = new Set(['type', 'version', 'payload'])
+const FENCE_KEYS = new Set(['suffix', 'head', 'callerStamped'])
 
 // The scenario flags that need what TypeScript lacks so far.
 const LATER_FLAGS = ['outcomes', 'projector', 'exclusive']
@@ -90,8 +105,25 @@ export function checkStep(step: JsonValue, index: number): void {
   }
 
   const raw = step instanceof Map ? step.get('event') : undefined
-  if (raw instanceof Map && raw.has('pad')) {
-    throw new Error(`step ${index} pads its event, which this runner doesn't do`)
+  if (raw instanceof Map) {
+    checkKeys(raw, EVENT_KEYS, `step ${index} event`)
+  }
+  for (const stream of optionalList(step, 'streams')) {
+    checkKeys(stream, STREAM_KEYS, `step ${index} stream`)
+    for (const event of list(field(stream, 'events'))) {
+      checkKeys(event, EVENT_KEYS, `step ${index} stream event`)
+    }
+  }
+  for (const fence of optionalList(step, 'fences')) {
+    checkKeys(fence, FENCE_KEYS, `step ${index} fence`)
+  }
+}
+
+function checkKeys(value: JsonValue, known: ReadonlySet<string>, what: string): void {
+  for (const key of value instanceof Map ? value.keys() : []) {
+    if (!known.has(key)) {
+      throw new Error(`${what} sets ${key}, which this runner doesn't read`)
+    }
   }
 }
 
@@ -252,6 +284,8 @@ export class Runner {
         const events = await this.#repository.latest(id, num(field(step, 'n')))
         return outcome('ok', events.length, 0, events.map((event) => Number(event.sequence)))
       }
+      case 'transaction':
+        return this.#transaction(step)
       case 'compact':
         try {
           const deleted = await this.#repository.compactBelow(id, int(field(step, 'through')))
@@ -303,6 +337,48 @@ export class Runner {
     }
   }
 
+  // Commits the step's streams and fences through the repository, as the Go and Rust drivers do,
+  // and checks that a failed transaction left every stream it touches unchanged.
+  async #transaction(step: JsonValue): Promise<Outcome> {
+    const repository = this.#repository
+    if (!isTransactional(repository)) {
+      throw new Error('the repository has no commitTransaction')
+    }
+
+    const transaction = transactionCommit(this.entityId, step)
+    const touched = [
+      ...transaction.streams.map((stream) => stream.entityId),
+      ...(transaction.fences ?? []).map((fence) => fence.entityId),
+    ]
+    const before = await this.#stored(touched)
+    try {
+      await repository.commitTransaction(transaction)
+      const events = transaction.streams.reduce((sum, stream) => sum + stream.events.length, 0)
+      return outcome('ok', events)
+    } catch (error) {
+      if ((await this.#stored(touched)) !== before) {
+        throw new Error(`a failed transaction changed a stream it touches: ${String(error)}`, {
+          cause: error,
+        })
+      }
+      return classify(error)
+    }
+  }
+
+  // The stored events and snapshot of each stream, to compare before and after a transaction.
+  async #stored(entityIds: readonly string[]): Promise<string> {
+    const stored = await Promise.all(
+      entityIds.map(async (id) => {
+        const events = await this.#repository.events(id)
+        const snapshot = await this.#repository.snapshot(id)
+
+        return [events.map(encodeEvent), snapshot && encodeSnapshot(snapshot)]
+      }),
+    )
+
+    return stringifyJson(stored)
+  }
+
   async #commitRaw(event: SerializedEvent): Promise<Outcome> {
     try {
       await this.#repository.commit({entityId: event.entityId, events: [event]})
@@ -311,6 +387,10 @@ export class Runner {
       return classify(error)
     }
   }
+}
+
+function isTransactional(repository: Repository): repository is TransactionalRepository {
+  return 'commitTransaction' in repository
 }
 
 function classify(error: unknown): Outcome {
@@ -344,6 +424,46 @@ function metadata(step: JsonValue): Partial<Metadata> {
     commitId:
       commandId === null ? (optionalString(step, 'commitId') ?? '') : `compat-${by}-${commandId}`,
   }
+}
+
+/**
+ * A transaction step's commit: each stream's raw events from its sequence, with the step's
+ * metadata and its inline snapshot, and each fence, the engine's unless the caller stamped it.
+ */
+export function transactionCommit(base: string, step: JsonValue): TransactionCommit {
+  const streams = optionalList(step, 'streams').map((stream): Commit => {
+    const id = streamId(base, optionalString(stream, 'suffix') ?? '')
+    const first = int(field(stream, 'sequence'))
+    const events = list(field(stream, 'events')).map((raw, index) =>
+      rawEvent(id, first + BigInt(index), step, {
+        type: str(field(raw, 'type')),
+        version: num(field(raw, 'version')),
+        payload: str(field(raw, 'payload')),
+      }),
+    )
+    const snapshot = stream instanceof Map ? stream.get('snapshot') : undefined
+    if (snapshot === undefined || snapshot === null) {
+      return {entityId: id, events}
+    }
+
+    return {
+      entityId: id,
+      events,
+      snapshot: {
+        entityType: 'account',
+        sequence: int(field(snapshot, 'sequence')),
+        payload: encoder.encode(str(field(snapshot, 'payload'))),
+      },
+    }
+  })
+  const fences = optionalList(step, 'fences').map((fence): ReadFence => ({
+    entityId: streamId(base, optionalString(fence, 'suffix') ?? ''),
+    entityType: 'account',
+    head: int(field(fence, 'head')),
+    provenance: optionalBoolean(fence, 'callerStamped') ? 'caller' : 'engine',
+  }))
+
+  return {streams, fences}
 }
 
 function rawEvent(
