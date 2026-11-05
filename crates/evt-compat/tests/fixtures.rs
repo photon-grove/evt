@@ -14,10 +14,10 @@ use photon_evt::wire::{dynamo, envelope};
 use photon_evt::{
     Aggregate, CommandIdentity, DigestInput, EntityId, EntityType, Error, EventId, EventSequence,
     EventType, EventVersion, FeatureManifest, FeatureMarker, MAX_COMMAND_ID_BYTES,
-    MAX_COMMIT_ITEM_BYTES, MAX_OUTCOME_BYTES, MemRepository, Metadata, Outcome, Rejection,
-    RejectionCode, RetryPolicy, SerializedEvent, SerializedSnapshot, StaleVersion,
-    canonical_digest_bytes, canonical_numbers, default_digest, json, snapshot_commit_size,
-    snapshot_events_due,
+    MAX_COMMIT_ITEM_BYTES, MAX_OUTCOME_BYTES, MemRepository, Metadata, Outcome, PrincipalId,
+    RecordedIdentity, Rejection, RejectionCode, RetryPolicy, SerializedEvent, SerializedSnapshot,
+    StaleVersion, canonical_digest_bytes, canonical_numbers, default_digest, json,
+    snapshot_commit_size, snapshot_events_due,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -606,6 +606,18 @@ struct OutcomeFixtures {
     malformed_rows: Vec<MalformedRow>,
     #[serde(default)]
     rejection_numbers: Vec<RejectionNumberVector>,
+    #[serde(default)]
+    identity_bounds: Vec<IdentityBoundVector>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IdentityBoundVector {
+    name: String,
+    identity: IdentityVector,
+    size: usize,
+    #[serde(default)]
+    error: String,
 }
 
 #[derive(Deserialize)]
@@ -684,6 +696,15 @@ struct OutcomeInputVector {
     response: Option<String>,
     event_ids: Vec<String>,
     rejection: Option<String>,
+    identity: Option<IdentityVector>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IdentityVector {
+    command_type: String,
+    targets: Vec<String>,
+    principal: Option<String>,
 }
 
 fn outcome_fixtures() -> OutcomeFixtures {
@@ -882,6 +903,7 @@ fn outcome_rows_match_go_byte_for_byte() {
             }
         }
         outcome.event_ids = input.event_ids.iter().map(EventId::new).collect();
+        outcome.identity = input.identity.map(recorded_identity);
 
         // The DynamoDB item, byte for byte, and its budget size.
         let item = dynamo::outcome_item(&outcome).unwrap();
@@ -923,9 +945,55 @@ fn outcome_rows_match_go_byte_for_byte() {
             "events": row.events,
             "rejection": row.rejection,
             "code": row.code,
+            "command_type": row.command_type,
+            "targets": row.targets,
+            "principal": row.principal,
         });
         assert_eq!(pg, vector.postgres_row, "{name}: postgres row");
         assert_eq!(row.into_outcome().unwrap(), outcome, "{name}: decode row");
+    }
+}
+
+fn recorded_identity(identity: IdentityVector) -> RecordedIdentity {
+    RecordedIdentity::new(
+        identity.command_type,
+        identity.targets.iter().map(EntityId::new).collect(),
+        identity.principal.map(PrincipalId::new),
+    )
+}
+
+/// The recorded identity's bound counts the UTF-8 bytes of the command type, the principal, and
+/// the encoded targets, escapes included, and refuses one byte past 65536 exactly as Go does.
+#[test]
+fn the_recorded_identity_bound_matches_go() {
+    let vectors = outcome_fixtures().identity_bounds;
+    assert!(!vectors.is_empty());
+
+    for vector in vectors {
+        let name = &vector.name;
+        let identity = recorded_identity(vector.identity);
+
+        let size = identity.command_type.len()
+            + identity.encode_targets().unwrap().len()
+            + identity
+                .principal
+                .as_ref()
+                .map_or(0, |principal| principal.as_str().len());
+        assert_eq!(size, vector.size, "{name}: size");
+
+        let checked =
+            photon_evt::check_outcome(&Outcome::accepted("c", "d").with_identity(identity));
+        match vector.error.as_str() {
+            "" => assert!(checked.is_ok(), "{name}: {checked:?}"),
+            "outcome-too-large" => assert!(
+                matches!(
+                    checked,
+                    Err(Error::OutcomeTooLarge { what: "identity", size }) if size == vector.size
+                ),
+                "{name}: {checked:?}"
+            ),
+            other => panic!("{name}: unknown fixture error {other}"),
+        }
     }
 }
 

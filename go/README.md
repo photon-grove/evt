@@ -105,7 +105,9 @@ suite checks each of them against it.
 The backend pages cover wiring and the stored layout: [DynamoDB](../docs/guide/dynamodb.md) and
 [PostgreSQL](../docs/guide/postgres.md). [Projections and rebuilds](../docs/guide/projections.md)
 and [Streams and projectors](../docs/guide/streams.md) cover read models, and
-[Command outcomes and retries](../docs/guide/commands.md) covers idempotent commands. The
+[Command outcomes and retries](../docs/guide/commands.md) covers idempotent commands, including
+the identity each outcome row records and `Store.ResolveCommandForPrincipal`, the lookup by command
+ID and principal. The
 [storage format](../docs/reference/storage-format.md) is the exact contract, shared with the Rust
 crate.
 

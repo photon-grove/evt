@@ -73,6 +73,7 @@ func RunOutcomeSuite(t *testing.T, newRepo func() evt.Repository, enforcesConcur
 	t.Run("RejectionWithEvents", func(t *testing.T) { testRejectionWithEvents(t, outcomes(t)) })
 	t.Run("RejectionWithEventsInATransaction", func(t *testing.T) { testRejectionWithEventsTransaction(t, outcomes(t)) })
 	t.Run("RejectionWithEventsCommitRules", func(t *testing.T) { testRejectionWithEventsCommitRules(t, outcomes(t), enforcesConcurrency) })
+	t.Run("RecordedIdentity", func(t *testing.T) { testRecordedIdentity(t, outcomes(t)) })
 	t.Run("ExpectedVersions", func(t *testing.T) { testExpectedVersions(t, outcomes(t)) })
 
 	if enforcesConcurrency {

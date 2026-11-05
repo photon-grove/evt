@@ -308,14 +308,17 @@ fn comparable(rows: Vec<EventRow>) -> Result<Vec<(EventRow, serde_json::Value)>,
         .collect()
 }
 
-/// Compares an outcome row with its JSON columns parsed: PostgreSQL stores `events` and
-/// `rejection` as jsonb, which normalizes whitespace and key order.
+/// Compares an outcome row with its JSON columns parsed: PostgreSQL stores `events`,
+/// `rejection`, and `targets` as jsonb, which normalizes whitespace and key order.
 type ComparableOutcome = (
     String,
     String,
     String,
     Option<Vec<u8>>,
     serde_json::Value,
+    Option<serde_json::Value>,
+    Option<String>,
+    Option<String>,
     Option<serde_json::Value>,
     Option<String>,
 );
@@ -332,6 +335,12 @@ fn comparable_outcome(row: OutcomeRow) -> Result<ComparableOutcome, BoxError> {
             .map(serde_json::from_str)
             .transpose()?,
         row.code,
+        row.command_type,
+        row.targets
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?,
+        row.principal,
     ))
 }
 

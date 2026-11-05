@@ -788,6 +788,11 @@ type outcomeRow struct {
 	Events    any
 	Rejection any
 	Code      string
+
+	// The recorded identity: nil where the row records none.
+	CommandType *string
+	Targets     any
+	Principal   *string
 }
 
 func postgresOutcome(ctx context.Context, pool *pgxpool.Pool, commandID string) (*outcomeRow, error) {
@@ -797,11 +802,13 @@ func postgresOutcome(ctx context.Context, pool *pgxpool.Pool, commandID string) 
 		events    string
 		rejection *string
 		code      *string
+		targets   *string
 	)
 
-	err := pool.QueryRow(ctx, `SELECT status, digest, response, events::text, rejection::text, code
+	err := pool.QueryRow(ctx, `SELECT status, digest, response, events::text, rejection::text, code,
+		command_type, targets::text, principal
 		FROM evt_events__evt_command_outcomes WHERE command_id = $1`, commandID).
-		Scan(&row.Status, &row.Digest, &response, &events, &rejection, &code)
+		Scan(&row.Status, &row.Digest, &response, &events, &rejection, &code, &row.CommandType, &targets, &row.Principal)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -823,6 +830,12 @@ func postgresOutcome(ctx context.Context, pool *pgxpool.Pool, commandID string) 
 
 	if code != nil {
 		row.Code = *code
+	}
+
+	if targets != nil {
+		if err = json.Unmarshal([]byte(*targets), &row.Targets); err != nil {
+			return nil, err
+		}
 	}
 
 	if len(response) == 0 {
@@ -857,6 +870,24 @@ func expectedOutcomeRow(outcome compat.OutcomeExpectation) (*outcomeRow, error) 
 
 	if rejection := text("rejection"); rejection != "" {
 		if err := json.Unmarshal([]byte(rejection), &row.Rejection); err != nil {
+			return nil, err
+		}
+	}
+
+	optional := func(name string) *string {
+		if _, present := outcome.DynamoItem[name]; !present {
+			return nil
+		}
+
+		value := text(name)
+
+		return &value
+	}
+
+	row.CommandType, row.Principal = optional("commandType"), optional("principal")
+
+	if targets := optional("targets"); targets != nil {
+		if err := json.Unmarshal([]byte(*targets), &row.Targets); err != nil {
 			return nil, err
 		}
 	}

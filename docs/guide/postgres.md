@@ -88,6 +88,15 @@ in the transaction that carries the view statements. So a takeover waits for it,
 lost the lock aborts without writing. A database created before the fence has neither table, and
 commits pass until `EnsureSchema` creates them.
 
+Outcome rows record the identity of their command in three columns of the outcomes table
+(`command_type`, `targets`, `principal`), which `EnsureSchema` adds to a table created before them.
+Unlike the fence tables, these are not optional: a writer that records them reads and writes the
+columns on every command, so on a table without them every outcome command fails (nothing is
+written). Run `EnsureSchema` (or Rust's `ensure_schema`) against the database before you roll out
+writers that record the identity. Older writers keep working against the upgraded table, since
+the columns are nullable. Once the columns exist the step checks for them first and takes no lock
+on the outcomes table, so calling it at every startup stays cheap.
+
 These assertions run after the commit waits for its locks, so every transaction that writes or
 checks a fence runs at `READ COMMITTED` whatever the server's `default_transaction_isolation`: a
 `REPEATABLE READ` snapshot would be taken before the wait and miss a rebuild that began meanwhile.

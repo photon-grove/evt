@@ -13,12 +13,13 @@ use crate::aggregate::{Aggregate, Projector};
 use crate::commit_id::{self, CommitIdGenerator};
 use crate::error::{BoxError, Error, ExecuteError, ReplayPhase};
 use crate::event::{DomainEvent, SerializedEvent, SerializedSnapshot};
-use crate::ids::{CommandId, EntityId, EntityType, EventId, EventSequence};
+use crate::ids::{CommandId, EntityId, EntityType, EventId, EventSequence, PrincipalId};
 use crate::json;
 use crate::metadata::Metadata;
 use crate::outcome::{
     CommandIdentity, CommandOutcome, DigestInput, Outcome, OutcomeCommand, OutcomeConfig,
-    Rejection, Settled, ToRejection, pre_check, principal, require_command_id, settle,
+    Rejection, Settled, ToRejection, check_command_id, check_metadata, pre_check, principal,
+    require_command_id, settle,
 };
 use crate::projection::{
     CommitProjector, CommitStream, CommitView, HistoryLedger, project_application,
@@ -552,7 +553,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
         let entity_id = entity_id.into();
         crate::outcome::check_targets([&entity_id])?;
         let command_id = require_command_id(&metadata)?;
-        let digest = config.digest(&DigestInput {
+        let input = DigestInput {
             command_type: command.command_type(),
             targets: vec![entity_id.clone()],
             payload: command
@@ -560,7 +561,8 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
                 .map_err(|err| Error::InvalidArgument(format!("the command payload: {err}")))?
                 .unwrap_or_default(),
             principal: principal(&metadata),
-        })?;
+        };
+        let pending = PendingCommand::new(config, command_id, &input, &metadata)?;
 
         let mut budget = Budget::new(config.retry());
 
@@ -572,8 +574,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
                 entity_id.clone(),
                 command.clone(),
                 &metadata,
-                &command_id,
-                &digest,
+                &pending,
                 &mut respond,
             ))
             .await;
@@ -589,8 +590,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
             if let Error::JournalRowTooLarge(row) = &failed.error {
                 return persist_rejection(
                     &self.repository,
-                    &command_id,
-                    &digest,
+                    &pending,
                     config.recovery_wait(),
                     row.to_rejection(),
                 )
@@ -609,8 +609,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
 
                 return persist_rejection(
                     &self.repository,
-                    &command_id,
-                    &digest,
+                    &pending,
                     config.recovery_wait(),
                     config.stale_fence(Rejection::retries_exhausted(budget.attempts())),
                 )
@@ -628,15 +627,15 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
         entity_id: EntityId,
         command: A::Command,
         metadata: &Metadata,
-        command_id: &CommandId,
-        digest: &str,
+        pending: &PendingCommand,
         respond: &mut F,
     ) -> Result<CommandOutcome<A::Event>, Failed>
     where
         A::Error: ToRejection,
         F: FnMut(&A, &[A::Event]) -> Result<Option<Vec<u8>>, BoxError>,
     {
-        if let Some(stored) = pre_check(&self.repository, command_id, digest)
+        let command_id = pending.command_id();
+        if let Some(stored) = pre_check(&self.repository, command_id, pending.digest())
             .await
             .map_err(Failed::deciding)?
         {
@@ -654,8 +653,6 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
         }
 
         let entity_id = loaded.entity_id.clone();
-        let digest = digest.to_owned();
-        let command_id = command_id.clone();
 
         let events = match loaded.aggregate.handle(command, &self.services).await {
             Ok(events) => events,
@@ -668,7 +665,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
                 // Canonicalized through its stored encoding, so a first execution and a replay
                 // return the same rejection.
                 let rejection = rejection.canonical().map_err(Failed::internal)?;
-                let outcome = Outcome::rejected(command_id, digest, rejection);
+                let outcome = pending.rejected(rejection);
 
                 // A rejection may carry events: they commit with the rejected row like an
                 // accepted command's, decided on the state this attempt loaded.
@@ -702,7 +699,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
             let response = respond(&loaded.aggregate, &[])
                 .map_err(response_error)
                 .map_err(Failed::internal)?;
-            let outcome = with_response(Outcome::accepted(command_id, digest), response);
+            let outcome = with_response(pending.accepted(), response);
             let commit = Commit::new(entity_id, Vec::new()).with_outcome(outcome);
 
             return self
@@ -718,10 +715,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
         let response = respond(&loaded.aggregate, &decided)
             .map_err(response_error)
             .map_err(Failed::internal)?;
-        commit.outcome = Some(with_response(
-            Outcome::accepted(command_id, digest),
-            response,
-        ));
+        commit.outcome = Some(with_response(pending.accepted(), response));
 
         self.record(commit, decided)
             .await
@@ -795,6 +789,58 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
             .map(CommandOutcome::replay))
     }
 
+    /// Looks a command's outcome up by its command ID alone and answers it for the asking
+    /// principal (`None` or empty when there is none), for a caller that cannot rebuild the command's full
+    /// identity. Nothing is run or written; the digest is not compared (use
+    /// [`resolve_command`](Store::resolve_command) to check the full identity). It reads the
+    /// command's outcome row (strongly consistent):
+    ///
+    /// - `Ok(Some(outcome))`: the row's recorded principal is the asking one (both absent counts
+    ///   as equal); `outcome` is the stored outcome ([`CommandOutcome::replayed`]);
+    /// - `Ok(None)`: no row exists, which is not proof the command did not apply;
+    /// - [`Error::OutcomePrincipalMismatch`] with `recorded: true`: the row belongs to another
+    ///   principal; with `recorded: false`: the row records no identity (written before outcomes
+    ///   recorded it), so it cannot be matched and the lookup fails closed. The error never
+    ///   carries the stored outcome.
+    ///
+    /// The command ID is checked before the read, as for every outcome read
+    /// ([`Error::InvalidArgument`], [`Error::CommandIdTooLong`]), and the principal like the
+    /// metadata's. A store without outcomes is [`Error::InvalidConfig`].
+    pub async fn resolve_command_for_principal(
+        &self,
+        command_id: &CommandId,
+        principal: Option<&PrincipalId>,
+    ) -> Result<Option<CommandOutcome>, Error> {
+        self.outcomes_config()?;
+        check_command_id(command_id)?;
+
+        // An empty principal is no principal, as an outcome row records it.
+        let principal = principal.filter(|principal| !principal.is_empty());
+        if let Some(principal) = principal {
+            check_metadata(&Metadata::default().with_principal_id(principal.clone()))?;
+        }
+
+        let Some(stored) = self.repository.outcome(command_id).await? else {
+            return Ok(None);
+        };
+
+        let Some(identity) = &stored.identity else {
+            return Err(Error::OutcomePrincipalMismatch {
+                command_id: command_id.clone(),
+                recorded: false,
+            });
+        };
+
+        if identity.principal.as_ref() != principal {
+            return Err(Error::OutcomePrincipalMismatch {
+                command_id: command_id.clone(),
+                recorded: true,
+            });
+        }
+
+        Ok(Some(CommandOutcome::replay(stored)))
+    }
+
     /// The outcome check of [`resolve_command`](Store::resolve_command), for any outcome type.
     async fn resolve(
         &self,
@@ -833,7 +879,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
 
         match settle(&self.repository, &command_id, &digest, window, result).await? {
             Settled::Committed => Ok(CommandOutcome::fresh(stored, committed, typed_events)),
-            Settled::Replayed(outcome) => Ok(CommandOutcome::replay(outcome)),
+            Settled::Replayed(outcome) => Ok(CommandOutcome::replay(*outcome)),
         }
     }
 
@@ -910,8 +956,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
             if let Error::JournalRowTooLarge(row) = &failed.error {
                 return persist_rejection(
                     &self.repository,
-                    pending.command_id(),
-                    pending.digest(),
+                    &pending,
                     config.recovery_wait(),
                     row.to_rejection(),
                 )
@@ -930,8 +975,7 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
 
                 return persist_rejection(
                     &self.repository,
-                    pending.command_id(),
-                    pending.digest(),
+                    &pending,
                     config.recovery_wait(),
                     config.stale_fence(Rejection::retries_exhausted(budget.attempts())),
                 )

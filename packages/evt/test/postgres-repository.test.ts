@@ -242,9 +242,14 @@ describe('PgRepository', () => {
 
     const statements = transaction(log).slice(1, -1)
     expect(statements[0]).toBe('SELECT pg_advisory_xact_lock(1702261762, hashtext($1))')
-    expect(statements).toHaveLength(10)
+    expect(statements).toHaveLength(11)
     const ddl = log.slice(log.indexOf('START TRANSACTION ISOLATION LEVEL READ COMMITTED') + 2, -1)
-    expect(ddl.every((text) => /^(CREATE|DO) /.test(text))).toBe(true)
+    expect(ddl.every((text) => /^(CREATE|DO|ALTER) /.test(text))).toBe(true)
+    // The recorded-identity columns are added by a guarded DO block, so a schema that has them takes
+    // no lock on the outcomes table.
+    const upgrade = ddl.filter((text) => text.includes('ALTER TABLE orders__evt_command_outcomes'))
+    expect(upgrade).toHaveLength(1)
+    expect(upgrade[0]).toMatch(/^DO \$\$\nBEGIN\n    IF \(SELECT count\(\*\) FROM pg_attribute/)
     expect(ddl.find((text) => text.startsWith('DO '))).toMatch(/END IF;\nEND \$\$$/)
   })
 

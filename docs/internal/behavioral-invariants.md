@@ -421,6 +421,23 @@ error before any write and is never split.
 - Stores without outcomes keep today's behavior, and a bare `Store.Commit` refuses
   to carry or skip an outcome
 
+### Recorded Identity on Outcome Rows
+
+- Every outcome row the engine writes records the identity its digest was computed from: the
+  command type, the target streams deduplicated and byte-sorted as the digest takes them (a JSON
+  array, `[]` for none), and the principal (absent when the command had none). The fields are
+  descriptive: pre-check, replay and `IdempotencyKeyReuse` still compare digests only
+- A row without `commandType` (written before the fields existed) decodes with no identity and is
+  never rewritten. `commandType` without `targets`, `targets` or `principal` without
+  `commandType`, or `targets` that are not a JSON array of strings is a corrupt row
+- The command type, principal and encoded targets together are bounded at 65536 bytes, checked
+  before any write (`OutcomeTooLarge`, what = identity)
+- The lookup by command ID and principal returns the stored outcome only for the same principal
+  (both absent counts as equal), not found for no row, and a typed `OutcomePrincipalMismatch`
+  otherwise (`recorded = false` for a row without identity), never carrying the outcome
+- PostgreSQL's schema step adds the three nullable columns to an existing outcomes table with
+  `ADD COLUMN IF NOT EXISTS`; older writers' inserts stay valid
+
 ### Rejections and the Accepted No-Op (v0.9, C4)
 
 - A domain rejection is `Rejection { code, message, details }`, stored as the JSON

@@ -176,9 +176,25 @@ CREATE TABLE IF NOT EXISTS ${outcomesTable(tables)} (
     rejection  jsonb,
     code       text,
     created_at timestamptz NOT NULL DEFAULT now(),
+    command_type text,
+    targets      jsonb,
+    principal    text,
     CHECK ((status = 'rejected' AND rejection IS NOT NULL AND code IS NOT NULL)
            OR (status = 'accepted' AND rejection IS NULL AND code IS NULL))
 );
+
+DO $$
+BEGIN
+    IF (SELECT count(*) FROM pg_attribute
+        WHERE attrelid = '${outcomesTable(tables)}'::regclass
+          AND attname IN ('command_type', 'targets', 'principal')
+          AND NOT attisdropped) < 3 THEN
+        ALTER TABLE ${outcomesTable(tables)}
+            ADD COLUMN IF NOT EXISTS command_type text,
+            ADD COLUMN IF NOT EXISTS targets      jsonb,
+            ADD COLUMN IF NOT EXISTS principal    text;
+    END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS ${featuresTable(tables)} (
     id                integer PRIMARY KEY,

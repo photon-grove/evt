@@ -103,6 +103,18 @@ A single-aggregate command's identity is the one `ExecuteWithOutcome` digests: i
 command as the payload; in Rust `CommandIdentity::for_command(&cmd, id)`, whose payload is the
 command's `OutcomeCommand::canonical_payload`.
 
+Each outcome row also records the identity its digest came from: the command type, the targets,
+and the principal (`Outcome.Identity`; Rust `Outcome::identity`). A caller that has only the
+command ID and the principal asking, such as an API that lets a client poll for the result of a
+command it submitted, uses `Store.ResolveCommandForPrincipal(ctx, commandID, principal)` (Rust
+`Store::resolve_command_for_principal`). It returns the stored outcome when the row's principal
+is the asking one (none matches none, and an empty principal is none), nothing when there is no
+row, and `*evt.OutcomePrincipalMismatchError` otherwise, which never carries the outcome. A row
+written before outcomes recorded their identity has none to match, so it fails closed with
+`Recorded` false. The digest is not compared: use `ResolveCommand` when you have the full
+identity. Note that `IdempotencyKeyReuse` does carry the stored outcome, so an endpoint that
+serves several principals should answer it without echoing the error's outcome.
+
 A lost race on the outcome row is resolved the same way and never surfaces as a generic conflict.
 The loser returns only the winner's stored outcome. A first execution returns its rejection in the
 stored (decoded) form, so its `Details` equal a replay's.

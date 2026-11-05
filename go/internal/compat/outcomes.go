@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -33,6 +34,9 @@ type OutcomeFixtures struct {
 	// MalformedRows are outcome items no reader may replay: each must fail to decode in every
 	// language as a corrupt record.
 	MalformedRows []MalformedRow `json:"malformedRows"`
+
+	// IdentityBounds pin the recorded identity's bound, escapes counted.
+	IdentityBounds []IdentityBoundVector `json:"identityBounds"`
 
 	// RejectionNumbers pin the canonical text of the numbers in a stored rejection.
 	RejectionNumbers []RejectionNumberVector `json:"rejectionNumbers"`
@@ -100,6 +104,17 @@ type OutcomeInputVector struct {
 	Response  *string  `json:"response"`
 	EventIDs  []string `json:"eventIds"`
 	Rejection *string  `json:"rejection"`
+
+	// Identity is the recorded identity, null for a row written before outcomes recorded it.
+	Identity *IdentityVector `json:"identity"`
+}
+
+// IdentityVector is an outcome's recorded identity: targets already deduplicated and sorted, and
+// Principal null when the command had none.
+type IdentityVector struct {
+	CommandType string   `json:"commandType"`
+	Targets     []string `json:"targets"`
+	Principal   *string  `json:"principal"`
 }
 
 // RowVector is one outcome and every encoding of it: the DynamoDB item, the item's budget size,
@@ -191,23 +206,44 @@ func GenerateOutcomeFixtures() (OutcomeFixtures, error) {
 		{EntityID: "claim#ada", Expected: 0, Actual: 1},
 	})
 
+	// identity is what a row records for a digest vector's input, so the two stay in step.
+	identity := func(name string) *evt.RecordedIdentity {
+		for _, digest := range digests {
+			if digest.name == name {
+				return evt.RecordedIdentityOf(digest.input)
+			}
+		}
+
+		panic("no digest vector " + name)
+	}
+
+	auditDigest, err := evt.DefaultDigest(evt.DigestInput{
+		CommandType: "account:audit", Payload: []byte(`{"note":"checked"}`),
+	})
+	if err != nil {
+		return fixtures, err
+	}
+
 	rows := []struct {
 		name    string
 		outcome evt.Outcome
 	}{
 		{"accepted with events and response", evt.Outcome{
 			CommandID: "cmd-0001", Status: evt.OutcomeAccepted,
+			Identity: identity("single stream"),
 			Digest:   "08f63bf06ef7167f79dda7f5de9307e1ffb626de015ecbc1c1482d1e67e5abd6",
 			Response: []byte(`{"accountId":"acct-1","balanceCents":0}`), EventIDs: []evt.EventID{"acct-1:1"},
 		}},
 		{"accepted multi-stream", evt.Outcome{
 			CommandID: "cmd-0004", Status: evt.OutcomeAccepted,
+			Identity: identity("multi stream with principal"),
 			Digest:   "56d01f5b9788b60e12a686e40807c28d9dfde802d82faf46888adda0acee7050",
 			EventIDs: []evt.EventID{"claim#ada:1", "profile#u-1:1"},
 		}},
 		{"accepted no-op", evt.Outcome{
 			CommandID: "cmd-0003", Status: evt.OutcomeAccepted,
-			Digest: "d24c7d5ce955a76c936a83e6eca2c3bc277d936c88a76460ed2d221e285a215a",
+			Identity: identity("absent payload"),
+			Digest:   "d24c7d5ce955a76c936a83e6eca2c3bc277d936c88a76460ed2d221e285a215a",
 		}},
 		{"accepted binary response", evt.Outcome{
 			CommandID: "cmd-0006", Status: evt.OutcomeAccepted, Digest: "d",
@@ -215,31 +251,56 @@ func GenerateOutcomeFixtures() (OutcomeFixtures, error) {
 		}},
 		{"rejected", evt.Outcome{
 			CommandID: "cmd-0002", Status: evt.OutcomeRejected,
-			Digest: "21c04bf818ab67db244dc184ae98197928309a4b3a3533acba69dacf992b6d79",
+			Identity: identity("multi stream, sorted"),
+			Digest:   "21c04bf818ab67db244dc184ae98197928309a4b3a3533acba69dacf992b6d79",
 			Rejection: &evt.Rejection{
 				Code: "username-taken", Message: "handle ada is taken", Details: map[string]any{"handle": "ada"},
 			},
 		}},
 		{"rejected stale fence", evt.Outcome{
 			CommandID: "cmd-0005", Status: evt.OutcomeRejected,
+			Identity:  identity("stale fence"),
 			Digest:    "ba4a6a859dcf103a00261515d7e309b31e8f07ca21732a4b7872b7fdebb92c1b",
 			Rejection: &callerFence,
 		}},
 		{"accepted rename, state-derived write set", evt.Outcome{
 			CommandID: "cmd-0008", Status: evt.OutcomeAccepted, Digest: renameDigest,
+			Identity: identity("rename, state-derived write set is not identity"),
 			EventIDs: []evt.EventID{"claim#ada:2", "claim#grace:1", "profile#u-1:2"},
+		}},
+		// Identities without a principal or a target, and with non-ASCII text in every field.
+		{"accepted outcome-only, recorded identity without principal or targets", evt.Outcome{
+			CommandID: "cmd-0012", Status: evt.OutcomeAccepted,
+			Digest:   auditDigest,
+			Identity: identity("outcome-only, no streams"),
+		}},
+		{"accepted, non-ASCII recorded identity", evt.Outcome{
+			CommandID: "cmd-0013", Status: evt.OutcomeAccepted, Digest: "d",
+			Identity: identity("non-ASCII and HTML-sensitive payload"),
+		}},
+		// The targets JSON escapes <, >, & and U+2028 exactly as the shared JSON rules do.
+		{"accepted, HTML-sensitive recorded identity", evt.Outcome{
+			CommandID: "cmd-0014", Status: evt.OutcomeAccepted, Digest: "d",
+			Identity: evt.RecordedIdentityOf(evt.DigestInput{
+				CommandType: "note:add<é>",
+				Targets:     []evt.EntityID{"x\u2028y", "a<b>&c", "naïve#1"},
+				Principal:   "user:<é>",
+			}),
 		}},
 		{"rejected stale fence, retries exhausted", evt.Outcome{
 			CommandID: "cmd-0009", Status: evt.OutcomeRejected, Digest: renameDigest, Rejection: &exhausted,
+			Identity: identity("rename, state-derived write set is not identity"),
 		}},
 		{"rejected stale version", evt.Outcome{
 			CommandID: "cmd-0011", Status: evt.OutcomeRejected, Digest: renameDigest, Rejection: &staleVersion,
+			Identity: identity("rename, state-derived write set is not identity"),
 		}},
 		// A rejection recorded with its failure events (RejectWithEvents): the same row as an
 		// accepted outcome's, with the rejection and code attributes beside the events.
 		{"rejected with events", evt.Outcome{
 			CommandID: "cmd-0010", Status: evt.OutcomeRejected,
-			Digest: "21c04bf818ab67db244dc184ae98197928309a4b3a3533acba69dacf992b6d79",
+			Identity: identity("multi stream, sorted"),
+			Digest:   "21c04bf818ab67db244dc184ae98197928309a4b3a3533acba69dacf992b6d79",
 			Rejection: &evt.Rejection{
 				Code: "apply-conflict", Message: "the proposal was decided on a stale base", Details: map[string]any{"base": 3},
 			},
@@ -272,6 +333,10 @@ func GenerateOutcomeFixtures() (OutcomeFixtures, error) {
 
 	fixtures.MalformedRows = malformedRows()
 
+	if fixtures.IdentityBounds, err = identityBounds(); err != nil {
+		return fixtures, err
+	}
+
 	numbers, err := rejectionNumbers()
 	if err != nil {
 		return fixtures, err
@@ -280,6 +345,58 @@ func GenerateOutcomeFixtures() (OutcomeFixtures, error) {
 	fixtures.RejectionNumbers = numbers
 
 	return fixtures, nil
+}
+
+// IdentityBoundVector is a recorded identity at the edge of its bound: Size is the bytes the bound
+// counts (the command type, the principal, and the encoded targets, escapes included), and Error is
+// "outcome-too-large" when CheckOutcome refuses it, empty when it passes.
+type IdentityBoundVector struct {
+	Name     string         `json:"name"`
+	Identity IdentityVector `json:"identity"`
+	Size     int            `json:"size"`
+	Error    string         `json:"error,omitempty"`
+}
+
+// identityBounds pins the bound at exactly MaxOutcomeBytes and one byte past it, with a thousand
+// < characters whose escapes (\u003c, six bytes each) count toward it.
+func identityBounds() ([]IdentityBoundVector, error) {
+	vectors := make([]IdentityBoundVector, 0, 2)
+
+	for _, test := range []struct {
+		name  string
+		extra int
+	}{{"at the bound", 0}, {"one byte past the bound", 1}} {
+		// "t" + `["` + 1000 × \u003c + filler + `"]` = 1 + 4 + 6000 + filler.
+		target := strings.Repeat("<", 1000) + strings.Repeat("a", evt.MaxOutcomeBytes-6005+test.extra)
+		identity := &evt.RecordedIdentity{Type: "t", Targets: []evt.EntityID{evt.EntityID(target)}}
+
+		encoded, err := identity.EncodeTargets()
+		if err != nil {
+			return nil, err
+		}
+
+		vector := IdentityBoundVector{
+			Name:     test.name,
+			Identity: IdentityVector{CommandType: "t", Targets: []string{target}},
+			Size:     len(identity.Type) + len(encoded),
+		}
+
+		err = evt.CheckOutcome(&evt.Outcome{CommandID: "c", Status: evt.OutcomeAccepted, Digest: "d", Identity: identity})
+
+		var tooLarge *evt.OutcomeTooLargeError
+
+		switch {
+		case err == nil:
+		case errors.As(err, &tooLarge) && tooLarge.What == "identity":
+			vector.Error = "outcome-too-large"
+		default:
+			return nil, fmt.Errorf("%s: %w", test.name, err)
+		}
+
+		vectors = append(vectors, vector)
+	}
+
+	return vectors, nil
 }
 
 // rejectionNumbers builds the canonical-number vectors from literal inputs, which DecodeRejection
@@ -402,6 +519,12 @@ func malformedRows() []MalformedRow {
 		{"rejection details that are a number", rejectedRow(text(`{"code":"c","message":"m","details":1}`))},
 		{"rejection followed by another value", rejectedRow(text(`{"code":"c","message":"m","details":null} {}`))},
 		{"rejection followed by garbage", rejectedRow(text(`{"code":"c","message":"m","details":null}x`))},
+		{"command type without targets", accepted(map[string]any{"commandType": text("t")})},
+		{"targets without a command type", accepted(map[string]any{"targets": text(`["a"]`)})},
+		{"principal without a command type", accepted(map[string]any{"principal": text("user:1")})},
+		{"targets that are not an array of strings", accepted(map[string]any{"commandType": text("t"), "targets": text(`{"a":1}`)})},
+		{"targets that are null", accepted(map[string]any{"commandType": text("t"), "targets": text(`null`)})},
+		{"targets stored as a number", accepted(map[string]any{"commandType": text("t"), "targets": map[string]any{"N": "1"}})},
 		{"code stored as a number", accepted(map[string]any{
 			"status": text("rejected"), "events": nil, "code": map[string]any{"N": "1"},
 			"rejection": text(`{"code":"c","message":"m","details":null}`),
@@ -482,6 +605,30 @@ func rowVector(name string, outcome evt.Outcome) (RowVector, error) {
 		vector.RejectionRaw = text
 		pg["rejection"] = text
 		pg["code"] = string(outcome.Rejection.Code)
+	}
+
+	pg["command_type"], pg["targets"], pg["principal"] = nil, nil, nil
+
+	if outcome.Identity != nil {
+		targets, err := outcome.Identity.EncodeTargets()
+		if err != nil {
+			return RowVector{}, err
+		}
+
+		input := &IdentityVector{CommandType: string(outcome.Identity.Type), Targets: make([]string, 0, len(outcome.Identity.Targets))}
+		for _, target := range outcome.Identity.Targets {
+			input.Targets = append(input.Targets, string(target))
+		}
+
+		pg["command_type"], pg["targets"] = string(outcome.Identity.Type), targets
+
+		if outcome.Identity.Principal != nil {
+			principal := string(*outcome.Identity.Principal)
+			input.Principal = &principal
+			pg["principal"] = principal
+		}
+
+		vector.Input.Identity = input
 	}
 
 	vector.PostgresRow = pg

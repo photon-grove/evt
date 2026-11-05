@@ -730,6 +730,9 @@ impl PostgresRepository {
             events: row.get(3),
             rejection: row.get(4),
             code: row.get(5),
+            command_type: row.get(6),
+            targets: row.get(7),
+            principal: row.get(8),
         }))
     }
 
@@ -850,6 +853,9 @@ impl PostgresRepository {
                     &row.events,
                     &row.rejection,
                     &row.code,
+                    &row.command_type,
+                    &row.targets,
+                    &row.principal,
                 ],
             )
             .await

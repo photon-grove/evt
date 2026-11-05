@@ -894,6 +894,9 @@ there is no reserved-then-resolved intermediate state.
 | `events`    | S    | JSON array of event IDs the commit wrote. Absent when none          |
 | `rejection` | S    | serialized rejection (below). Present only when `status = rejected` |
 | `code`      | S    | the rejection code. Present only when `status = rejected`           |
+| `commandType` | S  | the command type of the recorded identity ([Recorded identity](#recorded-identity)). Absent on rows written before it |
+| `targets`   | S    | JSON array of the identity's target stream IDs, as the digest orders them. Present exactly when `commandType` is |
+| `principal` | S    | the identity's principal. Present only when the command had one and `commandType` is present |
 
 The row has no snapshot, no `ttl`, and never compacts. `response` is base64 rather than raw text
 so a response of arbitrary bytes round-trips exactly in both languages. The decoded bytes are the
@@ -975,6 +978,75 @@ A rejected outcome:
   "digest": "21c04bf818ab67db244dc184ae98197928309a4b3a3533acba69dacf992b6d79",
   "rejection": "{\"code\":\"username-taken\",\"message\":\"handle ada is taken\",\"details\":{\"handle\":\"ada\"}}",
   "code": "username-taken"
+}
+```
+
+### Recorded identity
+
+An outcome row also records the identity the digest was computed from, so a caller that holds only
+a command ID and the principal asking can tell whose command it was. The fields are descriptive:
+the digest stays the idempotency key, and the pre-check, replay, and `IdempotencyKeyReuse` rules
+compare digests only, as before.
+
+- `commandType` is the command type, as the digest's `lp(command type)` takes it. It is present on
+  every row written since the fields were added, so its presence marks a row that records its
+  identity. It may be the empty string.
+- `targets` is the identity's target stream IDs, deduplicated and sorted by byte order exactly as
+  the digest takes them, encoded as a JSON array of strings by the shared JSON rules: `[]` for a
+  command that names no stream, and `["claim#ada","profile#u-1"]` for the multi-stream example.
+- `principal` is the metadata's `principalId`. It is absent when the command had none, so a
+  recorded row without `principal` belongs to a command with no principal.
+- A row with none of the three fields (written before they existed) records no identity. Readers
+  accept it; it decodes with no recorded identity (Go: `Outcome.Identity == nil`; Rust:
+  `Outcome::identity` is `None`). Every other combination is a malformed row (`CorruptOutcome` /
+  `InvalidRecord`): `targets` or `principal` without `commandType`, `commandType` without
+  `targets`, or a `targets` value that is not a JSON array of strings (`null`, an object, or an
+  array holding a `null` or another non-string).
+- Every row the engine writes records its identity: accepted, rejected, the accepted no-op, the
+  stale-fence and stale-version rejections the outcome-only transaction persists, and an oversized
+  journal row's rejection. A custom digester changes the digest, not the recorded identity.
+- The three fields together are bounded before any write: the UTF-8 bytes of `commandType`,
+  `principal`, and the encoded `targets` array (escapes included, so `<` counts six bytes as
+  `\u003c`) may total at most 65536 bytes, or the command fails with `OutcomeTooLarge` and writes
+  nothing, in both languages and on every backend. The check runs when the outcome is committed,
+  after the handler or prepare step, so a command whose targets are that large, which committed
+  before the fields existed, now fails. `compat/fixtures/outcomes.json` pins the bound under
+  `identityBounds`. The fields count toward the outcome item's size in the
+  [commit budget](#writes).
+
+The recorded identity backs a lookup by command ID and principal (Go
+`Store.ResolveCommandForPrincipal(ctx, commandID, principal)`, Rust
+`Store::resolve_command_for_principal(&command_id, principal)`), for a caller that cannot rebuild
+the full identity. It reads the row like the pre-check and writes nothing:
+
+- No row: not found (`nil, nil` / `Ok(None)`). As for every outcome read, that is not proof the
+  command did not apply.
+- A row whose recorded principal equals the asking principal (both absent counts as equal, and an
+  empty asking principal is absent, as the writer records it): the stored outcome, marked
+  replayed.
+- A row with another principal: the typed `OutcomePrincipalMismatch` error (Go
+  `*evt.OutcomePrincipalMismatchError`, `errors.Is(err, evt.ErrOutcomePrincipalMismatch)`; Rust
+  `Error::OutcomePrincipalMismatch`), carrying the command ID and `recorded = true`, and never the
+  stored outcome, so a principal cannot read another's response.
+- A row that records no identity: the same error with `recorded = false`. The lookup fails closed,
+  as it had to before the fields existed.
+
+A command written before the change and replayed after it keeps its row as it is: rows are never
+rewritten, so its identity stays unrecorded.
+
+The accepted multi-stream outcome above, with its recorded identity (command `claim-username`,
+targets `profile#u-1` and `claim#ada`, principal `user:42`):
+
+```json
+{
+  "pk": "command-outcome#cmd-0004",
+  "sk": 1,
+  "status": "accepted",
+  "digest": "56d01f5b9788b60e12a686e40807c28d9dfde802d82faf46888adda0acee7050",
+  "events": "[\"claim#ada:1\",\"profile#u-1:1\"]",
+  "commandType": "claim-username",
+  "targets": "[\"claim#ada\",\"profile#u-1\"]",
+  "principal": "user:42"
 }
 ```
 
@@ -3297,9 +3369,28 @@ CREATE TABLE IF NOT EXISTS evt_events__evt_command_outcomes (
     rejection  jsonb,
     code       text,
     created_at timestamptz NOT NULL DEFAULT now(),
+    command_type text,
+    targets      jsonb,
+    principal    text,
     CHECK ((status = 'rejected' AND rejection IS NOT NULL AND code IS NOT NULL)
            OR (status = 'accepted' AND rejection IS NULL AND code IS NULL))
 );
+
+-- A table created before the recorded identity gains its columns, so both shapes end up identical.
+-- The columns carry no constraint: readers enforce the rules (Recorded identity), as they do on
+-- DynamoDB. The catalog check comes first, so a table that has them takes no lock.
+DO $$
+BEGIN
+    IF (SELECT count(*) FROM pg_attribute
+        WHERE attrelid = 'evt_events__evt_command_outcomes'::regclass
+          AND attname IN ('command_type', 'targets', 'principal')
+          AND NOT attisdropped) < 3 THEN
+        ALTER TABLE evt_events__evt_command_outcomes
+            ADD COLUMN IF NOT EXISTS command_type text,
+            ADD COLUMN IF NOT EXISTS targets      jsonb,
+            ADD COLUMN IF NOT EXISTS principal    text;
+    END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS evt_events__evt_features (
     id                integer PRIMARY KEY,
@@ -3420,7 +3511,16 @@ v0.9 rows. The DynamoDB items of [Command outcomes](#command-outcomes),
   the `command-outcome#` prefix). `digest` and `code` are text as on DynamoDB. `response` is
   `bytea`, the same raw bytes whose base64 the DynamoDB item stores. `events` is a `jsonb` array
   of event IDs (the same array, in the same stream-ID-then-sequence order) and `rejection` a
-  `jsonb` object with keys `code`, `message`, `details`. Compare both as JSON, not bytes. The
+  `jsonb` object with keys `code`, `message`, `details`. Compare both as JSON, not bytes.
+  `command_type`, `targets` (a `jsonb` array) and `principal` are the
+  [recorded identity](#recorded-identity), `NULL` exactly where the DynamoDB attributes are
+  absent. They were added after v0.9: `EnsureSchema` / `ensure_schema` / `ensureSchema` adds them
+  to an existing table with `ADD COLUMN IF NOT EXISTS` under the schema lock, after a catalog check
+  so a table that has them takes no `ACCESS EXCLUSIVE` lock, and every row already in the table
+  keeps `NULL` (no identity recorded). A writer that records the identity reads and writes the
+  columns on every command and fails (writing nothing) on a table that lacks them, so the schema
+  step must run before such writers. An older writer's inserts, which name none of the columns,
+  stay valid, so writers can be upgraded one at a time after the schema. The
   `CHECK` constraints mirror the once-in-final-state rule. The outcome insert is a plain `INSERT`
   into the commit transaction. A unique violation (`23505`) on the outcomes table means another
   writer recorded the outcome first: the commit is ambiguous, and the caller recovers by

@@ -57,11 +57,26 @@ func (repo *Repository) insertOutcome(ctx context.Context, tx pgx.Tx, outcome *e
 		response = outcome.Response
 	}
 
+	var commandType, targets, principal any
+
+	if identity := outcome.Identity; identity != nil {
+		encoded, terr := identity.EncodeTargets()
+		if terr != nil {
+			return fmt.Errorf("postgres: %w", terr)
+		}
+
+		commandType, targets = string(identity.Type), encoded
+		if identity.Principal != nil {
+			principal = string(*identity.Principal)
+		}
+	}
+
 	_, err = tx.Exec(ctx, fmt.Sprintf(
-		`INSERT INTO %s (command_id, status, digest, response, events, rejection, code)
-		 VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7)`,
+		`INSERT INTO %s (command_id, status, digest, response, events, rejection, code, command_type, targets, principal)
+		 VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7, $8, $9::jsonb, $10)`,
 		repo.outcomesTable(),
-	), string(outcome.CommandID), string(outcome.Status), outcome.Digest, response, events, rejection, code)
+	), string(outcome.CommandID), string(outcome.Status), outcome.Digest, response, events, rejection, code,
+		commandType, targets, principal)
 	if err == nil {
 		return nil
 	}
@@ -87,12 +102,16 @@ func (repo *Repository) GetOutcome(ctx context.Context, id evt.CommandID) (*evt.
 		events         string
 		rejection      *string
 		code           *string
+		commandType    *string
+		targets        *string
+		principal      *string
 	)
 
 	err := repo.db.QueryRow(ctx, fmt.Sprintf(
-		`SELECT status, digest, response, events::text, rejection::text, code FROM %s WHERE command_id = $1`,
+		`SELECT status, digest, response, events::text, rejection::text, code, command_type, targets::text, principal
+		 FROM %s WHERE command_id = $1`,
 		repo.outcomesTable(),
-	), string(id)).Scan(&status, &digest, &response, &events, &rejection, &code)
+	), string(id)).Scan(&status, &digest, &response, &events, &rejection, &code, &commandType, &targets, &principal)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -132,6 +151,11 @@ func (repo *Repository) GetOutcome(ctx context.Context, id evt.CommandID) (*evt.
 
 	if outcome.Rejection != nil && (code == nil || *code != string(outcome.Rejection.Code)) {
 		return nil, corrupt(errors.New("the code column disagrees with the rejection"))
+	}
+
+	// jsonb normalizes the targets text too; DecodeRecordedIdentity compares the decoded array.
+	if outcome.Identity, err = evt.DecodeRecordedIdentity(id, commandType, targets, principal); err != nil {
+		return nil, err
 	}
 
 	return &outcome, nil
