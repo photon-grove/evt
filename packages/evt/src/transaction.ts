@@ -368,6 +368,10 @@ export class Transaction {
    */
   async commitWithOutcome(options: OutcomeCommitOptions = {}): Promise<CommandOutcome> {
     const pending = this.#takeCommand()
+    const answered = await this.#alreadyRan(pending, options)
+    if (answered !== null) {
+      return answered
+    }
     const prepared = this.#prepare(pending.metadata)
 
     return this.#record(pending, acceptedOutcome(pending, options.response), prepared, options)
@@ -383,6 +387,10 @@ export class Transaction {
    */
   async reject(rejection: Rejection, options: CallOptions = {}): Promise<CommandOutcome> {
     const pending = this.#takeCommand()
+    const answered = await this.#alreadyRan(pending, options)
+    if (answered !== null) {
+      return answered
+    }
     const outcome = rejectedOutcome(pending, rejection)
     const streams = [...this.#streams.values()]
     streams.sort((a, b) => a.order - b.order)
@@ -405,6 +413,10 @@ export class Transaction {
    */
   async rejectWithEvents(rejection: Rejection, options: CallOptions = {}): Promise<CommandOutcome> {
     const pending = this.#takeCommand()
+    const answered = await this.#alreadyRan(pending, options)
+    if (answered !== null) {
+      return answered
+    }
     const prepared = this.#prepare(pending.metadata)
 
     return this.#record(pending, rejectedOutcome(pending, rejection), prepared, options)
@@ -436,9 +448,7 @@ export class Transaction {
   }
 
   // The command an outcome method records, which ends the transaction: it must have begun, and no
-  // read may still be loading. An event written before outcomes existed in a stream the command
-  // read already carries its ID without an outcome row: the command ran, so no outcome is recorded
-  // for it.
+  // read may still be loading.
   #takeCommand(): PendingCommand {
     this.#outcomeConfig()
     this.#checkCommittable()
@@ -451,11 +461,25 @@ export class Transaction {
     }
     this.#done = true
 
-    if (this.#seen(pending.commandId)) {
+    return pending
+  }
+
+  // Whether a stream this command read already carries its ID. Another attempt of the command may
+  // have committed since beginCommand read the row, so the row is read again, and answers it when
+  // it's there. Without one, it's an event written before outcomes existed: the command ran, so no
+  // outcome is recorded for it.
+  async #alreadyRan(pending: PendingCommand, options: CallOptions): Promise<CommandOutcome | null> {
+    if (!this.#seen(pending.commandId)) {
+      return null
+    }
+
+    const repository = this.#context.repository as OutcomeRepository
+    const stored = await preCheck(repository, pending, options)
+    if (stored === null) {
       throw new DuplicateCommandError(pending.commandId)
     }
 
-    return pending
+    return replayed(stored)
   }
 
   // Builds the commit: every stream with events, its metadata stamped and the snapshot and

@@ -39,6 +39,7 @@ import {type Metadata, emptyMetadata} from './metadata.js'
 import {
   type CommandIdentity,
   type CommandOutcome,
+  type Outcome,
   checkCommandId,
   checkMetadata,
   checkText,
@@ -484,9 +485,20 @@ export class Store {
       return failed(error, 'deciding')
     }
 
-    // Events written before outcomes existed carry command IDs but have no outcome row. The window
-    // catches those duplicates, and only those: this store's own commits write rows.
+    // An event the load folded in already carries the command ID. Another attempt of the command
+    // may have committed since the row was read, so it's read again, and answers the command when
+    // it's there. Without one, it's an event written before outcomes existed: the command ran, so
+    // no outcome is recorded for it.
     if (loaded.seenCommandIds.has(pending.commandId)) {
+      let stored: Outcome | null
+      try {
+        stored = await preCheck(repository, pending, options)
+      } catch (error) {
+        return failed(error, 'deciding')
+      }
+      if (stored !== null) {
+        return {kind: 'done', outcome: replayed(stored)}
+      }
       return failed(new DuplicateCommandError(pending.commandId), 'internal')
     }
 

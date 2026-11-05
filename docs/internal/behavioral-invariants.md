@@ -352,6 +352,9 @@ error before any write and is never split.
   window of the streams the command read is applied: a pre-v0.9 event that carries this command ID
   and was replayed since the latest snapshot is a duplicate (`DuplicateCommandError` /
   `Error::DuplicateCommand`), and no terminal outcome is written for a command that already ran.
+  TypeScript reads the outcome row again before it reports one, so an attempt of the same command
+  that committed after the pre-check is replayed (or `IdempotencyKeyReuse`) rather than reported
+  as a duplicate.
   The window only sees events after the latest snapshot; a pre-v0.9 command ID folded into a
   snapshot or compacted away is not detected (the documented upgrade limitation, no backfill)
 - A command may not name a reserved target stream (`SYSTEM#`, `command-outcome#`): the identity

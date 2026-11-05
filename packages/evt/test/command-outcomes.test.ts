@@ -344,6 +344,34 @@ describe('Store.executeWithOutcome', () => {
     expect(await repository.outcome('c1')).toBeNull()
   })
 
+  test('an attempt that committed after the outcome check is replayed, not a duplicate', async () => {
+    const inner = new MemRepository()
+    const repository = new FaultRepository(inner)
+    let raced = false
+    // Another attempt of the command commits between this one's outcome check and its load.
+    repository.events = async (entityId, options) => {
+      if (!raced) {
+        raced = true
+        await outcomeStore(inner).executeWithOutcome(
+          ledger,
+          'l',
+          {type: 'add', amount: 1},
+          as('c1'),
+        )
+      }
+      return inner.events(entityId, options)
+    }
+
+    const result = await outcomeStore(repository).executeWithOutcome(
+      ledger,
+      'l',
+      {type: 'add', amount: 1},
+      as('c1'),
+    )
+    expect(result.replayed).toBe(true)
+    expect(await inner.events('l')).toHaveLength(1)
+  })
+
   test('a conflict re-prepares the command from a fresh load', async () => {
     const inner = new MemRepository()
     const repository = new Failing(inner, (commit) =>
@@ -945,6 +973,34 @@ describe('Transaction with outcomes', () => {
     const result = await transaction.rejectWithEvents({code: 'no', message: 'refused'})
     expect(result.outcome).toMatchObject({status: 'rejected', eventIds: [eventId('a', 1n)]})
     expect((await repository.events('a'))[0]?.metadata.commandId).toBe('c1')
+  })
+
+  test('a command that committed after beginCommand is replayed, or a reused key', async () => {
+    const repository = new MemRepository()
+    const store = outcomeStore(repository)
+    const transaction = store.transaction()
+    await transaction.beginCommand({commandType: 'pay'}, as('c1'))
+    const reused = store.transaction()
+    await reused.beginCommand({commandType: 'other'}, as('c2'))
+
+    // Other attempts commit the commands before either transaction reads the stream.
+    for (const [type, id] of [
+      ['pay', 'c1'],
+      ['pay', 'c2'],
+    ]) {
+      const winner = store.transaction()
+      await winner.beginCommand({commandType: type!}, as(id!))
+      winner.append(await winner.read(ledger, 'a'), [{type: 'ledger:added', data: {amount: 1}}])
+      await winner.commitWithOutcome()
+    }
+
+    await transaction.read(ledger, 'a')
+    const result = await transaction.reject({code: 'no', message: 'x'})
+    expect(result.replayed).toBe(true)
+    expect(result.outcome.status).toBe('accepted')
+
+    await reused.read(ledger, 'a')
+    expect(await failure(reused.commitWithOutcome())).toBeInstanceOf(IdempotencyKeyReuseError)
   })
 
   test('a command ID an older event carries is a duplicate', async () => {
