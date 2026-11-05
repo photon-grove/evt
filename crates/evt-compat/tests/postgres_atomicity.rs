@@ -472,11 +472,11 @@ async fn the_outcome_identity_columns_upgrade_an_existing_table() {
     let legacy = repo.outcome(&"legacy".into()).await.unwrap().unwrap();
     assert_eq!(legacy.identity, None, "an older row records no identity");
 
-    let identity = RecordedIdentity {
-        command_type: "account:open".into(),
-        targets: vec!["acct-1".into()],
-        principal: Some(PrincipalId::new("user:42")),
-    };
+    let identity = RecordedIdentity::new(
+        "account:open",
+        vec!["acct-1".into()],
+        Some(PrincipalId::new("user:42")),
+    );
     repo.commit_transaction(
         TransactionCommit::new(Vec::new())
             .with_outcome(Outcome::accepted("recorded", "d").with_identity(identity.clone())),

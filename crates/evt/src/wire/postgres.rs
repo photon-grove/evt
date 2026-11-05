@@ -452,8 +452,10 @@ pub fn select_outcome_sql(events_table: &str) -> String {
     )
 }
 
-/// One row of the command-outcomes table.
+/// One row of the command-outcomes table. Build one with
+/// [`from_outcome`](Self::from_outcome); it may gain columns.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct OutcomeRow {
     /// `command_id`.
     pub command_id: String,

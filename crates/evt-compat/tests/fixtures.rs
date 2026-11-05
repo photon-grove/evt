@@ -931,11 +931,11 @@ fn outcome_rows_match_go_byte_for_byte() {
 }
 
 fn recorded_identity(identity: IdentityVector) -> RecordedIdentity {
-    RecordedIdentity {
-        command_type: identity.command_type,
-        targets: identity.targets.iter().map(EntityId::new).collect(),
-        principal: identity.principal.map(PrincipalId::new),
-    }
+    RecordedIdentity::new(
+        identity.command_type,
+        identity.targets.iter().map(EntityId::new).collect(),
+        identity.principal.map(PrincipalId::new),
+    )
 }
 
 /// The recorded identity's bound counts the UTF-8 bytes of the command type, the principal, and

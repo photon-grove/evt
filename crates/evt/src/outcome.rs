@@ -361,6 +361,7 @@ pub struct Outcome {
 /// identity): the command type, the target streams deduplicated and sorted by byte order as the
 /// digest takes them, and the principal, `None` when the command had none.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RecordedIdentity {
     /// The command type, as the digest takes it. It may be empty.
     pub command_type: String,
@@ -371,6 +372,20 @@ pub struct RecordedIdentity {
 }
 
 impl RecordedIdentity {
+    /// An identity from its fields, taken as given: the targets keep their order. Use
+    /// [`of`](Self::of) for the identity a command records.
+    pub fn new(
+        command_type: impl Into<String>,
+        targets: Vec<EntityId>,
+        principal: Option<PrincipalId>,
+    ) -> Self {
+        Self {
+            command_type: command_type.into(),
+            targets,
+            principal,
+        }
+    }
+
     /// The identity an outcome records for a digest input. An empty principal is none.
     pub fn of(input: &DigestInput) -> Self {
         let mut targets = input.targets.clone();
