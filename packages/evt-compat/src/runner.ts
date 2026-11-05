@@ -4,16 +4,26 @@
 // compat/fixtures/scenarios.json records it.
 
 import {
+  AmbiguousWriteError,
+  CommandIdTooLongError,
+  type CommandOutcome,
   type Commit,
+  DEFAULT_RETRY_POLICY,
+  type DigestInput,
+  IdempotencyKeyReuseError,
   type JsonValue,
   type Metadata,
+  type OutcomeOptions,
+  type OutcomeRepository,
   type ReadFence,
   type Repository,
   type SerializedEvent,
   Store,
+  type StoreOptions,
   StreamHeadDriftError,
   type TransactionCommit,
   type TransactionalRepository,
+  defaultDigest,
   emptyMetadata,
   encodeEvent,
   encodeSnapshot,
@@ -21,8 +31,9 @@ import {
   isConflict,
   stringifyJson,
 } from '@photon-grove/evt'
+import {FaultRepository} from '@photon-grove/evt/testing'
 
-import {account, accountCommand} from './account.js'
+import {account, accountCommand, sortedKeys} from './account.js'
 import {type Checks, canonical, field, int, list, num, plain, str} from './harness.js'
 
 /** The scenarios TypeScript supports so far, in memory and in the live run. */
@@ -41,14 +52,23 @@ export const SUPPORTED_SCENARIOS: readonly string[] = [
   'latest-n',
   'multi-stream',
   'read-fences',
+  'outcomes-idempotency',
+  'outcomes-noop',
+  'outcomes-rejection',
+  'outcomes-rejection-events',
+  'outcomes-ambiguous',
+  'stream-heads-drift',
 ]
+
+/** The fixture run's name, which every run's identity digests use. */
+export const FIXTURE_RUN = 'fixture'
 
 export const ORIGIN_SOURCE = 'evt-compat'
 const REGION = 'us-west-2'
 const DEFAULT_TIMESTAMP = '2026-10-12T00:00:00Z'
 
 // The outcome keys a supported step's expectation may hold.
-const OUTCOME_KEYS = new Set(['result', 'events', 'deleted', 'sequences'])
+const OUTCOME_KEYS = new Set(['result', 'events', 'deleted', 'sequences', 'code', 'replayed'])
 
 // The step keys this runner reads. A supported scenario that gains another fails loudly rather
 // than running without it.
@@ -74,6 +94,9 @@ const STEP_KEYS = new Set([
   'n',
   'streams',
   'fences',
+  'injectCommitFault',
+  'identity',
+  'response',
 ])
 
 // The keys this runner reads of a transaction step's streams, their events and its fences.
@@ -82,7 +105,7 @@ const EVENT_KEYS = new Set(['type', 'version', 'payload'])
 const FENCE_KEYS = new Set(['suffix', 'head', 'callerStamped'])
 
 // The scenario flags that need what TypeScript lacks so far.
-const LATER_FLAGS = ['outcomes', 'projector', 'exclusive']
+const LATER_FLAGS = ['projector', 'exclusive']
 
 const encoder = new TextEncoder()
 const decoder = new TextDecoder()
@@ -132,6 +155,10 @@ export interface Outcome {
   events: number
   deleted: number
   sequences?: number[]
+  /** A rejected command's code. */
+  code?: string
+  /** The command's outcome was read from its stored row. */
+  replayed?: true
 }
 
 export function expectedOutcome(expect: JsonValue): Outcome {
@@ -144,16 +171,27 @@ export function expectedOutcome(expect: JsonValue): Outcome {
     }
   }
 
-  return outcome(
-    str(field(expect, 'result')),
-    expect.has('events') ? num(field(expect, 'events')) : 0,
-    expect.has('deleted') ? num(field(expect, 'deleted')) : 0,
-    expect.has('sequences') ? list(field(expect, 'sequences')).map(num) : [],
-  )
+  return {
+    ...outcome(
+      str(field(expect, 'result')),
+      expect.has('events') ? num(field(expect, 'events')) : 0,
+      expect.has('deleted') ? num(field(expect, 'deleted')) : 0,
+      expect.has('sequences') ? list(field(expect, 'sequences')).map(num) : [],
+    ),
+    ...commandFields(
+      optionalString(expect, 'code') ?? '',
+      expect.has('replayed') && field(expect, 'replayed') === true,
+    ),
+  }
 }
 
 function outcome(result: string, events = 0, deleted = 0, sequences: number[] = []): Outcome {
   return sequences.length > 0 ? {result, events, deleted, sequences} : {result, events, deleted}
+}
+
+// A command outcome's code and replay flag, present only when set, as Go's Outcome omits them.
+function commandFields(code: string, replayed: boolean): Partial<Outcome> {
+  return {...(code !== '' && {code}), ...(replayed && {replayed: true as const})}
 }
 
 /**
@@ -227,16 +265,40 @@ export interface Loaded {
   snapshotSequence: bigint
 }
 
+/** What a runner needs of its backend beyond the repository. */
+export interface RunnerOptions {
+  /**
+   * Appends an event to the backend's log without maintaining the stream's head item, as a writer
+   * that predates heads would: the writer a head-aware build must detect. Backs the
+   * appendRawBypassingHead step.
+   */
+  bypassHead?: ((event: SerializedEvent) => Promise<void>) | undefined
+}
+
 export class Runner {
   readonly #repository: Repository
   readonly #store: Store
+  readonly #outcomes: boolean
+  readonly #options: StoreOptions
+  readonly #bypassHead: RunnerOptions['bypassHead']
   readonly entityId: string
 
-  constructor(repository: Repository, scenario: JsonValue, entityId: string) {
+  /** A runner of `scenario` in the run named `run`, whose stream is `compat-<run>-<scenario>`. */
+  constructor(
+    repository: Repository,
+    scenario: JsonValue,
+    run: string,
+    options: RunnerOptions = {},
+  ) {
     this.#repository = repository
-    const snapshotInterval = num(field(scenario, 'snapshotInterval'))
-    this.#store = new Store(repository, {snapshotInterval})
-    this.entityId = entityId
+    this.entityId = `compat-${run}-${str(field(scenario, 'name'))}`
+    this.#outcomes = optionalBoolean(scenario, 'outcomes')
+    this.#options = {
+      snapshotInterval: num(field(scenario, 'snapshotInterval')),
+      ...(this.#outcomes && {outcomes: outcomeOptions(run)}),
+    }
+    this.#store = new Store(repository, this.#options)
+    this.#bypassHead = options.bypassHead
   }
 
   async step(step: JsonValue): Promise<Outcome> {
@@ -284,6 +346,25 @@ export class Runner {
         const events = await this.#repository.latest(id, num(field(step, 'n')))
         return outcome('ok', events.length, 0, events.map((event) => Number(event.sequence)))
       }
+      case 'appendRawBypassingHead': {
+        if (this.#bypassHead === undefined) {
+          throw new Error('the backend has no way to bypass the head item')
+        }
+        const raw = field(step, 'event')
+        const loaded = await this.#store.load(account, id)
+        await this.#bypassHead(
+          rawEvent(id, loaded.sequence + 1n, step, {
+            type: str(field(raw, 'type')),
+            version: num(field(raw, 'version')),
+            payload: str(field(raw, 'payload')),
+          }),
+        )
+        return outcome('ok', 1)
+      }
+      case 'outcomeOnly':
+        return this.#outcomeOnly(step)
+      case 'resolveOutcome':
+        return this.#resolveOutcome(id, step)
       case 'transaction':
         return this.#transaction(step)
       case 'compact':
@@ -318,7 +399,98 @@ export class Runner {
     }
   }
 
+  // A command on an outcomes runner records its outcome. A step that injects a commit fault runs
+  // on a store over a repository that fails its commit.
+  async #executeWithOutcome(id: string, step: JsonValue): Promise<Outcome> {
+    const command = accountCommand(field(step, 'command'))
+    let store = this.#store
+    const fault = optionalString(step, 'injectCommitFault')
+    if (fault !== null) {
+      const repository = new FaultRepository(this.#repository as OutcomeRepository)
+      switch (fault) {
+        case 'applyThenFail':
+          repository.applyThenFail()
+          break
+        case 'failWithoutApplying':
+          repository.failWithoutApplying()
+          break
+        default:
+          throw new Error(`unknown injectCommitFault ${fault}`)
+      }
+      store = new Store(repository, this.#options)
+    }
+
+    try {
+      const result = await store.executeWithOutcome(account, id, command, {
+        metadata: this.#metadata(step),
+      })
+      return commandResult(result)
+    } catch (error) {
+      return classifyCommand(error)
+    }
+  }
+
+  // A command that writes no events, recorded as an accepted outcome carrying the step's response.
+  async #outcomeOnly(step: JsonValue): Promise<Outcome> {
+    const identity = field(step, 'identity')
+    const payload = identity instanceof Map ? identity.get('payload') : undefined
+    const response = optionalString(step, 'response') ?? ''
+
+    try {
+      const transaction = this.#store.transaction()
+      const begun = await transaction.beginCommand(
+        {
+          commandType: str(field(identity, 'type')),
+          payload:
+            payload === undefined || payload === null
+              ? null
+              : encoder.encode(stringifyJson(sortedKeys(payload, true))),
+        },
+        {metadata: this.#metadata(step)},
+      )
+      if (begun.kind === 'replayed') {
+        return commandResult(begun.outcome)
+      }
+
+      return commandResult(
+        await transaction.commitWithOutcome({response: encoder.encode(response)}),
+      )
+    } catch (error) {
+      return classifyCommand(error)
+    }
+  }
+
+  // Reads the step's command's outcome row, as ambiguous-write recovery does, running nothing.
+  async #resolveOutcome(id: string, step: JsonValue): Promise<Outcome> {
+    const command = accountCommand(field(step, 'command'))
+    try {
+      const result = await this.#store.resolveOutcome(account, id, command, {
+        metadata: this.#metadata(step),
+      })
+      return result === null ? outcome('absent') : commandResult(result)
+    } catch (error) {
+      return classifyCommand(error)
+    }
+  }
+
+  // A step's metadata. On an outcomes runner the command ID is scoped to the run and the
+  // scenario, since outcome rows are global to the table.
+  #metadata(step: JsonValue): Partial<Metadata> {
+    const stamped = metadata(step)
+    if (!this.#outcomes || stamped.commandId === null || stamped.commandId === undefined) {
+      return stamped
+    }
+
+    const commandId = `${this.entityId}-${stamped.commandId}`
+
+    return {...stamped, commandId, commitId: `compat-${str(field(step, 'by'))}-${commandId}`}
+  }
+
   async #execute(id: string, step: JsonValue): Promise<Outcome> {
+    if (this.#outcomes) {
+      return this.#executeWithOutcome(id, step)
+    }
+
     const command = accountCommand(field(step, 'command'))
     const before = (await this.#store.load(account, id)).sequence
 
@@ -391,6 +563,53 @@ export class Runner {
 
 function isTransactional(repository: Repository): repository is TransactionalRepository {
   return 'commitTransaction' in repository
+}
+
+// A command outcome as a step's result: the events its row lists, its code when rejected, and
+// whether it was replayed.
+function commandResult(result: CommandOutcome): Outcome {
+  const {outcome: recorded, replayed} = result
+  const rejected = recorded.rejection !== null
+
+  return {
+    ...outcome(rejected ? 'rejected' : 'ok', recorded.eventIds.length),
+    ...commandFields(recorded.rejection?.code ?? '', replayed),
+  }
+}
+
+// The errors of a command on an outcomes runner, then the ones every step classifies.
+function classifyCommand(error: unknown): Outcome {
+  if (error instanceof IdempotencyKeyReuseError) {
+    return outcome('reuse')
+  }
+  if (error instanceof CommandIdTooLongError) {
+    return outcome('idTooLong')
+  }
+  if (error instanceof AmbiguousWriteError) {
+    return outcome('ambiguous')
+  }
+
+  return classify(error)
+}
+
+// The outcome options of a runner: the default digest with the run's name in each target
+// replaced by the fixture run's, so a command digests alike in every run and the fixtures'
+// digests hold against live backends; a short recovery window, which keeps the dropped-commit
+// step quick; and one attempt per step, since a step pins what one attempt returns.
+function outcomeOptions(run: string): OutcomeOptions {
+  const from = `compat-${run}-`
+  const to = `compat-${FIXTURE_RUN}-`
+
+  return {
+    digest: (input: DigestInput) =>
+      defaultDigest({
+        ...input,
+        // The first occurrence, as Go's strings.Replace(stream, from, to, 1) does.
+        targets: input.targets.map((target) => target.replace(from, to)),
+      }),
+    recoveryWaitMs: 100,
+    retry: {...DEFAULT_RETRY_POLICY, maxAttempts: 1},
+  }
 }
 
 function classify(error: unknown): Outcome {

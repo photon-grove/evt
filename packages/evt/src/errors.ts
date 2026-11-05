@@ -2,6 +2,8 @@
 // Domain outcomes (a rejected command, a duplicate) are values, never errors. A failure with
 // details has its own subclass, so `instanceof` narrows to its fields.
 
+import type {Outcome} from './outcome.js'
+
 /**
  * What went wrong:
  *
@@ -45,6 +47,14 @@
  * - `commandIdTooLong`: a command ID is over 512 UTF-8 bytes. Nothing was written.
  * - `indeterminate`: a commit that carries a command outcome failed in a way that leaves it
  *   unknown whether it applied, such as a timeout or a connection lost during `COMMIT`.
+ * - `idempotencyKeyReuse`: the command ID already has an outcome, recorded for a command with
+ *   another identity (another type, target, payload or principal). Nothing was written.
+ * - `ambiguousWrite`: a command's commit failed indeterminately, and its outcome row didn't
+ *   appear within the recovery window. It may still land. Retryable with the same command ID.
+ * - `outcomePrincipalMismatch`: a lookup by command ID found an outcome recorded for another
+ *   principal, or one that records no identity to match.
+ * - `duplicateCommand`: an event written before outcomes existed already carries the command ID,
+ *   so the command ran, but no outcome row says how. Nothing was written.
  */
 export type EvtErrorCode =
   | 'invalidJson'
@@ -73,6 +83,10 @@ export type EvtErrorCode =
   | 'outcomeTooLarge'
   | 'commandIdTooLong'
   | 'indeterminate'
+  | 'idempotencyKeyReuse'
+  | 'ambiguousWrite'
+  | 'outcomePrincipalMismatch'
+  | 'duplicateCommand'
 
 export class EvtError extends Error {
   override readonly name: string = 'EvtError'
@@ -281,9 +295,19 @@ export class FeatureManifestChangedError extends EvtError {
 export class TransientError extends EvtError {
   override readonly name = 'TransientError'
   override readonly code = 'transient'
+  /**
+   * Another transaction was writing one of the commit's items at the same time (DynamoDB's
+   * `TransactionConflict`), so the winner may be another attempt of the same command.
+   */
+  readonly transactionConflict: boolean
 
-  constructor(detail: string, options?: {cause?: unknown}) {
-    super('transient', `transient failure: ${detail}`, options)
+  constructor(detail: string, options?: {cause?: unknown; transactionConflict?: boolean}) {
+    super(
+      'transient',
+      `transient failure: ${detail}`,
+      options && 'cause' in options ? {cause: options.cause} : undefined,
+    )
+    this.transactionConflict = options?.transactionConflict ?? false
   }
 }
 
@@ -484,6 +508,85 @@ export class IndeterminateError extends EvtError {
 }
 
 /**
+ * The command ID already has an outcome, recorded for a command with another identity digest:
+ * another type, target, payload or principal. `prior` is the stored outcome. Nothing was written.
+ */
+export class IdempotencyKeyReuseError extends EvtError {
+  override readonly name = 'IdempotencyKeyReuseError'
+  override readonly code = 'idempotencyKeyReuse'
+  readonly commandId: string
+  readonly prior: Outcome
+
+  constructor(commandId: string, prior: Outcome) {
+    super(
+      'idempotencyKeyReuse',
+      `command ${commandId} already has an outcome for a command with another identity`,
+    )
+    this.commandId = commandId
+    this.prior = prior
+  }
+}
+
+/**
+ * A command's commit failed in a way that leaves it unknown whether it applied, and its outcome
+ * row didn't appear within the recovery window, or couldn't be read. The commit may still land, so
+ * this never means "not applied". Run the command again with the same command ID: its outcome
+ * check answers it if the commit landed. The commit's failure is the `cause`.
+ */
+export class AmbiguousWriteError extends EvtError {
+  override readonly name = 'AmbiguousWriteError'
+  override readonly code = 'ambiguousWrite'
+  readonly commandId: string
+
+  constructor(commandId: string, options?: {cause?: unknown}) {
+    super(
+      'ambiguousWrite',
+      `command ${commandId} may or may not have been applied: ${messageOf(options?.cause)}`,
+      options,
+    )
+    this.commandId = commandId
+  }
+}
+
+/**
+ * A lookup by command ID alone found an outcome it can't answer for the asking principal:
+ * `recorded` when the row belongs to another principal, not `recorded` when the row records no
+ * identity to match. It never carries the stored outcome.
+ */
+export class OutcomePrincipalMismatchError extends EvtError {
+  override readonly name = 'OutcomePrincipalMismatchError'
+  override readonly code = 'outcomePrincipalMismatch'
+  readonly commandId: string
+  readonly recorded: boolean
+
+  constructor(commandId: string, recorded: boolean) {
+    super(
+      'outcomePrincipalMismatch',
+      recorded
+        ? `the outcome of command ${commandId} belongs to another principal`
+        : `the outcome of command ${commandId} records no principal to match`,
+    )
+    this.commandId = commandId
+    this.recorded = recorded
+  }
+}
+
+/**
+ * An event written before outcomes existed already carries the command ID: the command ran, but
+ * no outcome row records how, so the store can't replay it. Nothing was written.
+ */
+export class DuplicateCommandError extends EvtError {
+  override readonly name = 'DuplicateCommandError'
+  override readonly code = 'duplicateCommand'
+  readonly commandId: string
+
+  constructor(commandId: string) {
+    super('duplicateCommand', `command ${commandId} already ran, and records no outcome`)
+    this.commandId = commandId
+  }
+}
+
+/**
  * Whether an error is an optimistic-concurrency conflict: a `conflict`, a `sequenceGap` or a
  * `fenceConflict`.
  */
@@ -497,7 +600,8 @@ export function isConflict(error: unknown): boolean {
 /**
  * Whether reloading and running the command again may succeed: after a conflict (a fence the
  * caller stamped excepted), while a rebuild holds the store, after the feature manifest changed
- * under the writer, or after throttling.
+ * under the writer, after throttling, or after an ambiguous write, whose outcome check answers a
+ * command that landed.
  */
 export function isRetryable(error: unknown): boolean {
   // A caller-stamped fence stays stale however often the command runs again.
@@ -512,7 +616,8 @@ export function isRetryable(error: unknown): boolean {
     error instanceof EvtError &&
     (error.code === 'rebuildInProgress' ||
       error.code === 'featureManifestChanged' ||
-      error.code === 'transient')
+      error.code === 'transient' ||
+      error.code === 'ambiguousWrite')
   )
 }
 

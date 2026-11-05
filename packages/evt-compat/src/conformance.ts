@@ -10,6 +10,7 @@
 /* oxlint-disable no-await-in-loop */
 
 import {
+  AmbiguousWriteError,
   CommandIdTooLongError,
   CommitTooLargeError,
   CompactionUncoveredError,
@@ -49,6 +50,7 @@ import {
   isConflict,
   isRetryable,
 } from '@photon-grove/evt'
+import {FaultRepository} from '@photon-grove/evt/testing'
 
 import {type Checks, canonical} from './harness.js'
 
@@ -127,6 +129,12 @@ export async function conformance(
       ['a failed commit leaves no outcome row', () => outcomeAtomicity(repo)],
       ['outcome bounds are refused before any write', () => outcomeBounds(repo)],
       ['racing outcome puts: one records, the rest are outcome conflicts', () => outcomeRace(repo)],
+      [
+        'a store records an outcome once, replays it, and refuses a reused command ID',
+        () => storeOutcomes(repo),
+      ],
+      ['racing commands with one ID: one commits, the rest replay it', () => commandRace(repo)],
+      ['an ambiguous write is recovered through the outcome row', () => ambiguousWrite(repo)],
     )
   }
 
@@ -577,6 +585,136 @@ async function transactionRanking(
     'a stale append comes before a stale fence',
     (failure) => failure instanceof ConflictError && failure.entityId === conflicted.id,
   )
+}
+
+// A ledger whose commands record outcomes: an addition answers with the total, and a refused
+// withdrawal records why in the history.
+type LedgerCommand = {type: 'add'; amount: number} | {type: 'take'; amount: number}
+
+function outcomeLedger(ns: string) {
+  return defineAggregate({
+    type: `${ns}-ledger`,
+    events: defineEvents({
+      'ledger:added': {version: 1, codec: json<{amount: number}>()},
+      'ledger:refused': {version: 1, codec: json<{amount: number}>()},
+    }),
+    state: json<{total: number}>(),
+    initial: () => ({total: 0}),
+    handle(state, command: LedgerCommand) {
+      if (command.type === 'add') {
+        return {
+          kind: 'accept',
+          events: [{type: 'ledger:added', data: {amount: command.amount}}],
+          response: new TextEncoder().encode(String(state.total + command.amount)),
+        }
+      }
+      if (command.amount > state.total) {
+        return {
+          kind: 'reject',
+          rejection: {code: 'insufficient', message: 'not enough', details: {total: state.total}},
+          events: [{type: 'ledger:refused', data: {amount: command.amount}}],
+        }
+      }
+      return {kind: 'accept', events: [{type: 'ledger:added', data: {amount: -command.amount}}]}
+    },
+    apply: (state, event) => ({
+      total: event.type === 'ledger:added' ? state.total + event.data.amount : state.total,
+    }),
+    identify: (command: LedgerCommand) => ({
+      commandType: `ledger:${command.type}`,
+      payload: new TextEncoder().encode(JSON.stringify(command)),
+    }),
+  })
+}
+
+function outcomeStore(repo: OutcomeRepository, maxAttempts = 5): Store {
+  return new Store(repo, {
+    snapshotInterval: 0,
+    outcomes: {recoveryWaitMs: 200, retry: {maxAttempts, baseDelayMs: 5, maxDelayMs: 50}},
+  })
+}
+
+async function storeOutcomes(repo: OutcomeRepository): Promise<void> {
+  const ns = namespace()
+  const type = outcomeLedger(ns)
+  const store = outcomeStore(repo)
+  const id = `${ns}-l`
+  const as = (commandId: string) => ({metadata: {commandId: `${ns}-${commandId}`}})
+
+  const first = await store.executeWithOutcome(type, id, {type: 'add', amount: 5}, as('c1'))
+  ensure(!first.replayed, 'the first run is fresh')
+  ensureEqual(new TextDecoder().decode(first.outcome.response!), '5', 'the response')
+  const replay = await store.executeWithOutcome(type, id, {type: 'add', amount: 5}, as('c1'))
+  ensure(replay.replayed, 'a repeat replays')
+  ensureEqual(outcomeText(replay.outcome), outcomeText(first.outcome), 'the replayed outcome')
+  await expectError(
+    store.executeWithOutcome(type, id, {type: 'add', amount: 6}, as('c1')),
+    'another payload under the ID',
+    coded('idempotencyKeyReuse'),
+  )
+
+  // A rejection's events commit with its row, and a replay writes them again never.
+  const refused = await store.executeWithOutcome(type, id, {type: 'take', amount: 9}, as('c2'))
+  ensureEqual(refused.outcome.status, 'rejected', 'the refusal is a rejection')
+  ensureEqual(refused.outcome.eventIds, [eventId(id, 2n)], 'the rejection lists its event')
+  await store.executeWithOutcome(type, id, {type: 'take', amount: 9}, as('c2'))
+  ensureEqual((await repo.events(id)).length, 2, 'the replay wrote nothing')
+  ensureEqual(
+    outcomeText(await repo.outcome(`${ns}-c2`)),
+    outcomeText(refused.outcome),
+    'the stored rejection',
+  )
+}
+
+async function commandRace(repo: OutcomeRepository): Promise<void> {
+  const ns = namespace()
+  const type = outcomeLedger(ns)
+  const id = `${ns}-l`
+  const metadata = {commandId: `${ns}-c1`}
+
+  // Four stores run the same command at once. Whichever commits, the others find its row.
+  const results = await Promise.all(
+    [1, 2, 3, 4].map(() =>
+      outcomeStore(repo).executeWithOutcome(type, id, {type: 'add', amount: 1}, {metadata}),
+    ),
+  )
+  ensureEqual(results.filter((result) => !result.replayed).length, 1, 'one run commits')
+  ensureEqual((await repo.events(id)).length, 1, 'the command wrote one event')
+  for (const result of results) {
+    ensureEqual(outcomeText(result.outcome), outcomeText(results[0]!.outcome), 'every answer')
+  }
+}
+
+async function ambiguousWrite(repo: OutcomeRepository): Promise<void> {
+  const ns = namespace()
+  const type = outcomeLedger(ns)
+  const id = `${ns}-l`
+  const as = (commandId: string) => ({metadata: {commandId: `${ns}-${commandId}`}})
+
+  const applied = await outcomeStore(new FaultRepository(repo).applyThenFail()).executeWithOutcome(
+    type,
+    id,
+    {type: 'add', amount: 1},
+    as('c1'),
+  )
+  ensure(applied.replayed, 'a commit that applied is answered by its row')
+  ensureEqual(applied.outcome.eventIds, [eventId(id, 1n)], 'the recovered outcome')
+
+  const dropped = new FaultRepository(repo).failWithoutApplying()
+  await expectError(
+    outcomeStore(dropped, 1).executeWithOutcome(type, id, {type: 'add', amount: 2}, as('c2')),
+    'a dropped commit',
+    (error) => error instanceof AmbiguousWriteError && isRetryable(error),
+  )
+  ensureEqual(await repo.outcome(`${ns}-c2`), null, 'the dropped commit left no row')
+  const retried = await outcomeStore(repo).executeWithOutcome(
+    type,
+    id,
+    {type: 'add', amount: 2},
+    as('c2'),
+  )
+  ensure(!retried.replayed, 'the retry commits')
+  ensureEqual((await repo.events(id)).length, 2, 'each command wrote one event')
 }
 
 // A ledger aggregate of the namespace's own entity type, for the store's transaction API.

@@ -26,6 +26,7 @@ import {Pool} from 'pg'
 import {
   type JsonValue,
   type Repository,
+  type SerializedEvent,
   decodeEvent,
   decodeSnapshot,
   encodeEnvelope,
@@ -38,11 +39,23 @@ import {
   DynamoRepository,
   type Item,
   eventFromItem,
+  eventItem,
   headFromItem,
+  outcomeFromItem,
+  outcomeKey,
 } from '@photon-grove/evt/dynamodb'
-import {PgRepository, streamHeadsTable} from '@photon-grove/evt/postgres'
+import {PgRepository, outcomeRow, outcomesTable, streamHeadsTable} from '@photon-grove/evt/postgres'
 
-import {Checks, canonical, field, list, loadFixture, loadFixtureForRun, str} from './harness.js'
+import {
+  Checks,
+  canonical,
+  field,
+  list,
+  loadFixture,
+  loadFixtureForRun,
+  plain,
+  str,
+} from './harness.js'
 import {
   ORIGIN_SOURCE,
   type Observed,
@@ -69,9 +82,13 @@ interface Args {
 /** A backend the run writes, and how to read a stream back as it stores it. */
 interface Backend {
   readonly repository: Repository
+  /** Appends an event to the log without maintaining the stream's head. */
+  bypassHead(event: SerializedEvent): Promise<void>
   observe(runner: Runner, id: string): Promise<Observed>
   /** Compares what the backend stores for a stream beyond what `observe` reads. */
   checkRows(checks: Checks, name: string, id: string, expected: JsonValue): Promise<void>
+  /** Compares a command's stored outcome row with its fixture's DynamoDB item. */
+  checkOutcome(checks: Checks, name: string, commandId: string, expected: JsonValue): Promise<void>
   close(): Promise<void>
 }
 
@@ -94,7 +111,7 @@ if (cli.command === 'scenarios') {
           throw new Error(`--as must be go or rust, not ${cli.as || '-'}`)
         }
         // An index with no step of the stood-in language's checks nothing, so it reports nothing.
-        quiet = (await runStep(checks, backend.repository, cli)) === 0
+        quiet = (await runStep(checks, backend, cli)) === 0
         break
       case 'verify':
         await verify(checks, backend, cli.run)
@@ -193,6 +210,14 @@ function dynamoBackend(): Backend {
 
   return {
     repository,
+    // The event item alone, with none of the head update a commit carries, as Go's driver puts it.
+    async bypassHead(event) {
+      await client.putItem({
+        TableName: table,
+        Item: eventItem(event),
+        ConditionExpression: 'attribute_not_exists(sk)',
+      })
+    },
     // A stream as the table stores it and as the repository reads it back.
     async observe(runner, id) {
       const items = await partition(client, table, id)
@@ -211,6 +236,10 @@ function dynamoBackend(): Backend {
     },
     // The items are compared with the stream itself.
     async checkRows() {},
+    async checkOutcome(checks, name, commandId, expected) {
+      const items = await partition(client, table, outcomeKey(commandId))
+      checks.equal(`${name}: outcome ${commandId} item`, canonical(items), canonical([expected]))
+    },
     async close() {
       client.destroy()
     },
@@ -236,6 +265,23 @@ async function postgresBackend(): Promise<Backend> {
 
   return {
     repository,
+    // The event row alone, leaving the stream's head row as it was, as Go's driver inserts it.
+    async bypassHead(event) {
+      await pool.query(
+        `INSERT INTO ${repository.tables.events} (entity_id, sequence, event_id, event_type, ` +
+          'version, entity_type, payload, metadata) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)',
+        [
+          event.entityId,
+          event.sequence.toString(),
+          event.id,
+          event.type,
+          event.version,
+          event.entityType,
+          event.payload ?? new Uint8Array(),
+          encodeMetadata(event.metadata),
+        ],
+      )
+    },
     async observe(runner, id) {
       const snapshot = await repository.snapshot(id)
       const {rows} = await pool.query<{head: string}>(
@@ -303,10 +349,41 @@ async function postgresBackend(): Promise<Backend> {
         ),
       )
     },
+    // The row as stored, its jsonb columns parsed, against the row the fixture's item encodes to.
+    async checkOutcome(checks, name, commandId, expected) {
+      const {rows} = await pool.query<Record<string, string | null>>(
+        "SELECT command_id, status, digest, encode(response, 'hex') AS response, " +
+          'events::text AS events, rejection::text AS rejection, code, command_type, ' +
+          `targets::text AS targets, principal FROM ${outcomesTable(repository.tables)} ` +
+          'WHERE command_id = $1',
+        [commandId],
+      )
+      const got = rows.map((row) =>
+        Object.assign({}, row, {
+          events: jsonColumn(row['events']),
+          rejection: jsonColumn(row['rejection']),
+          targets: jsonColumn(row['targets']),
+        }),
+      )
+      const row = outcomeRow(outcomeFromItem(plain(expected) as Item))
+      const want = {
+        ...row,
+        response: row.response === null ? null : hex(row.response),
+        events: jsonColumn(row.events),
+        rejection: jsonColumn(row.rejection),
+        targets: jsonColumn(row.targets),
+      }
+      checks.equal(`${name}: outcome ${commandId} row`, canonical(got), canonical([want]))
+    },
     async close() {
       await pool.end()
     },
   }
+}
+
+// A jsonb column as its parsed value, since jsonb normalizes its text.
+function jsonColumn(text: string | null | undefined): unknown {
+  return text === null || text === undefined ? null : plain(parseJson(text))
 }
 
 async function supportedScenarios(): Promise<JsonValue[]> {
@@ -323,7 +400,7 @@ async function supportedScenarios(): Promise<JsonValue[]> {
   })
 }
 
-async function runStep(checks: Checks, repository: Repository, args: Args): Promise<number> {
+async function runStep(checks: Checks, backend: Backend, args: Args): Promise<number> {
   let executed = 0
   for (const scenario of await supportedScenarios()) {
     const name = str(field(scenario, 'name'))
@@ -333,7 +410,9 @@ async function runStep(checks: Checks, repository: Repository, args: Args): Prom
     }
     checkStep(step, args.index)
 
-    const runner = new Runner(repository, scenario, `compat-${args.run}-${name}`)
+    const runner = new Runner(backend.repository, scenario, args.run, {
+      bypassHead: (event) => backend.bypassHead(event),
+    })
     const got = await runner.step(step)
     const want = expectedOutcome(field(step, 'expect'))
     checks.equal(`${name} step ${args.index}`, canonical(got), canonical(want))
@@ -358,10 +437,16 @@ async function verify(checks: Checks, backend: Backend, run: string): Promise<vo
       continue
     }
 
-    const runner = new Runner(backend.repository, scenario, `compat-${run}-${name}`)
+    const runner = new Runner(backend.repository, scenario, run)
     checks.equal(`${name}: entity ID`, runner.entityId, str(field(expected, 'entityId')))
     compareObserved(checks, name, await backend.observe(runner, runner.entityId), expected)
     await backend.checkRows(checks, name, runner.entityId, expected)
+
+    // The outcome rows the scenario's commands left.
+    for (const row of optionalList(expected, 'outcomes')) {
+      const commandId = str(field(row, 'commandId'))
+      await backend.checkOutcome(checks, name, commandId, field(row, 'dynamoItem'))
+    }
 
     // Every other stream the scenario touches.
     for (const sibling of optionalList(expected, 'siblings')) {

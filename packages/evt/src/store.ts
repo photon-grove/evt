@@ -8,16 +8,51 @@ import {
   type Rejection,
   replayEvent,
 } from './aggregate.js'
+import {
+  Budget,
+  OutcomeConfig,
+  type OutcomeOptions,
+  type PendingCommand,
+  type Phase,
+  acceptedOutcome,
+  freezeCommand,
+  persistRejection,
+  preCheck,
+  recordCommit,
+  rejectedOutcome,
+  replayed,
+  requireCommandId,
+  retryKind,
+} from './command.js'
 import {commitIds} from './commit-id.js'
-import {EvtError, SequenceGapError, SnapshotError, isConflict, isRetryable} from './errors.js'
+import {
+  DuplicateCommandError,
+  EvtError,
+  OutcomePrincipalMismatchError,
+  SequenceGapError,
+  SnapshotError,
+  isConflict,
+  isRetryable,
+} from './errors.js'
 import type {SerializedEvent} from './event.js'
 import {type Metadata, emptyMetadata} from './metadata.js'
-import type {
-  CallOptions,
-  NewSnapshot,
-  ProjectorGroup,
-  Repository,
-  TransactionalRepository,
+import {
+  type CommandIdentity,
+  type CommandOutcome,
+  checkCommandId,
+  checkMetadata,
+  checkText,
+  retriesExhaustedRejection,
+} from './outcome.js'
+import {
+  type CallOptions,
+  type Commit,
+  type NewSnapshot,
+  type OutcomeRepository,
+  type ProjectorGroup,
+  type Repository,
+  type TransactionalRepository,
+  checkNotReserved,
 } from './repository.js'
 import {
   DEFAULT_RETRY_POLICY,
@@ -48,6 +83,13 @@ export interface StoreOptions {
    * format by default.
    */
   commitId?: (() => string) | undefined
+  /**
+   * Records a durable outcome for every command (ADR 0004): run commands with
+   * {@link Store.executeWithOutcome}, and transactions with {@link Transaction.beginCommand}.
+   * `true` takes every default. The repository must be an {@link OutcomeRepository}, as every one
+   * this package ships is.
+   */
+  outcomes?: OutcomeOptions | true | undefined
 }
 
 /** An aggregate loaded from its stream, with the position it was loaded at. */
@@ -98,6 +140,7 @@ export class Store {
   readonly #clock: () => number
   readonly #snapshotInterval: number
   readonly #commitId: () => string
+  readonly #outcomes: OutcomeConfig | null
 
   constructor(repository: Repository, options: StoreOptions = {}) {
     const interval = options.snapshotInterval ?? DEFAULT_SNAPSHOT_INTERVAL
@@ -113,6 +156,21 @@ export class Store {
     this.#clock = options.clock ?? Date.now
     this.#snapshotInterval = interval
     this.#commitId = options.commitId ?? commitIds(this.#clock)
+
+    const outcomes = options.outcomes
+    this.#outcomes =
+      outcomes === undefined ? null : new OutcomeConfig(outcomes === true ? {} : outcomes)
+    if (this.#outcomes !== null && !isOutcomeRepository(repository)) {
+      throw new EvtError(
+        'invalidArgument',
+        'command outcomes need an OutcomeRepository, which records them in the commit',
+      )
+    }
+  }
+
+  /** Whether this store records command outcomes. */
+  get recordsOutcomes(): boolean {
+    return this.#outcomes !== null
   }
 
   /** The number of events between snapshots of `aggregate`: its own interval, or the store's. */
@@ -165,6 +223,14 @@ export class Store {
     command: C,
     options: ExecuteOptions = {},
   ): Promise<ExecuteResult<S>> {
+    if (this.#outcomes !== null) {
+      throw new EvtError(
+        'invalidArgument',
+        'this store records command outcomes: execute would skip the outcome row; ' +
+          'call executeWithOutcome',
+      )
+    }
+
     const metadata = this.#metadata(options.metadata)
     const loaded = await this.load(aggregate, entityId, options)
 
@@ -242,7 +308,251 @@ export class Store {
       load: (aggregate, entityId, options) => this.load(aggregate, entityId, options),
       snapshotInterval: (aggregate) => this.snapshotInterval(aggregate),
       metadata: (partial) => this.#metadata(partial),
+      outcomes: this.#outcomes,
     })
+  }
+
+  /**
+   * Runs a command on a store with outcomes, recording its outcome in the same commit as its
+   * events, so a retried command returns the recorded answer instead of running again. It needs a
+   * command ID (at most 512 UTF-8 bytes) and the aggregate's {@link AggregateDefinition.identify},
+   * both checked before anything is read.
+   *
+   * Every attempt reads the command's outcome row first. A stored outcome with the same identity
+   * digest is returned (`replayed`) without running the handler, and one with another digest is an
+   * `IdempotencyKeyReuseError`. Otherwise the handler runs:
+   *
+   * - accepted with events: they commit with an accepted outcome carrying the decision's
+   *   `response`;
+   * - accepted with no events: an accepted no-op outcome, with its response;
+   * - rejected: a rejected outcome, returned, not thrown. It writes no events, unless the
+   *   rejection carries some: those commit with the rejected outcome, which lists them;
+   * - a thrown error: an internal failure, thrown with no outcome written.
+   *
+   * When the commit conflicts with another writer, the command runs again from a fresh load, after
+   * a backoff, up to the store's retry policy. When the last attempt conflicts too, the store
+   * records a stale-fence rejection as the outcome and returns it, so the command ID keeps that
+   * answer; the remedy is a new command ID. A throttled backend is retried the same way and thrown
+   * when the attempts run out. Stream head drift is thrown at once, and records nothing.
+   *
+   * A lost race for the outcome row resolves through the winner's row, and a commit whose result
+   * is unknown is recovered by polling the row, never by running the handler again: a row that
+   * doesn't appear within the recovery window is a retryable `AmbiguousWriteError`. An event
+   * written before outcomes existed that already carries the command ID is a
+   * `DuplicateCommandError`.
+   *
+   * The identity digest covers the command's type and payload, the entity ID and the metadata's
+   * principal.
+   */
+  async executeWithOutcome<S, C, D extends EventDefinitions>(
+    aggregate: Aggregate<S, C, D>,
+    entityId: string,
+    command: C,
+    options: ExecuteOptions = {},
+  ): Promise<CommandOutcome> {
+    const config = this.#outcomeConfig()
+    const repository = this.repository as OutcomeRepository
+    const metadata = this.#metadata(options.metadata)
+    const pending = await freezeCommand(
+      config,
+      singleIdentity(aggregate, entityId, command, metadata),
+      metadata,
+    )
+
+    const budget = new Budget(config.retry)
+    // Each attempt waits for the one before it.
+    /* oxlint-disable no-await-in-loop */
+    for (;;) {
+      const attempt = await this.#attemptWithOutcome(aggregate, entityId, command, pending, options)
+      if (attempt.kind === 'done') {
+        return attempt.outcome
+      }
+
+      const kind = retryKind(attempt.error, attempt.phase)
+      if (kind === 'never') {
+        throw attempt.error
+      }
+
+      const delay = budget.next()
+      if (delay === null) {
+        if (kind === 'transient') {
+          throw attempt.error
+        }
+
+        const rejection = config.staleFence(retriesExhaustedRejection(budget.attempts))
+        return persistRejection(repository, pending, config, rejection, options)
+      }
+
+      await config.sleep(delay, options.signal)
+    }
+    /* oxlint-enable no-await-in-loop */
+  }
+
+  /**
+   * Reads a command's outcome without running or writing anything, as ambiguous-write recovery
+   * does: `command` and `entityId` give its identity exactly as {@link executeWithOutcome} digests
+   * them, and the metadata its command ID and principal. Null when no row exists, which is never
+   * proof the command didn't apply; the stored outcome (`replayed`) for the same digest; and an
+   * `IdempotencyKeyReuseError` for another.
+   */
+  async resolveOutcome<S, C, D extends EventDefinitions>(
+    aggregate: Aggregate<S, C, D>,
+    entityId: string,
+    command: C,
+    options: ExecuteOptions = {},
+  ): Promise<CommandOutcome | null> {
+    this.#outcomeConfig()
+    const metadata = this.#metadata(options.metadata)
+
+    return this.resolveCommand(singleIdentity(aggregate, entityId, command, metadata), options)
+  }
+
+  /**
+   * Looks a command's outcome up by its identity, without running or writing anything: the outcome
+   * check every attempt starts with, for a single-aggregate command or a transaction's. Null when
+   * no row exists, which is never proof the command didn't apply; the stored outcome (`replayed`)
+   * for the same digest; and an `IdempotencyKeyReuseError` for another. The command is checked as
+   * a command is before it runs: a missing or overlong command ID, or a reserved target, throws.
+   */
+  async resolveCommand(
+    identity: CommandIdentity,
+    options: ExecuteOptions = {},
+  ): Promise<CommandOutcome | null> {
+    const config = this.#outcomeConfig()
+    const pending = await freezeCommand(config, identity, this.#metadata(options.metadata))
+    const stored = await preCheck(this.repository as OutcomeRepository, pending, options)
+
+    return stored === null ? null : replayed(stored)
+  }
+
+  /**
+   * Looks a command's outcome up by its command ID alone, for a caller that can't rebuild the
+   * command's identity, and answers it only for the principal that recorded it (null or empty for
+   * none). Nothing runs, and the digest isn't compared. Null when no row exists; the stored
+   * outcome (`replayed`) when the row records the same principal; an
+   * `OutcomePrincipalMismatchError` when it records another (`recorded`), or no identity at all
+   * (not `recorded`), so the lookup fails closed.
+   */
+  async resolveCommandForPrincipal(
+    commandId: string,
+    principal: string | null,
+    options: CallOptions = {},
+  ): Promise<CommandOutcome | null> {
+    this.#outcomeConfig()
+    checkCommandId(commandId)
+
+    // An empty principal is no principal, as an outcome row records it.
+    const asking = principal === '' ? null : principal
+    if (asking !== null) {
+      checkMetadata({...emptyMetadata(), principalId: asking})
+    }
+
+    const stored = await (this.repository as OutcomeRepository).outcome(commandId, options)
+    if (stored === null) {
+      return null
+    }
+    if (stored.identity === null) {
+      throw new OutcomePrincipalMismatchError(commandId, false)
+    }
+    if (stored.identity.principal !== asking) {
+      throw new OutcomePrincipalMismatchError(commandId, true)
+    }
+
+    return replayed(stored)
+  }
+
+  // One attempt of a command with outcomes: the outcome check, the load, the handler and the
+  // commit, all from scratch.
+  async #attemptWithOutcome<S, C, D extends EventDefinitions>(
+    aggregate: Aggregate<S, C, D>,
+    entityId: string,
+    command: C,
+    pending: PendingCommand,
+    options: CallOptions,
+  ): Promise<Attempt> {
+    const repository = this.repository as OutcomeRepository
+    const config = this.#outcomeConfig()
+
+    let loaded: Loaded<S>
+    try {
+      const stored = await preCheck(repository, pending, options)
+      if (stored !== null) {
+        return {kind: 'done', outcome: replayed(stored)}
+      }
+      loaded = await this.load(aggregate, entityId, options)
+    } catch (error) {
+      return failed(error, 'deciding')
+    }
+
+    // Events written before outcomes existed carry command IDs but have no outcome row. The window
+    // catches those duplicates, and only those: this store's own commits write rows.
+    if (loaded.seenCommandIds.has(pending.commandId)) {
+      return failed(new DuplicateCommandError(pending.commandId), 'internal')
+    }
+
+    let commit: Commit
+    try {
+      commit = await this.#decide(aggregate, loaded, command, pending)
+    } catch (error) {
+      return failed(error, 'internal')
+    }
+
+    try {
+      const outcome = await recordCommit(
+        repository,
+        pending,
+        config,
+        commit.outcome!,
+        commit.events,
+        () => repository.commit(commit, options),
+      )
+      return {kind: 'done', outcome}
+    } catch (error) {
+      return failed(error, 'committing')
+    }
+  }
+
+  // Runs the handler and builds the commit that records its outcome: its events, with the
+  // snapshot and projector operations they call for, or none.
+  async #decide<S, C, D extends EventDefinitions>(
+    aggregate: Aggregate<S, C, D>,
+    loaded: Loaded<S>,
+    command: C,
+    pending: PendingCommand,
+  ): Promise<Commit> {
+    const entityId = loaded.entityId
+    const decision = await aggregate.handle(loaded.state, command)
+
+    // A rejection may carry events: they commit with the rejected outcome like an accepted
+    // command's, decided on the state this attempt loaded.
+    const outcome =
+      decision.kind === 'reject'
+        ? rejectedOutcome(pending, decision.rejection)
+        : acceptedOutcome(pending, decision.response)
+    const decided = decision.events ?? []
+    if (decided.length === 0) {
+      return {entityId, events: [], outcome}
+    }
+
+    const {events, snapshot, projections} = this.#stage(
+      aggregate,
+      loaded,
+      decided,
+      pending.metadata,
+    )
+
+    return {entityId, events, snapshot, projections, outcome}
+  }
+
+  #outcomeConfig(): OutcomeConfig {
+    if (this.#outcomes === null) {
+      throw new EvtError(
+        'invalidArgument',
+        'command outcomes are not enabled; construct the store with outcomes',
+      )
+    }
+
+    return this.#outcomes
   }
 
   async #loadOnce<S, C, D extends EventDefinitions>(
@@ -375,4 +685,44 @@ function rfc3339Seconds(ms: number): string {
 
 function isTransactional(repository: Repository): repository is TransactionalRepository {
   return typeof (repository as Partial<TransactionalRepository>).commitTransaction === 'function'
+}
+
+// An attempt of a command with outcomes: its outcome, or the error that ended it and the phase it
+// arose in.
+type Attempt =
+  {kind: 'done'; outcome: CommandOutcome} | {kind: 'failed'; error: unknown; phase: Phase}
+
+function failed(error: unknown, phase: Phase): Attempt {
+  return {kind: 'failed', error, phase}
+}
+
+function isOutcomeRepository(repository: Repository): repository is OutcomeRepository {
+  return (
+    isTransactional(repository) &&
+    typeof (repository as Partial<OutcomeRepository>).outcome === 'function'
+  )
+}
+
+// A single-aggregate command's identity: the aggregate's description of it, with the entity as
+// its one target. The target and the command ID are checked first, before the payload is encoded,
+// in the order Go and Rust check them.
+function singleIdentity<S, C, D extends EventDefinitions>(
+  aggregate: Aggregate<S, C, D>,
+  entityId: string,
+  command: C,
+  metadata: Metadata,
+): CommandIdentity {
+  checkText('a target stream ID', entityId)
+  checkNotReserved(entityId)
+  requireCommandId(metadata)
+  if (aggregate.identify === undefined) {
+    throw new EvtError(
+      'invalidArgument',
+      `aggregate ${aggregate.type} has no identify, which a store with outcomes needs`,
+    )
+  }
+
+  const {commandType, payload} = aggregate.identify(command)
+
+  return {commandType, targets: [entityId], payload}
 }

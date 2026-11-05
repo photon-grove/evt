@@ -343,7 +343,8 @@ error before any write and is never split.
 - Every attempt reads the outcome row first with a strongly consistent read (DynamoDB
   `ConsistentRead = true` whatever the repository's read-consistency setting): the same identity
   digest returns the stored outcome (events, response, rejection) without running the handler; a
-  different digest is `IdempotencyKeyReuse` carrying the stored outcome, and is never stored. The
+  different digest is `IdempotencyKeyReuse` (TypeScript `IdempotencyKeyReuseError`) carrying the
+  stored outcome, and is never stored. The
   stored digest is computed before execution from the command's identity alone (SHA-256 over the
   type, the sorted target streams the request names, the canonical payload JSON, and the
   principal) — the caller's intent, never the streams the command goes on to read or write
@@ -360,12 +361,16 @@ error before any write and is never split.
 - Go's error-returning `Execute` keeps its contract on an outcomes store: when
   the outcome is replayed (a duplicate, or a lost race settled by the winner's row) the supplied
   aggregate is restored and loaded again, so it reflects durable state. Rust's outcome methods return
-  a `CommandOutcome`, not an aggregate
+  a `CommandOutcome`, not an aggregate, and so does TypeScript's `executeWithOutcome`; TypeScript's
+  `execute` and a transaction's `commit` are refused on an outcomes store, since they would skip
+  the row
 - A multi-stream command begins with the outcome pre-check (`BeginCommand` /
-  `Transaction::begin_command`) before any read, append, or fence; a transaction whose pre-check
+  `Transaction::begin_command` / TypeScript `Transaction.beginCommand`) before any read, append,
+  or fence; a transaction whose pre-check
   returned a stored outcome is finished and accepts no further work
 - The pre-check is public as a lookup by identity (`Store.ResolveCommand` /
-  `Store::resolve_command`): it validates the identity and command ID as execution does, digests
+  `Store::resolve_command` / TypeScript `Store.resolveCommand`, with `resolveOutcome` for a
+  single-aggregate command): it validates the identity and command ID as execution does, digests
   with the store's digester, reads the row strongly consistent, and writes nothing. The same
   digest returns the stored outcome (replayed), another digest (another payload, target, or
   principal) is `IdempotencyKeyReuse` carrying it, and no row is "not found", never "did not
@@ -379,9 +384,9 @@ error before any write and is never split.
   outranks every other failed item in the
   commit's classification, so the engine resolves it by re-reading the row. A re-read that fails
   is retryable where it can be, so the next attempt's outcome pre-read answers the command: Go
-  makes any failure not classified permanent transient, and Rust makes a re-read that stalls past
-  the recovery window `Error::Transient` (a backend's `Transient` stays retryable, a definitive
-  `Backend` error is returned). An ordinary conflict
+  makes any failure not classified permanent transient, and Rust and TypeScript make a re-read
+  that stalls past the recovery window `Error::Transient` / `TransientError` (a backend's
+  `Transient` stays retryable, a definitive `Backend` error is returned). An ordinary conflict
   of an outcome-bearing commit also re-reads the row once, so a lost race with the same command
   returns the winner's outcome
 - Only a genuinely indeterminate failure of an outcome-bearing commit is recovered — a timeout or
@@ -413,7 +418,8 @@ error before any write and is never split.
   is never replayed. A custom digest must be non-empty, checked before anything is read or run
 - After an indeterminate commit failure (timeout, lost connection, server fault) the engine
   re-reads the row: present with the same digest returns the stored outcome, a different digest is
-  `IdempotencyKeyReuse`, and an absent row after the window is a retryable `AmbiguousWrite`. The
+  `IdempotencyKeyReuse`, and an absent row after the window is a retryable `AmbiguousWrite`
+  (TypeScript `AmbiguousWriteError`). The
   handler never re-runs during recovery, and the reads do not depend on the caller's cancelled
   context
 - The response (raw bytes, stored as padded base64) and the encoded rejection are each at most
