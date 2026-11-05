@@ -8,7 +8,13 @@
 // fixture test does.
 
 import {
+  type CallOptions,
+  type Commit,
   type JsonValue,
+  type NormalizedTransaction,
+  type TransactionCommit,
+  commitAsTransaction,
+  compareUtf8,
   encodeEnvelope,
   encodeEvent,
   encodeSnapshot,
@@ -19,13 +25,16 @@ import {
   type TransactItem,
   eventItem,
   headItem,
+  outcomeItem,
   snapshotItem,
   transactionItems,
 } from '@photon-grove/evt/dynamodb'
 import {MemRepository, headFixtures} from '@photon-grove/evt/memory'
+import {FaultRepository} from '@photon-grove/evt/testing'
 
 import {type Checks, canonical, field, list, loadFixture, plain, str} from './harness.js'
 import {
+  FIXTURE_RUN,
   ORIGIN_SOURCE,
   type Observed,
   Runner,
@@ -41,10 +50,8 @@ import {
   transactionCommit,
 } from './runner.js'
 
-const FIXTURE_RUN = 'fixture'
-
 // The expectations only the scenarios TypeScript doesn't support yet produce.
-const LATER_EXPECTATIONS = ['views', 'outcomes']
+const LATER_EXPECTATIONS = ['views']
 
 // The marker version a fresh store's transactions check, and the table the fixture's actions
 // leave out.
@@ -83,7 +90,11 @@ async function runScenario(
   }
 
   const repository = new MemRepository()
-  const runner = new Runner(repository, scenario, `compat-${FIXTURE_RUN}-${name}`)
+  const recorder = new Recorder(repository)
+  const runner = new Runner(recorder, scenario, FIXTURE_RUN, {
+    bypassHead: async (event) => headFixtures(repository).appendBypassingHead(event),
+  })
+  const outcomes = scenario instanceof Map && scenario.get('outcomes') === true
 
   const steps = list(field(scenario, 'steps'))
   const transactions: unknown[] = []
@@ -91,9 +102,19 @@ async function runScenario(
     checkStep(step, index)
 
     const want = expectedOutcome(field(step, 'expect'))
+    const sent = recorder.calls.length
     const got = await runner.step(step)
     const label = `${name} step ${index} (${str(field(step, 'op'))})`
     checks.equal(label, canonical(got), canonical(want))
+
+    // An outcomes scenario pins every request each step sends, as Go's generator records them.
+    if (outcomes) {
+      const calls = recorder.calls.slice(sent)
+      if (calls.length > 0) {
+        transactions.push({step: index, calls: calls.map((items) => items.map(action))})
+      }
+      continue
+    }
 
     // The request a DynamoDB writer sends for the step, whether it commits or conflicts.
     if (str(field(step, 'op')) === 'transaction') {
@@ -110,6 +131,13 @@ async function runScenario(
 
   checks.equal(`${name}: entity ID`, runner.entityId, str(field(expected, 'entityId')))
   compareObserved(checks, name, await observe(repository, runner, runner.entityId), expected)
+  if (outcomes) {
+    checks.equal(
+      `${name}: outcomes`,
+      canonical(await outcomeRows(repository, runner.entityId, steps)),
+      canonical(optionalList(expected, 'outcomes').map(plain)),
+    )
+  }
 
   // Sibling streams in ascending order, as the fixture lists them.
   const suffixes = [...new Set(steps.flatMap(stepSuffixes))].filter((suffix) => suffix !== '')
@@ -123,6 +151,62 @@ async function runScenario(
     if (sibling !== undefined) {
       const observed = await observe(repository, runner, id)
       compareStream(checks, `${name} sibling ${suffix}`, observed, sibling)
+    }
+  }
+}
+
+// The outcome rows a scenario's commands left, as DynamoDB items, by command ID bytes.
+async function outcomeRows(
+  repository: MemRepository,
+  entityId: string,
+  steps: readonly JsonValue[],
+): Promise<unknown[]> {
+  const ids = [...new Set(steps.flatMap((step) => optionalString(step, 'commandId') ?? []))]
+    .map((id) => `${entityId}-${id}`)
+    .filter((id) => new TextEncoder().encode(id).length <= 512)
+  ids.sort(compareUtf8)
+
+  const rows: unknown[] = []
+  for (const commandId of ids) {
+    const outcome = await repository.outcome(commandId)
+    if (outcome !== null) {
+      rows.push({commandId, dynamoItem: outcomeItem(outcome)})
+    }
+  }
+
+  return rows
+}
+
+/**
+ * Records the DynamoDB request each commit sends, built from what the repository is given, and
+ * passes it on. A commit the DynamoDB repository would refuse before any request records nothing.
+ */
+class Recorder extends FaultRepository {
+  readonly calls: TransactItem[][] = []
+
+  override commit(commit: Commit, options?: CallOptions): Promise<void> {
+    this.#record(() => commitAsTransaction(commit))
+
+    return super.commit(commit, options)
+  }
+
+  override commitTransaction(transaction: TransactionCommit, options?: CallOptions): Promise<void> {
+    this.#record(() => normalizeTransaction(transaction))
+
+    return super.commitTransaction(transaction, options)
+  }
+
+  #record(normalize: () => NormalizedTransaction): void {
+    let normalized: NormalizedTransaction
+    try {
+      normalized = normalize()
+    } catch {
+      return
+    }
+    // The repository sends nothing for a commit that writes nothing at all.
+    const {streams, fences, outcome} = normalized
+    if (streams.length > 0 || fences.length > 0 || outcome !== null) {
+      this.calls.push(transactionItems(TABLE, normalized, MARKER_VERSION, () => undefined))
     }
   }
 }

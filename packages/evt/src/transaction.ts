@@ -2,13 +2,31 @@
 // events decided for some of them, and one atomic commit that fences every stream it read but
 // didn't write.
 
-import type {Aggregate, EventDefinitions, EventOf} from './aggregate.js'
-import {EvtError} from './errors.js'
+import type {Aggregate, EventDefinitions, EventOf, Rejection} from './aggregate.js'
+import {
+  type OutcomeConfig,
+  type PendingCommand,
+  acceptedOutcome,
+  freezeCommand,
+  persistRejection,
+  preCheck,
+  recordCommit,
+  rejectedOutcome,
+  replayed,
+} from './command.js'
+import {DuplicateCommandError, EvtError, FenceConflictError} from './errors.js'
 import type {SerializedEvent} from './event.js'
 import {type Metadata, emptyMetadata} from './metadata.js'
 import {
+  type CommandIdentity,
+  type CommandOutcome,
+  type Outcome,
+  staleFenceRejection,
+} from './outcome.js'
+import {
   type CallOptions,
   type Commit,
+  type OutcomeRepository,
   type ReadFence,
   type TransactionalRepository,
   checkNotReserved,
@@ -34,6 +52,39 @@ export interface TransactionContext {
   snapshotInterval(aggregate: {readonly snapshotInterval?: number | undefined}): number
   /** The command's metadata with what the store fills in, and the commit ID stamped. */
   metadata(partial?: Partial<Metadata>): Metadata
+  /** How the store records command outcomes, or null when it records none. */
+  readonly outcomes?: OutcomeConfig | null | undefined
+}
+
+/**
+ * What {@link Transaction.beginCommand} found:
+ *
+ * - `proceed`: no outcome is recorded for the command ID. Read, append and fence, then commit with
+ *   {@link Transaction.commitWithOutcome}, or refuse with {@link Transaction.reject} or
+ *   {@link Transaction.rejectWithEvents}.
+ * - `replayed`: the command already has an outcome with the same identity digest. Nothing ran and
+ *   nothing is written: return it.
+ */
+export type Begin = {kind: 'proceed'} | {kind: 'replayed'; outcome: CommandOutcome}
+
+/** Options for {@link Transaction.beginCommand}. */
+export interface BeginOptions extends CallOptions {
+  /** The command's metadata: its command ID, its principal, and what the commit stamps. */
+  metadata?: Partial<Metadata> | undefined
+}
+
+/** Options for {@link Transaction.commitWithOutcome}. */
+export interface OutcomeCommitOptions extends CallOptions {
+  /** Stored with the accepted outcome, for a retried command to return. Empty stores none. */
+  response?: Uint8Array | null | undefined
+}
+
+// The commit a transaction builds: the written streams in read order, the fences, and the events
+// in the order the commit writes them.
+interface Prepared {
+  readonly streams: Commit[]
+  readonly fences: ReadFence[]
+  readonly events: SerializedEvent[]
 }
 
 /** A fence the caller stamps on a stream the transaction doesn't read. */
@@ -123,6 +174,9 @@ export class Transaction {
   #reads = 0
   #pending = 0
   #done = false
+  // The command beginCommand froze, until an outcome method takes it.
+  #command: PendingCommand | null = null
+  #beginning = false
 
   /** @internal Begun by {@link Store.transaction}. */
   constructor(context: TransactionContext) {
@@ -224,31 +278,216 @@ export class Transaction {
   }
 
   /**
+   * Starts a command on a store with outcomes: validates the command ID (present, at most 512
+   * UTF-8 bytes), computes the identity digest, and reads the command's outcome row. Call it
+   * first, before any read, append or fence, so a repeated command does no work. A stored outcome
+   * with the same digest is `replayed`, and the transaction is done; one with another digest is an
+   * `IdempotencyKeyReuseError`.
+   *
+   * The identity is the caller's intent, fixed before any state is read: the streams the request
+   * names, not the ones the transaction goes on to read and write.
+   */
+  async beginCommand(identity: CommandIdentity, options: BeginOptions = {}): Promise<Begin> {
+    const config = this.#outcomeConfig()
+    this.#checkOpen()
+    if (this.#command !== null || this.#beginning) {
+      throw invalidCommit('beginCommand was already called on this transaction')
+    }
+    // A read that failed left nothing behind, so it doesn't count.
+    if (this.#ids.size > 0 || this.#fences.size > 0) {
+      throw invalidCommit(
+        'beginCommand must be the first operation on a transaction, before any read, append or fence',
+      )
+    }
+
+    // Held while the command is checked and its row read, so a failed begin can be called again.
+    this.#beginning = true
+    try {
+      const metadata = this.#context.metadata(options.metadata)
+      const pending = await freezeCommand(config, identity, metadata)
+      const repository = this.#context.repository as OutcomeRepository
+      const stored = await preCheck(repository, pending, options)
+      if (stored !== null) {
+        this.#done = true
+        return {kind: 'replayed', outcome: replayed(stored)}
+      }
+
+      this.#command = pending
+    } finally {
+      this.#beginning = false
+    }
+
+    return {kind: 'proceed'}
+  }
+
+  /**
    * Stamps one commit ID and the command's metadata on every appended event, and commits every
    * stream with events, a fence on every stream read without any, and the caller's fences, in one
    * atomic repository transaction. On failure nothing is written. A command ID that an event a
    * read stream folded in since its latest snapshot already carries is a `duplicate`, and nothing
    * is written. Projector operations follow the streams in the order they were read. A commit
    * while a read is still loading throws `invalidCommit`, and leaves the transaction open.
+   *
+   * A transaction of a store with outcomes refuses it: begin the command with
+   * {@link beginCommand}, then commit with {@link commitWithOutcome}.
    */
   async commit(options: ExecuteOptions = {}): Promise<TransactionResult> {
-    this.#checkOpen()
-    if (this.#pending > 0) {
-      throw invalidCommit('a read is still loading; await it before the commit')
+    if (this.#context.outcomes) {
+      throw new EvtError(
+        'invalidArgument',
+        'this transaction records command outcomes: commit would skip the outcome row; ' +
+          'call beginCommand, then commitWithOutcome or reject',
+      )
     }
+    this.#checkCommittable()
     this.#done = true
 
     const metadata = this.#context.metadata(options.metadata)
     const commandId = metadata.commandId
-    const streams = [...this.#streams.values()]
-    streams.sort((a, b) => a.order - b.order)
-    if (
-      commandId !== null &&
-      commandId !== '' &&
-      streams.some((stream) => stream.loaded.seenCommandIds.has(commandId))
-    ) {
+    if (commandId !== null && commandId !== '' && this.#seen(commandId)) {
       return {kind: 'duplicate', commandId}
     }
+
+    const {streams, fences, events} = this.#prepare(metadata)
+    await this.#context.repository.commitTransaction({streams, fences}, options)
+
+    return {kind: 'committed', events}
+  }
+
+  /**
+   * Commits the transaction and records the command as accepted, in one atomic repository
+   * commit: the appended events (none is an accepted no-op), the read set's fences, and then the
+   * outcome row, which stores `response` for a retried command to return. The transaction must
+   * have begun with {@link beginCommand}.
+   *
+   * A lost race for the outcome row resolves through the winner's row, and a commit whose result
+   * is unknown through polling the row (an `AmbiguousWriteError` when it doesn't appear). A failed
+   * fence the caller stamped records a stale-fence rejection instead, and returns it: the command
+   * ID stays terminal, so the caller decides again under a new one. Any other conflict throws:
+   * begin a new transaction and the command again.
+   */
+  async commitWithOutcome(options: OutcomeCommitOptions = {}): Promise<CommandOutcome> {
+    const pending = this.#takeCommand()
+    const answered = await this.#alreadyRan(pending, options)
+    if (answered !== null) {
+      return answered
+    }
+    const prepared = this.#prepare(pending.metadata)
+
+    return this.#record(pending, acceptedOutcome(pending, options.response), prepared, options)
+  }
+
+  /**
+   * Records the command as rejected without writing events: the domain refused it, and the
+   * staged appends are discarded ({@link rejectWithEvents} commits them). The commit still checks
+   * a fence on every stream the transaction read, at the head it read, and every fence the caller
+   * stamped, so a rejection decided on stale state isn't recorded: an engine fence that failed
+   * throws a retryable `FenceConflictError`, and a caller's records a stale-fence rejection
+   * instead. A retried command replays the stored rejection.
+   */
+  async reject(rejection: Rejection, options: CallOptions = {}): Promise<CommandOutcome> {
+    const pending = this.#takeCommand()
+    const answered = await this.#alreadyRan(pending, options)
+    if (answered !== null) {
+      return answered
+    }
+    const outcome = rejectedOutcome(pending, rejection)
+    const streams = [...this.#streams.values()]
+    streams.sort((a, b) => a.order - b.order)
+    const fences: ReadFence[] = streams.map((stream) => ({
+      entityId: stream.loaded.entityId,
+      entityType: stream.aggregate.type,
+      head: stream.loaded.sequence,
+      provenance: 'engine',
+    }))
+    fences.push(...this.#callerFences())
+
+    return this.#record(pending, outcome, {streams: [], fences, events: []}, options)
+  }
+
+  /**
+   * Records the command as rejected and commits the staged events in the same atomic commit, so
+   * the history shows why the command was refused, or nothing is written. The commit is checked
+   * as {@link commitWithOutcome}'s is, and the rejected outcome lists its events. With nothing
+   * appended it's {@link reject}. A retried command replays the rejection and writes nothing.
+   */
+  async rejectWithEvents(rejection: Rejection, options: CallOptions = {}): Promise<CommandOutcome> {
+    const pending = this.#takeCommand()
+    const answered = await this.#alreadyRan(pending, options)
+    if (answered !== null) {
+      return answered
+    }
+    const prepared = this.#prepare(pending.metadata)
+
+    return this.#record(pending, rejectedOutcome(pending, rejection), prepared, options)
+  }
+
+  // Commits a prepared transaction with the command's outcome, and settles the result.
+  async #record(
+    pending: PendingCommand,
+    outcome: Outcome,
+    prepared: Prepared,
+    options: CallOptions,
+  ): Promise<CommandOutcome> {
+    const config = this.#outcomeConfig()
+    const repository = this.#context.repository as OutcomeRepository
+    const {streams, fences, events} = prepared
+
+    try {
+      return await recordCommit(repository, pending, config, outcome, events, () =>
+        repository.commitTransaction({streams, fences, outcome}, options),
+      )
+    } catch (error) {
+      // Only the caller knows what it read, so a stale fence of its own is the command's answer.
+      if (error instanceof FenceConflictError && error.provenance === 'caller') {
+        const rejection = config.staleFence(staleFenceRejection())
+        return persistRejection(repository, pending, config, rejection, options)
+      }
+      throw error
+    }
+  }
+
+  // The command an outcome method records, which ends the transaction: it must have begun, and no
+  // read may still be loading.
+  #takeCommand(): PendingCommand {
+    this.#outcomeConfig()
+    this.#checkCommittable()
+    const pending = this.#command
+    if (pending === null) {
+      throw new EvtError(
+        'invalidArgument',
+        'beginCommand must be called before the transaction records an outcome',
+      )
+    }
+    this.#done = true
+
+    return pending
+  }
+
+  // Whether a stream this command read already carries its ID. Another attempt of the command may
+  // have committed since beginCommand read the row, so the row is read again, and answers it when
+  // it's there. Without one, it's an event written before outcomes existed: the command ran, so no
+  // outcome is recorded for it.
+  async #alreadyRan(pending: PendingCommand, options: CallOptions): Promise<CommandOutcome | null> {
+    if (!this.#seen(pending.commandId)) {
+      return null
+    }
+
+    const repository = this.#context.repository as OutcomeRepository
+    const stored = await preCheck(repository, pending, options)
+    if (stored === null) {
+      throw new DuplicateCommandError(pending.commandId)
+    }
+
+    return replayed(stored)
+  }
+
+  // Builds the commit: every stream with events, its metadata stamped and the snapshot and
+  // projector operations it calls for; a fence on every stream read without any; and the caller's
+  // fences on streams the transaction didn't read.
+  #prepare(metadata: Metadata): Prepared {
+    const streams = [...this.#streams.values()]
+    streams.sort((a, b) => a.order - b.order)
 
     const commits: Commit[] = []
     const fences: ReadFence[] = []
@@ -290,24 +529,44 @@ export class Transaction {
         ),
       })
     }
+    fences.push(...this.#callerFences())
 
-    // A caller's fence on a stream the transaction read is superseded by the read's own.
-    for (const fence of this.#fences.values()) {
-      if (!this.#ids.has(fence.entityId)) {
-        fences.push({...fence, provenance: 'caller'})
-      }
-    }
-
-    await this.#context.repository.commitTransaction({streams: commits, fences}, options)
-
-    // Sorted apart from what the repository was given, which stays in read order.
+    // Sorted apart from what the repository is given, which stays in read order.
     const written = [...commits]
     written.sort((a, b) => compareUtf8(a.entityId, b.entityId))
 
-    return {
-      kind: 'committed',
-      events: written.flatMap((commit) => commit.events),
+    return {streams: commits, fences, events: written.flatMap((commit) => commit.events)}
+  }
+
+  // A caller's fence on a stream the transaction read is superseded by the read's own.
+  #callerFences(): ReadFence[] {
+    return [...this.#fences.values()]
+      .filter((fence) => !this.#ids.has(fence.entityId))
+      .map((fence): ReadFence => Object.assign({}, fence, {provenance: 'caller' as const}))
+  }
+
+  // Whether an event a read stream folded in since its latest snapshot carries the command ID.
+  #seen(commandId: string): boolean {
+    return [...this.#streams.values()].some((stream) => stream.loaded.seenCommandIds.has(commandId))
+  }
+
+  #checkCommittable(): void {
+    this.#checkOpen()
+    if (this.#pending > 0) {
+      throw invalidCommit('a read is still loading; await it before the commit')
     }
+  }
+
+  #outcomeConfig(): OutcomeConfig {
+    const config = this.#context.outcomes
+    if (!config) {
+      throw new EvtError(
+        'invalidArgument',
+        'command outcomes are not enabled; construct the store with outcomes',
+      )
+    }
+
+    return config
   }
 
   #checkOpen(): void {

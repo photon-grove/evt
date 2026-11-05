@@ -12,6 +12,7 @@ import {
   defineAggregate,
   defineEvents,
   jsonUpcaster,
+  compareUtf8,
   parseJson,
   stringifyJson,
 } from '@photon-grove/evt'
@@ -31,15 +32,13 @@ export interface Account {
   lastMemo: string | null
 }
 
-/**
- * Account commands, decoded from the scenario JSON. `withdrawAudited` waits for rejections with
- * events (phase 4 of ADR 0009).
- */
+/** Account commands, decoded from the scenario JSON. */
 export type AccountCommand =
   | {type: 'open'; owner: string; openedAt: string | null}
   | {type: 'deposit'; amountCents: number; memo: string | null}
   | {type: 'batchDeposit'; amounts: number[]}
   | {type: 'withdraw'; amountCents: number}
+  | {type: 'withdrawAudited'; amountCents: number}
   | {type: 'tag'; tags: string[]}
   | {type: 'setLabels'; labels: Map<string, string>}
   | {type: 'rename'; owner: string}
@@ -251,6 +250,23 @@ function accept(...decided: AccountEvent[]): Decision<AccountEvent> {
   return {kind: 'accept', events: decided}
 }
 
+// Accepts with a response carrying the balance after the events, which a store with outcomes
+// records and any other ignores.
+function acceptWithBalance(
+  balanceCents: number,
+  ...decided: AccountEvent[]
+): Decision<AccountEvent> {
+  return {
+    kind: 'accept',
+    events: decided,
+    response: encoder.encode(`{"balanceCents":${balanceCents}}`),
+  }
+}
+
+// Each decoded command's payload for the identity digest: the step's command object with its keys
+// sorted, as Go marshals it, so every language digests a command alike.
+const payloads = new WeakMap<AccountCommand, Uint8Array>()
+
 export const account = defineAggregate({
   type: 'account',
   events,
@@ -285,7 +301,7 @@ export const account = defineAggregate({
         if (command.amountCents <= 0) {
           return reject('amount must be positive')
         }
-        return accept({
+        return acceptWithBalance(current.balanceCents + command.amountCents, {
           type: 'account:deposited',
           data: {amountCents: command.amountCents, memo: command.memo},
         })
@@ -296,13 +312,12 @@ export const account = defineAggregate({
         if (command.amounts.some((amount) => amount <= 0)) {
           return reject('amount must be positive')
         }
-        return accept(
-          ...command.amounts.map(
-            (amountCents): AccountEvent => ({
-              type: 'account:deposited',
-              data: {amountCents, memo: null},
-            }),
-          ),
+        return acceptWithBalance(
+          command.amounts.reduce((balance, amount) => balance + amount, current.balanceCents),
+          ...command.amounts.map((amountCents): AccountEvent => ({
+            type: 'account:deposited',
+            data: {amountCents, memo: null},
+          })),
         )
       case 'withdraw':
         if (command.amountCents <= 0) {
@@ -314,7 +329,30 @@ export const account = defineAggregate({
             requestedCents: command.amountCents,
           })
         }
-        return accept({type: 'account:withdrawn', data: {amountCents: command.amountCents}})
+        return acceptWithBalance(current.balanceCents - command.amountCents, {
+          type: 'account:withdrawn',
+          data: {amountCents: command.amountCents},
+        })
+      // Like withdraw, but a refusal for insufficient funds is recorded in the account's history
+      // as a tag, in the same commit as the rejection.
+      case 'withdrawAudited':
+        if (command.amountCents <= 0) {
+          return reject('amount must be positive')
+        }
+        if (command.amountCents > current.balanceCents) {
+          const refused = reject('insufficient funds', {
+            balanceCents: current.balanceCents,
+            requestedCents: command.amountCents,
+          })
+          return {
+            ...refused,
+            events: [{type: 'account:tagged', data: {tags: ['overdraft-attempted']}}],
+          }
+        }
+        return acceptWithBalance(current.balanceCents - command.amountCents, {
+          type: 'account:withdrawn',
+          data: {amountCents: command.amountCents},
+        })
       case 'tag':
         if (command.tags.length === 0) {
           return reject('no tags')
@@ -332,10 +370,19 @@ export const account = defineAggregate({
         return accept({type: 'account:renamed', data: {owner: command.owner}})
       case 'close':
         return accept({type: 'account:closed', data: {reason: command.reason}})
-      // Accepted with no events.
+      // Accepted with no events and no response.
       case 'ping':
-      case 'balance':
         return accept()
+      // Accepted with no events; the response is the balance.
+      case 'balance':
+        return acceptWithBalance(current.balanceCents)
+    }
+  },
+
+  identify(command: AccountCommand) {
+    return {
+      commandType: `account:${command.type}`,
+      payload: payloads.get(command) ?? encoder.encode(stringifyJson(command)),
     }
   },
 
@@ -366,6 +413,30 @@ export const account = defineAggregate({
 
 /** Decodes a scenario step's command object. */
 export function accountCommand(value: JsonValue): AccountCommand {
+  const command = decodeCommand(value)
+  payloads.set(command, encoder.encode(stringifyJson(sortedKeys(value))))
+
+  return command
+}
+
+/**
+ * A JSON object with its keys in UTF-8 byte order, as Go marshals a map, and its values as they
+ * are; nested objects too when `deep`.
+ */
+export function sortedKeys(value: JsonValue, deep = false): JsonValue {
+  if (!(value instanceof Map)) {
+    return deep && Array.isArray(value) ? value.map((entry) => sortedKeys(entry, deep)) : value
+  }
+
+  const keys = [...value.keys()]
+  keys.sort(compareUtf8)
+
+  return new Map(
+    keys.map((key) => [key, deep ? sortedKeys(value.get(key)!, deep) : value.get(key)!]),
+  )
+}
+
+function decodeCommand(value: JsonValue): AccountCommand {
   const fields = new Fields(value)
   const type = fields.required('type').string('type')
 
@@ -379,6 +450,7 @@ export function accountCommand(value: JsonValue): AccountCommand {
     case 'batchDeposit':
       return {type, amounts: ints(value, 'amounts')}
     case 'withdraw':
+    case 'withdrawAudited':
       return {type, amountCents: fields.required('amountCents').int('amountCents')}
     case 'tag':
       return {type, tags: fields.required('tags').strings('tags') ?? []}

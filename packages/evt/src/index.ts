@@ -5,6 +5,7 @@
 export {
   type Aggregate,
   type AggregateDefinition,
+  type CommandDescription,
   type Decision,
   type EventDefinition,
   type EventDefinitions,
@@ -18,6 +19,7 @@ export {
   jsonUpcaster,
 } from './aggregate.js'
 export {base64Decode, base64Encode} from './base64.js'
+export {DEFAULT_RECOVERY_WAIT_MS, type OutcomeOptions} from './command.js'
 export {
   type Codec,
   type JsonOptions,
@@ -29,7 +31,9 @@ export {encodeEnvelope, decodeEnvelope, messageAttributes} from './envelope.js'
 export {
   CommitTooLargeError,
   CompactionUncoveredError,
+  AmbiguousWriteError,
   ConflictError,
+  DuplicateCommandError,
   EvtError,
   type EvtErrorCode,
   FeatureManifestChangedError,
@@ -37,8 +41,10 @@ export {
   type FenceProvenance,
   CommandIdTooLongError,
   HistoryDependentProjectionError,
+  IdempotencyKeyReuseError,
   IndeterminateError,
   OutcomeConflictError,
+  OutcomePrincipalMismatchError,
   type OutcomePart,
   OutcomeTooLargeError,
   ProjectorOnlyCommitError,
@@ -86,6 +92,8 @@ export {
 } from './metadata.js'
 export {
   COMMAND_OUTCOME_PREFIX,
+  type CommandIdentity,
+  type CommandOutcome,
   type DigestInput,
   MAX_COMMAND_ID_BYTES,
   MAX_OUTCOME_BYTES,
@@ -120,6 +128,7 @@ export {
   type StoreInitializer,
   type TransactionCommit,
   type TransactionalRepository,
+  commitAsTransaction,
   normalizeTransaction,
 } from './repository.js'
 export {
@@ -129,7 +138,15 @@ export {
 } from './retry.js'
 export {MAX_COMMIT_ITEM_BYTES, snapshotCommitSize, snapshotEventsDue} from './snapshots.js'
 export {compareUtf8, utf8Length} from './utf8.js'
-export {type CallerFence, StreamRead, Transaction, type TransactionResult} from './transaction.js'
+export {
+  type Begin,
+  type BeginOptions,
+  type CallerFence,
+  type OutcomeCommitOptions,
+  StreamRead,
+  Transaction,
+  type TransactionResult,
+} from './transaction.js'
 export {
   DEFAULT_SNAPSHOT_INTERVAL,
   type ExecuteOptions,

@@ -11,9 +11,9 @@ held to the fixtures Go and Rust generate, byte for byte.
 npm install @photon-grove/evt
 ```
 
-So far it has the core, multi-stream transactions with read fences, the in-memory, DynamoDB and
-PostgreSQL backends, and the testing helpers. Commit-wide projectors and command outcomes come in
-later releases, and the
+So far it has the core, multi-stream transactions with read fences, command outcomes, the
+in-memory, DynamoDB and PostgreSQL backends, and the testing helpers. Commit-wide projectors come
+in a later release, and the
 [feature matrix](https://github.com/photon-grove/evt/blob/main/docs/reference/feature-matrix.md)
 tracks each one. The
 [getting started guide](https://github.com/photon-grove/evt/blob/main/docs/guide/getting-started.md#the-same-model-in-typescript)
@@ -110,13 +110,15 @@ of `AbortSignal`, which the DOM library, `@types/node`, and Bun's and Deno's typ
   sides. Any `{encode, decode}` pair of bytes works as a codec.
 - **Aggregates.** `defineAggregate` names the type, the events, the state's codec and its initial
   value. `handle(state, command)` returns a decision, `{kind: 'accept', events}` or
-  `{kind: 'reject', rejection: {code, message}}`, and may be async. `apply(state, event)` returns
-  the next state and never validates.
+  `{kind: 'reject', rejection: {code, message}}`, and may be async. On a store with command
+  outcomes, an accepted decision can carry a `response` and a rejection its own `events`. `apply(state,
+  event)` returns the next state and never validates.
 - **The store.** `new Store(repository, options)` loads an aggregate from its latest snapshot and
   the events after it, runs a command, and commits the decided events with optimistic concurrency:
   the commit fails with a `ConflictError` if another writer moved the stream first.
   `executeWithRetry` loads and runs the command again after a conflict, with a jittered backoff
-  (`DEFAULT_RETRY_POLICY`, the same as Go's and Rust's). A rejection commits nothing.
+  (`DEFAULT_RETRY_POLICY`, the same as Go's and Rust's). Without command outcomes, a rejection
+  commits nothing.
 - **Snapshots.** The store writes a snapshot every five events by default (the `snapshotInterval`
   option, or the aggregate's own). A snapshot too large for one DynamoDB item is skipped rather
   than failing the commit, and later loads replay from the one before.
@@ -153,17 +155,30 @@ of `AbortSignal`, which the DOM library, `@types/node`, and Bun's and Deno's typ
   `TransactionalRepository`, whose `commitTransaction({streams, fences})` takes the streams and
   fences directly. A fence on an entity type with retention is refused with a
   `RetentionConflictError`.
-- **Outcome rows.** Every repository here is an `OutcomeRepository`. A commit or transaction that
-  carries an `outcome` writes the command's row as its last action, on the condition that no row
-  exists for the command ID. That covers an outcome-only commit, with no events, and `outcome()`
-  reads the row back with a strongly consistent read. The row's event IDs are the ones the commit
-  wrote, and its rejection is stored as `encodeRejection` writes it: keys sorted as in a Go map, and
-  numbers in the canonical text PostgreSQL's `jsonb` prints. A second row for the same ID fails
-  with an `OutcomeConflictError`, which outranks every stream and fence failure. When a commit
-  that carries an outcome fails without a known result, such as a timeout or a connection lost
-  during `COMMIT`, it fails with an `IndeterminateError`, because it may still land. Command IDs,
-  responses, rejections and recorded identities are bounded before any write. Running commands
-  with outcomes, replaying them and recovering ambiguous writes come in a later release.
+- **Command outcomes.** A store built with `outcomes` records a durable outcome for every command,
+  in the same commit as its events, so a retried command returns the recorded answer instead of
+  running again. Run commands with `executeWithOutcome(aggregate, id, command, {metadata})`, which
+  needs a command ID and the aggregate's `identify(command)`: the command's type and the canonical
+  JSON of its payload, which with the entity ID and the metadata's principal make up its identity
+  digest. Every attempt reads the command's outcome row first. A stored outcome with the same
+  digest is returned with `replayed: true` and the handler doesn't run, and one with another digest
+  is an `IdempotencyKeyReuseError`. Otherwise the handler runs, and an accepted decision's
+  `response` is stored with its outcome. A rejection is recorded and returned, not thrown, and the
+  `events` it carries commit with the rejected row. A conflict runs the command again from a fresh
+  load, and when the attempts run out the store records a `stale-fence` rejection, so the command
+  ID keeps that answer. A commit whose result is unknown is settled by polling the outcome row,
+  never by running the handler again: a row that doesn't appear within `recoveryWaitMs` is a
+  retryable `AmbiguousWriteError`. `resolveOutcome` and `resolveCommand(identity)` read the row
+  without running anything, and `resolveCommandForPrincipal(commandId, principal)` answers only the
+  principal that recorded it (`OutcomePrincipalMismatchError` otherwise). In a transaction,
+  `beginCommand(identity, {metadata})` comes first, and `commitWithOutcome({response})`, `reject`
+  and `rejectWithEvents` commit it. A failed fence the caller stamped records the `stale-fence`
+  rejection instead. On a store with outcomes, `execute` and a transaction's `commit` are refused,
+  since they would skip the row. Underneath, every repository is an `OutcomeRepository`: it writes
+  a commit's `outcome` as its last action, on the condition that no row exists for the command ID,
+  and reads it back with `outcome()`, strongly consistent. `FaultRepository` in
+  `@photon-grove/evt/testing` makes a commit apply and then fail, or fail without applying, to
+  test recovery.
 - **Sequences** are `bigint`s, because Go and Rust store them as 64-bit integers.
 
 Errors are `EvtError`s with a `code`. `isConflict` and `isRetryable` tell them apart.
@@ -205,12 +220,14 @@ long as they agree on these:
 - Event versions. Like Rust, TypeScript refuses a stored version it can't upcast to the declared
   one, and Go decodes it anyway, so deploy readers before writers when you bump a version.
 
-Until the TypeScript package has commit-wide projectors and command outcomes, two more rules apply:
+- On a store whose Go or Rust writers record command outcomes, build the TypeScript `Store` with
+  `outcomes` too, and run commands with `executeWithOutcome`. A command digests alike in every
+  language only when its type and payload bytes match: Go marshals a command's map with its keys
+  sorted, for example.
 
-- Don't write an entity type that has commit-wide projectors registered in a Go or Rust service.
-  Its commits would land without their view rows.
-- Don't share a store whose Go or Rust writers record command outcomes. A command retried through
-  TypeScript would find no outcome and could run twice.
+Until the TypeScript package has commit-wide projectors, one more rule applies: don't write an
+entity type that has commit-wide projectors registered in a Go or Rust service. Its commits would
+land without their view rows.
 
 The [known differences](https://github.com/photon-grove/evt/blob/main/docs/reference/storage-format.md#known-differences)
 between the languages are in the storage format, and

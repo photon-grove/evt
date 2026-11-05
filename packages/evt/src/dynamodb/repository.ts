@@ -622,7 +622,7 @@ export class DynamoRepository implements OutcomeRepository, StoreInitializer {
       if (colliding !== -1) {
         return new TransientError(
           `transaction conflict on ${entityAt(layout, colliding)}: another writer was committing at the same time`,
-          {cause: error},
+          {cause: error, transactionConflict: true},
         )
       }
       if (codes.some((code) => THROTTLED.has(code))) {
