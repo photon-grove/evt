@@ -187,7 +187,7 @@ async fn identity_recorded_by_engine_rejections<R: Repository>(repo: &R) -> Case
         EntityId::new(format!("{ns}-b")),
     );
     store
-        .execute(&b, Add(1), command_metadata(&command_id()))
+        .execute_with_outcome(&b, Add(1), command_metadata(&command_id()))
         .await?;
 
     // A caller-stamped fence already stale persists the stale-fence rejection.

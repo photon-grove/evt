@@ -6096,10 +6096,12 @@ impl<R: Repository> Repository for Meddling<'_, R> {
         self.inner.declare_history_dependent(types)
     }
 
+    // The meddling write and the inner commit are boxed: each is a whole repository commit, and
+    // nesting both inline under the engine's retry loop outgrows a debug test thread's stack.
     async fn commit(&self, commit: Commit<R::Operation>) -> Result<(), Error> {
-        self.meddle(false, !commit.events.is_empty()).await?;
+        Box::pin(self.meddle(false, !commit.events.is_empty())).await?;
 
-        self.inner.commit(commit).await
+        Box::pin(self.inner.commit(commit)).await
     }
 
     async fn commit_transaction(
@@ -6110,10 +6112,9 @@ impl<R: Repository> Repository for Meddling<'_, R> {
             .streams
             .iter()
             .any(|stream| !stream.events.is_empty());
-        self.meddle(!commit.fences.is_empty(), writes_events)
-            .await?;
+        Box::pin(self.meddle(!commit.fences.is_empty(), writes_events)).await?;
 
-        self.inner.commit_transaction(commit).await
+        Box::pin(self.inner.commit_transaction(commit)).await
     }
 
     fn backoff(&self, duration: Duration) -> impl Future<Output = ()> + Send {
