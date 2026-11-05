@@ -1288,6 +1288,7 @@ pub fn decode_event_ids(text: &str) -> Result<Vec<EventId>, Error> {
 }
 
 /// How a commit that carried an outcome ended, once races and ambiguity are resolved.
+#[derive(Debug)]
 pub(crate) enum Settled {
     /// This call's commit applied.
     Committed,
@@ -1525,21 +1526,30 @@ pub(crate) async fn settle<R: Repository>(
         // row exists by now. Re-read once, so the retry's pre-check is not needed to find it. That
         // includes a fence conflict: the winner wrote the very stream the loser fenced, and a
         // backend that asserts fences before inserting the outcome (PostgreSQL) reports the fence,
-        // not the lost outcome put. Absent, the conflict stands and the fence-aware retry runs; a
-        // failed read keeps the conflict.
-        Err(
-            conflict @ (Error::Conflict { .. }
-            | Error::SequenceGap { .. }
-            | Error::FenceConflict { .. }),
-        ) => match read_bounded(repository, command_id, window).await {
-            Some(Ok(Some(stored))) => {
-                Ok(Settled::Replayed(Box::new(same_command(stored, digest)?)))
+        // not the lost outcome put, and a DynamoDB transaction conflict: the loser was cancelled
+        // while the winner's transaction held the outcome item. Absent, the error stands and the
+        // fence-aware retry runs; a failed read keeps the error.
+        Err(conflict) if may_have_lost_the_race(&conflict) => {
+            match read_bounded(repository, command_id, window).await {
+                Some(Ok(Some(stored))) => {
+                    Ok(Settled::Replayed(Box::new(same_command(stored, digest)?)))
+                }
+                // A malformed row is corruption, not a conflict to retry past.
+                Some(Err(err @ Error::InvalidRecord(_))) => Err(err),
+                _ => Err(conflict),
             }
-            // A malformed row is corruption, not a conflict to retry past.
-            Some(Err(err @ Error::InvalidRecord(_))) => Err(err),
-            _ => Err(conflict),
-        },
+        }
         Err(other) => Err(other),
+    }
+}
+
+/// Reports whether a failed commit may be the loser of a race for its own command ID, whose
+/// winner's outcome row then answers it ([`settle`]).
+fn may_have_lost_the_race(error: &Error) -> bool {
+    match error {
+        Error::Conflict { .. } | Error::SequenceGap { .. } | Error::FenceConflict { .. } => true,
+        Error::Transient(source) => source.is::<crate::error::TransactionConflict>(),
+        _ => false,
     }
 }
 
@@ -2156,5 +2166,47 @@ mod tests {
         assert_eq!(RejectionCode::NOT_FOUND, "not-found");
         assert_eq!(RejectionCode::BAD_COMMAND, "bad-command");
         assert_eq!(RejectionCode::STALE_FENCE, "stale-fence");
+    }
+
+    #[tokio::test]
+    async fn a_transaction_conflict_rereads_the_row_a_racing_winner_wrote() {
+        use crate::conformance::{Add, Ledger};
+        use crate::error::TransactionConflict;
+        use crate::{MemRepository, Metadata, Store};
+
+        let repository = MemRepository::new();
+        let won = CommandId::new("won");
+        Store::<Ledger, _>::new(&repository, ())
+            .with_outcomes(OutcomeConfig::new())
+            .execute_with_outcome(
+                "ledger",
+                Add(1),
+                Metadata::new("local").with_command_id("won"),
+            )
+            .await
+            .unwrap();
+        let digest = repository.outcome(&won).await.unwrap().unwrap().digest;
+
+        let window = Duration::from_millis(100);
+        let conflict = || {
+            Err(Error::Transient(Box::new(TransactionConflict::new(
+                "ledger".into(),
+                "cancelled",
+            ))))
+        };
+
+        // The loser of the race for the same command ID answers with the winner's row.
+        let settled = settle(&repository, &won, &digest, window, conflict()).await;
+        assert!(matches!(settled, Ok(Settled::Replayed(_))), "{settled:?}");
+
+        // No row: it stays transient, so nothing is recorded and the ID can be sent again.
+        let absent = CommandId::new("absent");
+        let settled = settle(&repository, &absent, &digest, window, conflict()).await;
+        assert!(matches!(settled, Err(Error::Transient(_))), "{settled:?}");
+
+        // Throttling says nothing about a winner: returned as it is.
+        let throttled = Err(Error::Transient("throttled".into()));
+        let settled = settle(&repository, &won, &digest, window, throttled).await;
+        assert!(matches!(settled, Err(Error::Transient(_))), "{settled:?}");
     }
 }

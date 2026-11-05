@@ -432,7 +432,7 @@ The languages report the other cancellations differently:
 | ---------------------------------------------------- | ------------------------------------- | ------------------------------- |
 | head, event, or snapshot condition                   | `dynamo.ErrSnapshotRaceCondition`     | `Error::Conflict`               |
 | projector operation condition                        | `*evt.ProjectorOperationError`, not retried (a legacy transaction group's `HandleError`) | `Error::ProjectorOperation`, not retried |
-| `TransactionConflict`                                | classified as transient               | `Error::Conflict`, retried      |
+| `TransactionConflict`                                | `dynamo.ErrTransactionConflict`, transient, not a conflict | `Error::Transient` (source `TransactionConflict`), not a conflict |
 | `ThrottlingError` or `ProvisionedThroughputExceeded` | classified as transient               | `Error::Transient`, retried     |
 
 In Rust, a commit that times out, loses its response, or fails with an internal server error is
@@ -1487,13 +1487,19 @@ the error) and only then by fence provenance:
   persists the command's outcome at once as a rejection with the reserved code `stale-fence` and
   the message `a caller-stamped fence went stale`. Only a caller-stamped fence that itself failed
   produces this form.
-- A DynamoDB `TransactionConflict` (another transaction was writing the same items) is a conflict
-  in both languages. A throttled commit and an ambiguous write whose outcome row never appeared
-  are transient: they run again after a backoff, but they are not conflicts, so they never
-  exhaust into a rejection ([Exhausted attempts](#exhausted-attempts)). So is a load that
-  found a sequence gap (a compaction raced it, or events expired): reloading resolves the first
-  case, so it is retried, but it says the read was inconsistent, not that a decision went stale,
-  and a gap that persists is returned as an error rather than recorded against the command ID.
+- A DynamoDB `TransactionConflict` (another transaction was writing one of the same items at that
+  moment) is transient in every language, never a conflict. Nothing was written, and the item it
+  collided on can be one no command changes, such as the feature-marker or rebuild-lock check or
+  a fence two commands share, so nothing the command was decided on is known to be stale. It, a
+  throttled commit, and an ambiguous write whose outcome row never appeared run again after a
+  backoff, but they are not conflicts, so they never exhaust into a rejection
+  ([Exhausted attempts](#exhausted-attempts)). With one attempt, it is returned at once and
+  nothing is recorded, so the same command ID can be sent again. A failed condition in the same
+  cancellation outranks it and keeps its own classification.
+- A load that found a sequence gap (a compaction raced it, or events expired) is transient too:
+  reloading resolves the first case, so it is retried, but it says the read was inconsistent, not
+  that a decision went stale, and a gap that persists is returned as an error rather than
+  recorded against the command ID.
   Only a failed read that a multi-stream prepare step passes on counts: an error the step makes up
   itself, even one shaped like a conflict or a transient failure, is the step's own failure and is
   returned at once in both languages. A Go transaction is consumed by a failed read; a Rust one
@@ -1583,8 +1589,9 @@ in Rust) which attempt once and return an engine-filled conflict as an error.
 
 Worst-case latency. A command takes at most the attempts, the waits between them, and any
 recovery windows. With the defaults the waits are at most 25, 50, 100, and 200 ms, about 0.4 s in
-total, so a burst of `TransactionConflict` on a hot key exhausts into a `stale-fence` rejection in
-well under a second. An ambiguous write whose row never appears costs a full recovery window
+total, so a hot stream whose other writers keep moving it exhausts into a `stale-fence` rejection
+in well under a second, while a burst of `TransactionConflict` is returned as a transient error.
+An ambiguous write whose row never appears costs a full recovery window
 ([Ambiguous-write recovery](#ambiguous-write-recovery), 10 s plus up to a second of grace) per
 attempt, so five attempts can take about a minute. Set a deadline, a shorter recovery window, or
 fewer attempts to bound it.
@@ -1610,8 +1617,9 @@ bytes:
 ```
 
 Only a conflict exhausts into a rejection. When attempts run out on a transient failure that is
-not a conflict (throttling, an ambiguous write whose row never appeared), nothing says the state
-went stale, so the error is returned and no rejection is recorded. The same command ID can run
+not a conflict (throttling, a DynamoDB `TransactionConflict`, an ambiguous write whose row never
+appeared), nothing says the state went stale, so the error is returned and no rejection is
+recorded. The same command ID can run
 again.
 
 Although a stale fence is transient by nature, the rejection is a durable, terminal outcome

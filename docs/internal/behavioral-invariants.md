@@ -494,10 +494,11 @@ error before any write and is never split.
   `compat/fixtures/outcomes.json`. There is no wait after the last attempt, and a Go wait ends with
   the context's error
 - A failure is classified by the transaction item that failed. An optimistic-concurrency conflict
-  at commit time (head update, event put, snapshot condition, engine-filled fence,
-  DynamoDB `TransactionConflict`) re-prepares the command: the outcome row is read again, the
-  aggregates are loaded again, and the handler or prepare step runs again from scratch. Throttling,
-  an ambiguous write whose row never appeared, and a load that found a sequence gap are retried
+  at commit time (head update, event put, snapshot condition, engine-filled fence) re-prepares the
+  command: the outcome row is read again, the aggregates are loaded again, and the handler or
+  prepare step runs again from scratch. Throttling, a DynamoDB `TransactionConflict` (another
+  transaction was writing one of the items, perhaps one no command changes), an ambiguous write
+  whose row never appeared, and a load that found a sequence gap are retried
   after a backoff too, but are transient, not conflicts: they never become a rejection. Everything
   else is returned at once, including an error a multi-stream prepare step makes up itself (only a
   failed `Read` it passes on is a load failure) and, in both languages, a command ID, digest, and

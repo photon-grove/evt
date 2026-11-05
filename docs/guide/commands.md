@@ -182,8 +182,9 @@ can't know whether your decision still holds.
 When the last attempt also conflicts, the engine persists a `stale-fence` rejection
 (`evt.RetriesExhaustedRejection`) as the command's outcome, so a replay of the ID gets the same
 answer. Submit a new command ID to try again. A transient failure that isn't a conflict (throttling,
-or an ambiguous write that never resolved) is retried the same way but returned as an error when the
-attempts run out.
+a DynamoDB `TransactionConflict` with another writer's transaction, or an ambiguous write that never
+resolved) is retried the same way but returned as an error when the attempts run out, with nothing
+recorded, so the same command ID can be sent again.
 
 This means handlers and `Prepare` functions can run more than once, and they have to be safe to
 repeat. The store resets the aggregate between attempts from a deep copy of its exported fields,
