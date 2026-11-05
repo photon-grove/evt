@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.13.0](https://github.com/photon-grove/evt/compare/go/v0.12.0...go/v0.13.0) (2026-11-05)
+
+
+### ⚠ BREAKING CHANGES
+
+* photon_evt::wire::postgres::OutcomeRow has three new public fields and is now #[non_exhaustive]; build one with OutcomeRow::from_outcome. RecordedIdentity is #[non_exhaustive] too; use RecordedIdentity::new.
+* **dynamo:** a DynamoDB TransactionConflict is no longer an optimistic conflict. Rust reports Error::Transient (is_conflict() is false), Go's dynamo.ErrTransactionConflict no longer matches evt.ErrOptimisticConflict, and TypeScript throws TransientError. Retry loops keyed on is_retryable, policy.IsTransient or isRetryable still retry it; ones keyed on the conflict checks no longer do.
+
+### Features
+
+* client-expected versions and configurable stale rejection codes ([#289](https://github.com/photon-grove/evt/issues/289)) ([ac78226](https://github.com/photon-grove/evt/commit/ac78226caf86d8f848b1a97b66e70ccb210000a5))
+* record the principal, command type and targets on command outcomes ([#286](https://github.com/photon-grove/evt/issues/286)) ([8e48d82](https://github.com/photon-grove/evt/commit/8e48d829cd195da3e16de643a0cb8a9eb6d3cd25))
+
+
+### Bug Fixes
+
+* **dynamo:** classify a TransactionConflict as transient, never a stale fence ([#288](https://github.com/photon-grove/evt/issues/288)) ([e49906e](https://github.com/photon-grove/evt/commit/e49906ead90b1c5e1813a2324a46f6b1eccc996b))
+* **go:** deep-copy promoted fields and classify a failed outcome reread ([#281](https://github.com/photon-grove/evt/issues/281)) ([05c9243](https://github.com/photon-grove/evt/commit/05c92431a2dbd0c7fc7a5d24bb94ae5c3f3dc2b3))
+
 ## [0.12.0](https://github.com/photon-grove/evt/compare/go/v0.11.1...go/v0.12.0) (2026-11-04)
 
 

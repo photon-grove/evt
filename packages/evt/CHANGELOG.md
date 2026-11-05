@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.2.0](https://github.com/photon-grove/evt/compare/evt-ts-v0.1.2...evt-ts-v0.2.0) (2026-11-05)
+
+
+### ⚠ BREAKING CHANGES
+
+* photon_evt::wire::postgres::OutcomeRow has three new public fields and is now #[non_exhaustive]; build one with OutcomeRow::from_outcome. RecordedIdentity is #[non_exhaustive] too; use RecordedIdentity::new.
+* **dynamo:** a DynamoDB TransactionConflict is no longer an optimistic conflict. Rust reports Error::Transient (is_conflict() is false), Go's dynamo.ErrTransactionConflict no longer matches evt.ErrOptimisticConflict, and TypeScript throws TransientError. Retry loops keyed on is_retryable, policy.IsTransient or isRetryable still retry it; ones keyed on the conflict checks no longer do.
+
+### Features
+
+* record the principal, command type and targets on command outcomes ([#286](https://github.com/photon-grove/evt/issues/286)) ([8e48d82](https://github.com/photon-grove/evt/commit/8e48d829cd195da3e16de643a0cb8a9eb6d3cd25))
+* **ts:** add the Store transaction API and run the multi-stream scenarios ([#293](https://github.com/photon-grove/evt/issues/293)) ([7242144](https://github.com/photon-grove/evt/commit/724214471a077b5b0868e645570b2e7ec46bfa6a))
+* **ts:** commit transactions with read fences on every backend ([#291](https://github.com/photon-grove/evt/issues/291)) ([b9e81ef](https://github.com/photon-grove/evt/commit/b9e81efb0257f72cb7f0cce018fc08db1c09ce8f))
+* **ts:** join the PostgreSQL cross-language run ([#285](https://github.com/photon-grove/evt/issues/285)) ([b5f15a1](https://github.com/photon-grove/evt/commit/b5f15a164440f9712838f039e152ee4577e6ffe7))
+
+
+### Bug Fixes
+
+* **dynamo:** classify a TransactionConflict as transient, never a stale fence ([#288](https://github.com/photon-grove/evt/issues/288)) ([e49906e](https://github.com/photon-grove/evt/commit/e49906ead90b1c5e1813a2324a46f6b1eccc996b))
+
 ## [0.1.2](https://github.com/photon-grove/evt/compare/evt-ts-v0.1.1...evt-ts-v0.1.2) (2026-11-04)
 
 
