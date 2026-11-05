@@ -4,6 +4,7 @@
 import {headActionSize, headFence, headUpdate} from './dynamodb/head.js'
 import {eventItem, itemSize, snapshotItem} from './dynamodb/item.js'
 import {FEATURES_PK, REBUILD_LOCK_PK} from './dynamodb/marker.js'
+import {outcomeItemSize} from './dynamodb/outcome.js'
 import {
   CommitTooLargeError,
   EvtError,
@@ -15,6 +16,7 @@ import {
   StreamHeadDriftError,
 } from './errors.js'
 import {type SerializedEvent, type SerializedSnapshot, eventId} from './event.js'
+import {type Outcome, checkCommitText, checkOutcome, storedOutcome} from './outcome.js'
 import {MAX_COMMIT_ITEM_BYTES} from './snapshots.js'
 import {compareUtf8} from './utf8.js'
 
@@ -44,7 +46,8 @@ export interface ProjectorGroup {
 
 /**
  * Everything a repository writes atomically for one command. A commit with no events is a no-op,
- * and its snapshot is ignored, unless it carries projector operations: then it's refused.
+ * and its snapshot is ignored, unless it carries projector operations, which are refused, or an
+ * outcome, which is written alone (an outcome-only commit).
  */
 export interface Commit {
   /** The stream the events are appended to. */
@@ -55,6 +58,11 @@ export interface Commit {
   snapshot?: NewSnapshot | null | undefined
   /** The operations the aggregate's projectors add, written first, in order. */
   projections?: readonly ProjectorGroup[] | null | undefined
+  /**
+   * The command outcome to record in the same transaction, as its last write, on an
+   * {@link OutcomeRepository}. Its event IDs are replaced by the commit's own.
+   */
+  outcome?: Outcome | null | undefined
 }
 
 /** Options every repository call takes. */
@@ -173,6 +181,12 @@ export interface TransactionCommit {
   streams: readonly Commit[]
   /** The streams read but not written, at most one fence per stream. */
   fences?: readonly ReadFence[] | null | undefined
+  /**
+   * The command outcome to record in the same transaction, after the fences, on an
+   * {@link OutcomeRepository}. Its event IDs are replaced by the ones the transaction writes. With
+   * no events it's an outcome-only commit: a rejection or an accepted no-op, still fenced.
+   */
+  outcome?: Outcome | null | undefined
 }
 
 /**
@@ -192,6 +206,31 @@ export interface TransactionalRepository extends Repository {
   commitTransaction(transaction: TransactionCommit, options?: CallOptions): Promise<void>
 }
 
+/**
+ * A repository that records command outcomes (ADR 0004, C3): it writes a commit's or a
+ * transaction's `outcome` as the transaction's last write, conditioned on no row existing for the
+ * command ID, and reads it back. It must:
+ *
+ * - refuse an outcome that fails {@link checkOutcome}, and a commit that carries one with a string
+ *   U+0000 or a lone surrogate would corrupt, before any request;
+ * - count the outcome item in the commit budget;
+ * - report a lost outcome condition as an {@link OutcomeConflictError}, which outranks every
+ *   stream and fence failure but not the control checks, and never as a conflict;
+ * - fail a commit that carries an outcome, and whose result is genuinely unknown (a timeout, a
+ *   lost connection or response, a server fault, an abort while the write was in flight, a
+ *   connection lost during `COMMIT`), with an {@link IndeterminateError}, and keep every
+ *   definitive refusal as it is;
+ * - read the row with a strongly consistent read, whatever its read-consistency setting, and
+ *   refuse a malformed one with `invalidRecord`.
+ */
+export interface OutcomeRepository extends TransactionalRepository {
+  /**
+   * The stored outcome of a command, or null when none is recorded. Null is never proof the
+   * command didn't apply: a commit may still land. The command ID is checked as a write checks it.
+   */
+  outcome(commandId: string, options?: CallOptions): Promise<Outcome | null>
+}
+
 /** A transaction as the backends write it. */
 export interface NormalizedTransaction {
   /** The streams it writes events to, sorted by entity ID bytes, without their projections. */
@@ -200,6 +239,8 @@ export interface NormalizedTransaction {
   readonly fences: readonly ReadFence[]
   /** The written streams' projector groups, in the order the streams were declared. */
   readonly projections: readonly ProjectorGroup[]
+  /** The outcome to record, with the event IDs the transaction writes, or null. */
+  readonly outcome: Outcome | null
 }
 
 /**
@@ -243,7 +284,65 @@ export function normalizeTransaction(transaction: TransactionCommit): Normalized
   const fences = (transaction.fences ?? []).filter((fence) => !writes.has(fence.entityId))
   fences.sort(byId)
 
-  return {streams, fences, projections}
+  const outcome = transaction.outcome ?? null
+  if (outcome === null) {
+    return {streams, fences, projections, outcome}
+  }
+
+  // A commit that records an outcome stores every string it names on every backend alike, so
+  // every stream and fence it lists is checked, written or not.
+  checkOutcome(outcome)
+  const listedFences = transaction.fences ?? []
+  checkCommitText(
+    transaction.streams.flatMap((stream) => stream.events),
+    [
+      ...transaction.streams.flatMap((stream) =>
+        stream.snapshot ? [stream.snapshot.entityType] : [],
+      ),
+      ...listedFences.map((fence) => fence.entityType),
+    ],
+    [...transaction.streams, ...listedFences].map((stream) => stream.entityId),
+  )
+  const events = streams.flatMap((stream) => stream.events)
+
+  return {
+    streams,
+    fences,
+    projections,
+    outcome: storedOutcome(
+      outcome,
+      events.map((event) => event.id),
+    ),
+  }
+}
+
+/** Whether a normalized transaction writes nothing at all: no stream, no fence and no outcome. */
+export function isEmptyTransaction(transaction: NormalizedTransaction): boolean {
+  return (
+    transaction.streams.length === 0 &&
+    transaction.fences.length === 0 &&
+    transaction.outcome === null
+  )
+}
+
+/**
+ * The transaction a single-stream commit writes. Its snapshot is dropped when it has no events,
+ * since a commit with no events ignores it.
+ */
+export function commitAsTransaction(commit: Commit): NormalizedTransaction {
+  validateCommit(commit)
+  checkNotReserved(commit.entityId)
+
+  const normalized = normalizeTransaction({
+    streams: commit.events.length > 0 ? [commit] : [],
+    outcome: commit.outcome,
+  })
+  // An outcome-only commit still names its stream, which is checked as a written one's is.
+  if (normalized.outcome !== null && commit.events.length === 0) {
+    checkCommitText([], commit.snapshot ? [commit.snapshot.entityType] : [], [commit.entityId])
+  }
+
+  return normalized
 }
 
 /**
@@ -378,23 +477,28 @@ export function validateCommit(commit: Commit): void {
 /**
  * The size of each action a commit's transaction carries, in order: the feature-marker and
  * rebuild-lock checks, the projector operations, then the stream's head update, its event puts,
- * and its snapshot put when it writes one. `ttl` gives the expiry an entity type's items carry, if
- * it's retained. Every backend budgets a commit by these sizes, so an oversized commit fails the
- * same way on each.
+ * and its snapshot put when it writes one, without an outcome. `ttl` gives the expiry an entity
+ * type's items carry, if it's retained. The backends budget through {@link transactionSizes},
+ * which also counts a commit's outcome put.
  */
 export function commitSizes(
   commit: Commit,
   ttl: (entityType: string) => number | undefined,
 ): number[] {
-  const transaction = {streams: [commit], fences: [], projections: commit.projections ?? []}
+  const transaction = {
+    streams: [commit],
+    fences: [],
+    projections: commit.projections ?? [],
+    outcome: null,
+  }
 
   return transactionSizes(transaction, ttl)
 }
 
 /**
  * The size of each action a transaction carries: the two control checks, every stream's projector
- * operations, every written stream's head update, event puts and snapshot put, then a check on
- * every fenced stream's head. Every backend budgets a transaction by these sizes.
+ * operations, every written stream's head update, event puts and snapshot put, a check on every
+ * fenced stream's head, then the outcome put. Every backend budgets a transaction by these sizes.
  */
 export function transactionSizes(
   transaction: NormalizedTransaction,
@@ -410,6 +514,9 @@ export function transactionSizes(
   }
   for (const fence of transaction.fences) {
     sizes.push(headActionSize(headFence(fence.entityId, fence.head)))
+  }
+  if (transaction.outcome) {
+    sizes.push(outcomeItemSize(transaction.outcome))
   }
 
   return sizes

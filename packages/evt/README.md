@@ -153,6 +153,17 @@ of `AbortSignal`, which the DOM library, `@types/node`, and Bun's and Deno's typ
   `TransactionalRepository`, whose `commitTransaction({streams, fences})` takes the streams and
   fences directly. A fence on an entity type with retention is refused with a
   `RetentionConflictError`.
+- **Outcome rows.** Every repository here is an `OutcomeRepository`. A commit or transaction that
+  carries an `outcome` writes the command's row as its last action, on the condition that no row
+  exists for the command ID. That covers an outcome-only commit, with no events, and `outcome()`
+  reads the row back with a strongly consistent read. The row's event IDs are the ones the commit
+  wrote, and its rejection is stored as `encodeRejection` writes it: keys sorted as in a Go map, and
+  numbers in the canonical text PostgreSQL's `jsonb` prints. A second row for the same ID fails
+  with an `OutcomeConflictError`, which outranks every stream and fence failure. When a commit
+  that carries an outcome fails without a known result, such as a timeout or a connection lost
+  during `COMMIT`, it fails with an `IndeterminateError`, because it may still land. Command IDs,
+  responses, rejections and recorded identities are bounded before any write. Running commands
+  with outcomes, replaying them and recovering ambiguous writes come in a later release.
 - **Sequences** are `bigint`s, because Go and Rust store them as 64-bit integers.
 
 Errors are `EvtError`s with a `code`. `isConflict` and `isRetryable` tell them apart.

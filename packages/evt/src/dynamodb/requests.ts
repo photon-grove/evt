@@ -2,7 +2,7 @@
 // format alone (storage format, "Writes"). Every commit opens with the two control checks, the
 // feature marker's and the rebuild lock's, then its projector operations, then writes each stream:
 // its head update, its event puts, and its snapshot put when it has one. A transaction then checks
-// the head of every stream it fenced.
+// the head of every stream it fenced, and a commit that records a command outcome puts it last.
 
 import type {SerializedEvent, SerializedSnapshot} from '../event.js'
 import {int64Argument, safeIntegerArgument} from '../fields.js'
@@ -12,6 +12,7 @@ import type {TransactItem} from './client.js'
 import {type HeadAction, headFence, headUpdate} from './head.js'
 import {HEAD_SORT_KEY, type Item, SNAPSHOT_SORT_KEY, eventItem, snapshotItem} from './item.js'
 import {FEATURES_PK, REBUILD_LOCK_PK} from './marker.js'
+import {OUTCOME_CONDITION, outcomeItem} from './outcome.js'
 import {DYNAMODB_BACKEND} from './views.js'
 
 /** The marker check of a writer that validated the manifest at version `:v`. */
@@ -115,7 +116,12 @@ export function commitTransaction(
     throw new RangeError('a commit transaction needs at least one event')
   }
 
-  const transaction = {streams: [commit], fences: [], projections: commit.projections ?? []}
+  const transaction = {
+    streams: [commit],
+    fences: [],
+    projections: commit.projections ?? [],
+    outcome: null,
+  }
 
   return transactionItems(table, transaction, markerVersion, () => ttl)
 }
@@ -126,6 +132,8 @@ export interface TransactionLayout {
   readonly projectorEnd: number
   readonly streams: readonly StreamLayout[]
   readonly fences: readonly {readonly index: number; readonly fence: ReadFence}[]
+  /** The outcome put's index, when the transaction records one. */
+  readonly outcome: number | null
 }
 
 /** A written stream's actions in a transaction. */
@@ -140,10 +148,11 @@ export interface StreamLayout {
 }
 
 /**
- * The actions of a normalized transaction that writes or fences at least one stream, in order:
- * the control checks, the projector operations in declaration order, every written stream's head
- * update, event puts and snapshot put, then a check on every fenced stream's head. `ttl` gives a
- * written stream's `ttl`s when it has retention. Exported for the compatibility fixtures.
+ * The actions of a normalized transaction that writes, fences or records something, in order: the
+ * control checks, the projector operations in declaration order, every written stream's head
+ * update, event puts and snapshot put, a check on every fenced stream's head, then the outcome
+ * put. `ttl` gives a written stream's `ttl`s when it has retention. Exported for the compatibility
+ * fixtures.
  */
 export function transactionItems(
   table: string,
@@ -179,7 +188,19 @@ export function buildTransaction(
     return {index: items.length - 1, fence}
   })
 
-  return {items, layout: {projectorEnd, streams, fences}}
+  let outcome: number | null = null
+  if (transaction.outcome) {
+    items.push({
+      Put: {
+        TableName: table,
+        Item: outcomeItem(transaction.outcome),
+        ConditionExpression: OUTCOME_CONDITION,
+      },
+    })
+    outcome = items.length - 1
+  }
+
+  return {items, layout: {projectorEnd, streams, fences, outcome}}
 }
 
 // A written stream's actions: its head update, its event puts and its snapshot put.

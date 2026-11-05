@@ -3,7 +3,8 @@
 // stream heads) in tables derived from the events table's name (storage format, "PostgreSQL").
 // Every commit is one READ COMMITTED transaction that runs the statements Go and Rust run, in
 // their order: the entity lock, the feature-marker check under its shared lock, the rebuild-lock
-// assertion under its own, the head statement, the event inserts, then the snapshot upsert.
+// assertion under its own, the outcome probe, the head statement, the event inserts, the snapshot
+// upsert, then the outcome insert.
 //
 // Each statement of a transaction needs the one before it, so they await in loops on purpose.
 /* oxlint-disable no-await-in-loop */
@@ -14,6 +15,8 @@ import {
   EvtError,
   FenceConflictError,
   HistoryDependentProjectionError,
+  IndeterminateError,
+  OutcomeConflictError,
   RebuildInProgressError,
   SequenceGapError,
   StreamHeadDriftError,
@@ -32,23 +35,26 @@ import {
 } from '../features.js'
 import {int64Argument} from '../fields.js'
 import {decodeMetadata, emptyMetadata, encodeMetadata} from '../metadata.js'
+import {type Outcome, checkCommandId} from '../outcome.js'
 import {
   type CallOptions,
   type Commit,
   type NormalizedTransaction,
+  type OutcomeRepository,
   type StoreInitializer,
   type TransactionCommit,
-  type TransactionalRepository,
   checkBudget,
   checkFenceRetention,
   checkNotReserved,
+  commitAsTransaction,
+  isEmptyTransaction,
   normalizeTransaction,
   rankFailures,
   transactionSizes,
-  validateCommit,
 } from '../repository.js'
 import {compareUtf8} from '../utf8.js'
 import type {PgClient, PgConnection, PgQueryable} from './client.js'
+import {insertOutcomeSql, outcomeFromRow, outcomeRow, selectOutcomeSql} from './outcome.js'
 import {
   ENGINE_LOCK_EXCLUSIVE,
   ENGINE_LOCK_SHARED,
@@ -57,6 +63,7 @@ import {
   SCHEMA_LOCK,
   featuresLockKey,
   featuresTable,
+  outcomesTable,
   pgTables,
   rebuildGenerationTable,
   rebuildLockKey,
@@ -87,6 +94,13 @@ const EVENT_COLUMNS =
 // serialization failure and a detected deadlock.
 const TRANSIENT_STATES = new Set(['40001', '40P01'])
 
+// A unique violation, which the outcome insert raises when another writer recorded the outcome.
+const UNIQUE_VIOLATION = '23505'
+
+// The shape of a SQLSTATE: five digits or capital letters. No class starts with E, so a Node
+// system error code such as EPIPE never matches.
+const SQLSTATE = /^[0-9A-DF-Z][0-9A-Z]{4}$/
+
 // One statement inside a transaction: it checks the signal first, so an abort rolls back.
 type Statement = (text: string, values?: (string | null)[]) => Promise<Row[]>
 
@@ -105,7 +119,7 @@ type Row = Record<string, unknown>
  * it validated. Every commit and snapshot write reads the manifest again under a shared lock that
  * no declaration can take while the write is open, and validates it again when it changed.
  */
-export class PgRepository implements TransactionalRepository, StoreInitializer {
+export class PgRepository implements OutcomeRepository, StoreInitializer {
   readonly #client: PgClient
   readonly #tables: PgTables
 
@@ -133,7 +147,7 @@ export class PgRepository implements TransactionalRepository, StoreInitializer {
    * ({@link schemaDdl}), under the schema lock they take. Safe to call on every start.
    */
   async ensureSchema(options?: CallOptions): Promise<void> {
-    await this.#transaction(options, async (run) => {
+    await this.#transaction(options, false, async (run) => {
       await run(SCHEMA_LOCK, [this.#tables.events])
       for (const statement of statements(schemaDdl(this.#tables))) {
         await run(statement)
@@ -148,7 +162,7 @@ export class PgRepository implements TransactionalRepository, StoreInitializer {
    */
   async initialize(options?: CallOptions): Promise<boolean> {
     try {
-      return await this.#transaction(options, async (run) => {
+      return await this.#transaction(options, false, async (run) => {
         await run(ENGINE_LOCK_EXCLUSIVE, [featuresLockKey(this.#tables)])
         const manifest = await this.#readManifest(run)
         checkSupported(manifest)
@@ -176,25 +190,51 @@ export class PgRepository implements TransactionalRepository, StoreInitializer {
 
   async commit(commit: Commit, options?: CallOptions): Promise<void> {
     options?.signal?.throwIfAborted()
-    validateCommit(commit)
-    checkNotReserved(commit.entityId)
-    if (commit.events.length > 0) {
-      await this.#write(normalizeTransaction({streams: [commit]}), options)
+    const normalized = commitAsTransaction(commit)
+    if (!isEmptyTransaction(normalized)) {
+      await this.#write(normalized, options)
     }
   }
 
   /**
    * Commits every stream and checks every fence in one transaction, in the order Go and Rust run
    * it: every stream's entity lock, written and fenced, in ascending entity-ID byte order; the
-   * marker check, the fences' retention and the rebuild-lock assertion; every head statement and
-   * fence read, ranked; the event inserts; then the snapshot upserts.
+   * marker check, the fences' retention and the rebuild-lock assertion; the probe for a recorded
+   * outcome; every head statement and fence read, ranked; the event inserts; the snapshot upserts;
+   * then the outcome insert.
    */
   async commitTransaction(transaction: TransactionCommit, options?: CallOptions): Promise<void> {
     options?.signal?.throwIfAborted()
     const normalized = normalizeTransaction(transaction)
-    if (normalized.streams.length > 0 || normalized.fences.length > 0) {
+    if (!isEmptyTransaction(normalized)) {
       await this.#write(normalized, options)
     }
+  }
+
+  async outcome(commandId: string, options?: CallOptions): Promise<Outcome | null> {
+    options?.signal?.throwIfAborted()
+    checkCommandId(commandId)
+
+    const rows = await this.#read(selectOutcomeSql(this.#tables), [commandId])
+    const row = rows[0]
+    if (row === undefined) {
+      return null
+    }
+
+    const response = nullableText(row, 'response')
+
+    return outcomeFromRow({
+      command_id: text(row, 'command_id'),
+      status: text(row, 'status'),
+      digest: text(row, 'digest'),
+      response: response === null ? null : unhex(response),
+      events: text(row, 'events'),
+      rejection: nullableText(row, 'rejection'),
+      code: nullableText(row, 'code'),
+      command_type: nullableText(row, 'command_type'),
+      targets: nullableText(row, 'targets'),
+      principal: nullableText(row, 'principal'),
+    })
   }
 
   async #write(transaction: NormalizedTransaction, options?: CallOptions): Promise<void> {
@@ -211,7 +251,8 @@ export class PgRepository implements TransactionalRepository, StoreInitializer {
     checkBudget(transactionSizes(transaction, () => undefined))
     await this.#ensureStreamHeads(options)
 
-    await this.#transaction(options, async (run) => {
+    const {outcome} = transaction
+    await this.#transaction(options, outcome !== null, async (run) => {
       // Each stream once, in the bytewise order that also pins the transaction, so two
       // transactions that share streams lock them in the same sequence and can't deadlock.
       const ids = [...transaction.streams, ...transaction.fences].map(({entityId}) => entityId)
@@ -226,6 +267,18 @@ export class PgRepository implements TransactionalRepository, StoreInitializer {
       const retention = manifest.retention
       checkFenceRetention(transaction, (entityType) => retention.includes(entityType))
       await this.#assertNoRebuildLock(run)
+
+      // A recorded outcome outranks every stream failure, as the outcome put does on DynamoDB. The
+      // insert's unique violation still settles a real race.
+      if (outcome !== null) {
+        const recorded = await run(
+          `SELECT 1 AS recorded FROM ${outcomesTable(this.#tables)} WHERE command_id = $1`,
+          [outcome.commandId],
+        )
+        if (recorded.length > 0) {
+          throw new OutcomeConflictError(outcome.commandId)
+        }
+      }
 
       // Every head statement and fence read runs before any failure is reported, so the ranking
       // sees them all.
@@ -269,7 +322,35 @@ export class PgRepository implements TransactionalRepository, StoreInitializer {
       for (const stream of transaction.streams) {
         await this.#writeCommitSnapshot(run, stream)
       }
+      if (outcome !== null) {
+        await this.#insertOutcome(run, outcome)
+      }
     })
+  }
+
+  // The outcome insert, the commit's last statement. A unique violation is a lost race.
+  async #insertOutcome(run: Statement, outcome: Outcome): Promise<void> {
+    const row = outcomeRow(outcome)
+    try {
+      await run(insertOutcomeSql(this.#tables), [
+        row.command_id,
+        row.status,
+        row.digest,
+        row.response === null ? null : hex(row.response),
+        row.events,
+        row.rejection,
+        row.code,
+        row.command_type,
+        row.targets,
+        row.principal,
+      ])
+    } catch (error) {
+      if (sqlState(error) === UNIQUE_VIOLATION) {
+        throw new OutcomeConflictError(outcome.commandId)
+      }
+
+      throw error
+    }
   }
 
   // A stream's event inserts, after its head statement passed. A row that already exists is an
@@ -378,7 +459,7 @@ export class PgRepository implements TransactionalRepository, StoreInitializer {
     const eventSequence = int64Argument(snapshot.eventSequence, 'snapshot.eventSequence')
     await this.#ensureStreamHeads(options)
 
-    return this.#transaction(options, async (run) => {
+    return this.#transaction(options, false, async (run) => {
       const {entityId} = snapshot
       await run(ENTITY_LOCK, [entityId])
       await this.#checkManifest(run)
@@ -405,7 +486,7 @@ export class PgRepository implements TransactionalRepository, StoreInitializer {
     // One transaction under the manifest's shared lock, held through the delete, so no
     // declaration lands between the check and the delete it authorizes. It never declares
     // stream-heads, and never touches the head.
-    return this.#transaction(options, async (run) => {
+    return this.#transaction(options, false, async (run) => {
       await run(ENGINE_LOCK_SHARED, [featuresLockKey(this.#tables)])
       const manifest = await this.#readManifest(run)
       checkWritable(manifest)
@@ -677,8 +758,11 @@ export class PgRepository implements TransactionalRepository, StoreInitializer {
 
   // Runs `work` in one READ COMMITTED transaction on a connection of its own, and commits it. A
   // failure, an abort included, rolls it back. A serialization failure or a deadlock is transient.
+  // For a commit that records an outcome (`indeterminate`), a `COMMIT` whose result is unknown is
+  // an IndeterminateError.
   async #transaction<T>(
     options: CallOptions | undefined,
+    indeterminate: boolean,
     work: (run: Statement) => Promise<T>,
   ): Promise<T> {
     const signal = options?.signal
@@ -686,7 +770,7 @@ export class PgRepository implements TransactionalRepository, StoreInitializer {
 
     const client = this.#client
     if (client.connect === undefined) {
-      return serialize(client, () => inTransaction(client, signal, work))
+      return serialize(client, () => inTransaction(client, signal, indeterminate, work))
     }
 
     const connection = await client.connect()
@@ -702,7 +786,7 @@ export class PgRepository implements TransactionalRepository, StoreInitializer {
 
     let broken: Error | undefined
     try {
-      return await inTransaction(connection, signal, work, (error) => {
+      return await inTransaction(connection, signal, indeterminate, work, (error) => {
         broken = error
       })
     } finally {
@@ -725,9 +809,13 @@ function serialize<T>(client: PgQueryable, task: () => Promise<T>): Promise<T> {
 }
 
 // One transaction on one connection. `broken` hears of a connection that failed to roll back.
+// With `indeterminate`, a COMMIT that fails without a database error (the connection dropped while
+// it was in flight) and an abort while it was in flight are IndeterminateErrors: the transaction
+// may have applied.
 async function inTransaction<T>(
   connection: PgQueryable | PgConnection,
   signal: AbortSignal | undefined,
+  indeterminate: boolean,
   work: (run: Statement) => Promise<T>,
   broken?: (error: Error) => void,
 ): Promise<T> {
@@ -738,10 +826,12 @@ async function inTransaction<T>(
   }
 
   let result: T
+  let committing = false
   try {
     await connection.query('START TRANSACTION ISOLATION LEVEL READ COMMITTED')
     result = await work(run)
     signal?.throwIfAborted()
+    committing = true
     await connection.query('COMMIT')
   } catch (error) {
     try {
@@ -750,20 +840,34 @@ async function inTransaction<T>(
       broken?.(rollback instanceof Error ? rollback : new Error(String(rollback)))
     }
 
+    if (committing && indeterminate && sqlState(error) === null) {
+      throw new IndeterminateError({cause: error})
+    }
+
     throw transient(error)
   }
 
   // An abort while the COMMIT was in flight rejects too, though the commit may have applied, as
   // CallOptions promises: there is nothing left to roll back.
+  if (indeterminate && signal?.aborted) {
+    throw new IndeterminateError({cause: signal.reason})
+  }
   signal?.throwIfAborted()
 
   return result
 }
 
+// The SQLSTATE of an error PostgreSQL raised, or null for any other error.
+function sqlState(error: unknown): string | null {
+  const code = typeof error === 'object' && error !== null ? (error as {code?: unknown}).code : null
+
+  return typeof code === 'string' && SQLSTATE.test(code) ? code : null
+}
+
 // A driver error PostgreSQL raised for a rollback a retry may not hit again, as a TransientError.
 function transient(error: unknown): unknown {
-  const code = typeof error === 'object' && error !== null ? (error as {code?: unknown}).code : null
-  if (typeof code === 'string' && TRANSIENT_STATES.has(code)) {
+  const code = sqlState(error)
+  if (code !== null && TRANSIENT_STATES.has(code)) {
     return new TransientError(`PostgreSQL rolled the transaction back (${code})`, {cause: error})
   }
 
@@ -787,6 +891,11 @@ function rowsOf(result: {rows?: readonly unknown[]} | undefined): Row[] {
   }
 
   return rows as Row[]
+}
+
+// A text column of a row that may be NULL.
+function nullableText(row: Row, column: string): string | null {
+  return row[column] === null ? null : text(row, column)
 }
 
 // A text column of a row.

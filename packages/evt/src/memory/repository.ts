@@ -1,7 +1,7 @@
 // The in-memory repository. It enforces the storage contract the way the live backends do: a head
 // per stream that every commit raises, optimistic concurrency against it, the feature marker and
-// the rebuild-lock check, and the same failure classification and transaction budget. It's for
-// tests and local development.
+// the rebuild-lock check, command outcomes, and the same failure classification and transaction
+// budget. It's for tests and local development.
 
 import {
   ConflictError,
@@ -9,11 +9,14 @@ import {
   EvtError,
   FenceConflictError,
   HistoryDependentProjectionError,
+  OutcomeConflictError,
   RebuildInProgressError,
   SequenceGapError,
   StreamHeadDriftError,
   StreamHeadsNotMigratedError,
 } from '../errors.js'
+import type {Item} from '../dynamodb/item.js'
+import {outcomeFromItem, outcomeItem} from '../dynamodb/outcome.js'
 import type {SerializedEvent, SerializedSnapshot} from '../event.js'
 import {
   type FeatureManifest,
@@ -25,21 +28,23 @@ import {
 } from '../features.js'
 import {int64Argument} from '../fields.js'
 import type {Metadata} from '../metadata.js'
+import {type Outcome, checkCommandId} from '../outcome.js'
 import {
   type CallOptions,
   type Commit,
   type NormalizedTransaction,
+  type OutcomeRepository,
   type ReadFence,
   type StoreInitializer,
   type TransactionCommit,
-  type TransactionalRepository,
   checkBudget,
   checkFenceRetention,
   checkNotReserved,
+  commitAsTransaction,
+  isEmptyTransaction,
   normalizeTransaction,
   rankFailures,
   transactionSizes,
-  validateCommit,
 } from '../repository.js'
 
 interface Stream {
@@ -82,9 +87,12 @@ let controlsOf: (repo: MemRepository) => Controls
  * on its feature manifest, so {@link initialize} is needed only where code treats every backend
  * alike.
  */
-export class MemRepository implements TransactionalRepository, StoreInitializer {
+export class MemRepository implements OutcomeRepository, StoreInitializer {
   readonly #streams = new Map<string, Stream>()
   readonly #controls: Controls = {manifest: null, rebuild: {generation: 0n, lock: null}}
+  // The command outcomes by command ID, kept as the DynamoDB item, so a read decodes and
+  // validates exactly what a live backend's would.
+  readonly #outcomes = new Map<string, Item>()
 
   async initialize(options?: CallOptions): Promise<boolean> {
     options?.signal?.throwIfAborted()
@@ -100,24 +108,31 @@ export class MemRepository implements TransactionalRepository, StoreInitializer 
 
   async commit(commit: Commit, options?: CallOptions): Promise<void> {
     options?.signal?.throwIfAborted()
-    validateCommit(commit)
-    checkNotReserved(commit.entityId)
-    if (commit.events.length > 0) {
-      this.#write(normalizeTransaction({streams: [commit]}))
+    const normalized = commitAsTransaction(commit)
+    if (!isEmptyTransaction(normalized)) {
+      this.#write(normalized)
     }
   }
 
   async commitTransaction(transaction: TransactionCommit, options?: CallOptions): Promise<void> {
     options?.signal?.throwIfAborted()
     const normalized = normalizeTransaction(transaction)
-    if (normalized.streams.length > 0 || normalized.fences.length > 0) {
+    if (!isEmptyTransaction(normalized)) {
       this.#write(normalized)
     }
   }
 
+  async outcome(commandId: string, options?: CallOptions): Promise<Outcome | null> {
+    options?.signal?.throwIfAborted()
+    checkCommandId(commandId)
+    const item = this.#outcomes.get(commandId)
+
+    return item === undefined ? null : outcomeFromItem(item)
+  }
+
   // Writes a transaction, or refuses it with nothing written, in the order the live backends
-  // check: the budget, the marker and the fences' retention, the rebuild lock, then every stream
-  // and fence, ranked.
+  // check: the budget, the marker and the fences' retention, the rebuild lock, a recorded outcome,
+  // then every stream and fence, ranked.
   #write(transaction: NormalizedTransaction): void {
     // Every backend budgets a commit the same way, so an oversized one fails before any write.
     checkBudget(transactionSizes(transaction, () => undefined))
@@ -130,6 +145,12 @@ export class MemRepository implements TransactionalRepository, StoreInitializer 
     const {rebuild} = this.#controls
     if (rebuild.lock !== null || rebuild.generation % 2n !== 0n) {
       throw new RebuildInProgressError()
+    }
+
+    // A recorded outcome outranks every stream failure, as the outcome put does on DynamoDB.
+    const {outcome} = transaction
+    if (outcome !== null && this.#outcomes.has(outcome.commandId)) {
+      throw new OutcomeConflictError(outcome.commandId)
     }
 
     const failures: EvtError[] = []
@@ -164,6 +185,7 @@ export class MemRepository implements TransactionalRepository, StoreInitializer 
 
       return {entityId: commit.entityId, events, last, snapshot}
     })
+    const recorded = outcome && outcomeItem(outcome)
 
     for (const {entityId, events, last, snapshot} of writes) {
       const held = this.#streams.get(entityId) ?? emptyStream()
@@ -175,6 +197,9 @@ export class MemRepository implements TransactionalRepository, StoreInitializer 
         held.snapshot = snapshot
       }
       this.#streams.set(entityId, held)
+    }
+    if (outcome !== null && recorded !== null) {
+      this.#outcomes.set(outcome.commandId, recorded)
     }
   }
 

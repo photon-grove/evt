@@ -16,6 +16,8 @@ import {
   FeatureManifestChangedError,
   FenceConflictError,
   HistoryDependentProjectionError,
+  IndeterminateError,
+  OutcomeConflictError,
   RebuildInProgressError,
   SequenceGapError,
   StoreNotInitializedError,
@@ -32,21 +34,23 @@ import {
   declaresStreamHeads,
 } from '../features.js'
 import {int64Argument} from '../fields.js'
+import {type Outcome, checkCommandId} from '../outcome.js'
 import {
   type CallOptions,
   type Commit,
   type NormalizedTransaction,
+  type OutcomeRepository,
   type StoreInitializer,
   type TransactionCommit,
-  type TransactionalRepository,
   checkBudget,
   checkFenceRetention,
   checkNotReserved,
+  commitAsTransaction,
+  isEmptyTransaction,
   isReserved,
   normalizeTransaction,
   rankFailures,
   transactionSizes,
-  validateCommit,
 } from '../repository.js'
 import type {DynamoClient, Page, RequestOptions, TransactItem} from './client.js'
 import {
@@ -60,6 +64,7 @@ import {
   ttlFromItem,
 } from './item.js'
 import {FEATURES_PK, manifestFromItem, markerItem} from './marker.js'
+import {OUTCOME_SORT_KEY, outcomeFromItem, outcomeKey} from './outcome.js'
 import {DYNAMODB_BACKEND, transactItemSize} from './views.js'
 import {
   type CommitTtl,
@@ -129,7 +134,7 @@ const MAX_SNAPSHOT_GUARD_RETRIES = 4
  * declares a feature, the next write fails, validates the manifest again, and either refuses an
  * unsupported feature or fails once with a retryable {@link FeatureManifestChangedError}.
  */
-export class DynamoRepository implements TransactionalRepository, StoreInitializer {
+export class DynamoRepository implements OutcomeRepository, StoreInitializer {
   readonly #client: DynamoClient
   readonly #table: string
   readonly #lazy: boolean
@@ -193,25 +198,46 @@ export class DynamoRepository implements TransactionalRepository, StoreInitializ
 
   async commit(commit: Commit, options?: CallOptions): Promise<void> {
     options?.signal?.throwIfAborted()
-    validateCommit(commit)
-    checkNotReserved(commit.entityId)
-    if (commit.events.length > 0) {
-      await this.#write(normalizeTransaction({streams: [commit]}), options)
+    const normalized = commitAsTransaction(commit)
+    if (!isEmptyTransaction(normalized)) {
+      await this.#write(normalized, options)
     }
   }
 
   /**
    * Commits every stream and checks every fence in one `TransactWriteItems` call: the control
-   * checks, the projector operations, each written stream's actions, then a check on each fenced
-   * stream's head. A fence on a type this repository retains is refused before any request, and
-   * one on a type the store's manifest retains after the marker's validation.
+   * checks, the projector operations, each written stream's actions, a check on each fenced
+   * stream's head, then the outcome put. A fence on a type this repository retains is refused
+   * before any request, and one on a type the store's manifest retains after the marker's
+   * validation.
    */
   async commitTransaction(transaction: TransactionCommit, options?: CallOptions): Promise<void> {
     options?.signal?.throwIfAborted()
     const normalized = normalizeTransaction(transaction)
-    if (normalized.streams.length > 0 || normalized.fences.length > 0) {
+    if (!isEmptyTransaction(normalized)) {
       await this.#write(normalized, options)
     }
+  }
+
+  /**
+   * The command's outcome row, read strongly consistent whatever {@link consistentRead} says: an
+   * eventually consistent miss would run a committed command again.
+   */
+  async outcome(commandId: string, options?: CallOptions): Promise<Outcome | null> {
+    options?.signal?.throwIfAborted()
+    checkCommandId(commandId)
+
+    const output = await this.#client.getItem(
+      {
+        TableName: this.#table,
+        Key: {pk: {S: outcomeKey(commandId)}, sk: {N: OUTCOME_SORT_KEY.toString()}},
+        ConsistentRead: true,
+      },
+      requestOptions(options),
+    )
+    const item = output.Item as Item | undefined
+
+    return item && Object.keys(item).length > 0 ? outcomeFromItem(item) : null
   }
 
   async #write(transaction: NormalizedTransaction, options?: CallOptions): Promise<void> {
@@ -252,7 +278,7 @@ export class DynamoRepository implements TransactionalRepository, StoreInitializ
     try {
       await this.#client.transactWriteItems({TransactItems: items}, request)
     } catch (error) {
-      throw await this.#classifyCommit(layout, error, request)
+      throw await this.#classifyCommit(transaction, layout, error, request)
     }
   }
 
@@ -573,13 +599,18 @@ export class DynamoRepository implements TransactionalRepository, StoreInitializ
   // Then every failed stream and fence is classified, and the ranking reports the first drift, else
   // the first gap, else the first other failure, in transaction order.
   async #classifyCommit(
+    transaction: NormalizedTransaction,
     layout: TransactionLayout,
     error: unknown,
     request: RequestOptions,
   ): Promise<unknown> {
     const codes = cancellationCodes(error)
     if (codes === null) {
-      return error
+      // A commit that records an outcome, and whose result is unknown, may still land: the store
+      // settles it by reading the outcome row.
+      return transaction.outcome !== null && resultUnknown(error)
+        ? new IndeterminateError({cause: error})
+        : error
     }
 
     const failed = codes.indexOf(CONDITION_FAILED)
@@ -607,6 +638,12 @@ export class DynamoRepository implements TransactionalRepository, StoreInitializ
     }
     if (codes[1] === CONDITION_FAILED) {
       return new RebuildInProgressError()
+    }
+
+    // A lost outcome put outranks every stream and fence failure: the command already ran, and
+    // the store resolves it through the winner's row. It's never a conflict.
+    if (layout.outcome !== null && codes[layout.outcome] === CONDITION_FAILED) {
+      return new OutcomeConflictError(transaction.outcome!.commandId)
     }
 
     const failures: EvtError[] = []
@@ -1163,6 +1200,33 @@ function cancellationCodes(error: unknown): string[] | null {
 
     return typeof code === 'string' ? code : ''
   })
+}
+
+// The SDK errors that leave a commit's result unknown, whatever their HTTP status.
+const UNKNOWN_RESULT = new Set([
+  'InternalServerError',
+  'ServiceUnavailable',
+  'TransactionInProgressException',
+  'IdempotentParameterMismatchException',
+])
+
+// Whether a failed commit may have applied: anything but a refusal DynamoDB answered with a 4xx
+// status. A timeout, a lost connection, an unreadable response, an abort while the call was in
+// flight and any 5xx may follow a transaction that applied.
+function resultUnknown(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) {
+    return true
+  }
+
+  const {name, $metadata} = error as {name?: unknown; $metadata?: {httpStatusCode?: unknown}}
+  if (typeof name === 'string' && UNKNOWN_RESULT.has(name)) {
+    return true
+  }
+
+  const status = $metadata?.httpStatusCode
+
+  // A 2xx whose body couldn't be read carries its real status: the transaction may have applied.
+  return typeof status !== 'number' || status < 400 || status >= 500
 }
 
 function isConditionalCheckFailed(error: unknown): boolean {
