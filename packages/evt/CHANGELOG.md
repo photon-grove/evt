@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/photon-grove/evt/compare/evt-ts-v0.2.0...evt-ts-v0.2.1) (2026-11-05)
+
+
+### Features
+
+* **ts:** record command outcome rows on every backend ([#294](https://github.com/photon-grove/evt/issues/294)) ([cce0bc1](https://github.com/photon-grove/evt/commit/cce0bc1d7fd92cb42867bd84652e026b0501b4a7))
+
 ## [0.2.0](https://github.com/photon-grove/evt/compare/evt-ts-v0.1.2...evt-ts-v0.2.0) (2026-11-05)
 
 

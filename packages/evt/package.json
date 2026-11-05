@@ -1,6 +1,6 @@
 {
   "name": "@photon-grove/evt",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Event sourcing for TypeScript, wire-compatible with the Go and Rust evt implementations.",
   "keywords": [
     "event-sourcing",
