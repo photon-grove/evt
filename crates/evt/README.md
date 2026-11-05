@@ -223,10 +223,13 @@ be safe to repeat, and a command passed to `execute_with_outcome` must be `Clone
 attempt also conflicts, the engine records `Rejection::retries_exhausted(attempts)` (code
 `stale-fence`), and a new command ID is the way to try again. For multi-stream commands,
 `Transaction::begin_command` must be the first call on the transaction (`Error::CommandOrder`
-otherwise), followed by `commit_with_outcome` or `reject`, attempting once. The
-[commands guide](https://github.com/photon-grove/evt/blob/main/docs/guide/commands.md) covers
-identity, ambiguous writes and fence-aware retry in full, and the rules are the same in both
-languages.
+otherwise), followed by `commit_with_outcome` or `reject`, attempting once. A client's version of a
+stream the command reads is declared with `Transaction::expect(entity_id, head)`: an acceptance on
+a stream that has moved records the `stale-version` rejection instead, and a domain rejection still
+wins. `OutcomeConfig::with_stale_version_code` and `with_stale_fence_code` replace the engine's
+codes. The [commands guide](https://github.com/photon-grove/evt/blob/main/docs/guide/commands.md)
+covers identity, ambiguous writes, fence-aware retry and client-expected versions in full, and the
+rules are the same in both languages.
 
 ```rust
 use photon_evt::{

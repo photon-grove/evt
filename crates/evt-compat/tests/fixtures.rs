@@ -15,8 +15,9 @@ use photon_evt::{
     Aggregate, CommandIdentity, DigestInput, EntityId, EntityType, Error, EventId, EventSequence,
     EventType, EventVersion, FeatureManifest, FeatureMarker, MAX_COMMAND_ID_BYTES,
     MAX_COMMIT_ITEM_BYTES, MAX_OUTCOME_BYTES, MemRepository, Metadata, Outcome, Rejection,
-    RejectionCode, RetryPolicy, SerializedEvent, SerializedSnapshot, canonical_digest_bytes,
-    canonical_numbers, default_digest, json, snapshot_commit_size, snapshot_events_due,
+    RejectionCode, RetryPolicy, SerializedEvent, SerializedSnapshot, StaleVersion,
+    canonical_digest_bytes, canonical_numbers, default_digest, json, snapshot_commit_size,
+    snapshot_events_due,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -625,6 +626,7 @@ struct RetryDefaults {
     base_delay_ms: u64,
     max_delay_ms: u64,
     stale_code: String,
+    stale_version_code: String,
 }
 
 #[derive(Deserialize)]
@@ -715,6 +717,10 @@ fn retry_defaults_match_go() {
     );
     assert_eq!(policy.max_delay, Duration::from_millis(retry.max_delay_ms));
     assert_eq!(RejectionCode::STALE_FENCE, retry.stale_code.as_str());
+    assert_eq!(
+        RejectionCode::STALE_VERSION,
+        retry.stale_version_code.as_str()
+    );
 }
 
 /// The stale-fence rejections the engine records are built, not just decoded: Rust's constructors
@@ -739,6 +745,24 @@ fn stale_fence_rejections_match_go_byte_for_byte() {
     assert_eq!(
         Rejection::retries_exhausted(5).encode().unwrap(),
         stored("rejected stale fence, retries exhausted")
+    );
+
+    // Out of order on purpose: the constructor sorts by entity ID, as Go's does.
+    let stale_version = Rejection::stale_version(&[
+        StaleVersion {
+            entity_id: EntityId::new("profile#u-1"),
+            expected: EventSequence(4),
+            actual: EventSequence(6),
+        },
+        StaleVersion {
+            entity_id: EntityId::new("claim#ada"),
+            expected: EventSequence(0),
+            actual: EventSequence(1),
+        },
+    ]);
+    assert_eq!(
+        stale_version.encode().unwrap(),
+        stored("rejected stale version")
     );
 }
 
@@ -766,6 +790,7 @@ fn a_rejection_lists_events_only_when_it_committed_some() {
         "rejected",
         "rejected stale fence",
         "rejected stale fence, retries exhausted",
+        "rejected stale version",
     ] {
         let plain = row(plain);
 

@@ -425,8 +425,9 @@ error before any write and is never split.
 
 - A domain rejection is `Rejection { code, message, details }`, stored as the JSON
   `{"code":…,"message":…,"details":…}` (`details` an object or `null`) with the code repeated in
-  the row's `code` attribute. Engine codes are `not-found`, `bad-command`, and `stale-fence`;
-  application codes are free-form. A rejected outcome is terminal for its digest and a retried
+  the row's `code` attribute. Engine codes are `not-found`, `bad-command`, `stale-fence`, and
+  `stale-version`, and a store may replace the code (never the message or details) of the
+  engine's stale-fence and stale-version rejections; application codes are free-form. A rejected outcome is terminal for its digest and a retried
   command replays it verbatim without running the handler
 - Numbers in `details` are stored in the canonical text PostgreSQL's `jsonb` prints (no exponent,
   the literal's scale less its exponent, no sign on zero), so every backend returns the same number
@@ -487,6 +488,15 @@ error before any write and is never split.
 - A failed caller-stamped fence fails fast: the engine records the `stale-fence` rejection
   immediately, without re-preparing or waiting, because it cannot know the caller's decision still
   holds. A caller-stamped fence that passed does not turn another item's conflict into a rejection
+- A client-expected head (Go `Transaction.Expect`, Rust `Transaction::expect`) is checked only on
+  acceptance, before any write: a mismatch records the stale-version rejection (details
+  `{"streams":[{"actual","entityId","expected"}]}` sorted by entity ID) through the fenced
+  rejection commit instead of the acceptance, a domain rejection never consults it, and accepting
+  with an expectation for an unread stream is an invalid argument that records nothing.
+  Declaring one needs outcomes in both languages (Rust never ignores it on a plain transaction),
+  and an empty replacement code keeps the engine's default in both Every attempt
+  re-checks against its own load, so an acceptance never commits after an expected stream moved.
+  Expectations are not part of the identity digest
 - Exhausted attempts on a conflict persist a `stale-fence` rejection (message `the state this
   command was decided on kept changing; retries were exhausted`, details `{"attempts": N}`) as the
   command's outcome through the outcome-only transaction, so a replay of the command ID returns

@@ -35,6 +35,10 @@ var errOutcomesNeedCommand = &evt.InvalidArgumentError{
 type outcomeConfig struct {
 	digester     evt.Digester
 	recoveryWait time.Duration
+
+	// staleFenceCode and staleVersionCode are the codes of the engine's stale rejections.
+	staleFenceCode   evt.RejectionCode
+	staleVersionCode evt.RejectionCode
 }
 
 // OutcomeOption configures command outcomes on a store.
@@ -61,6 +65,29 @@ func WithRecoveryWait(wait time.Duration) OutcomeOption {
 	}
 }
 
+// WithStaleFenceCode replaces the code of the stale-fence rejections the engine records, a failed
+// caller-stamped fence and exhausted retries, which is evt.RejectionStaleFence by default. Use it
+// to keep an application's existing wire code; an empty code keeps the default. The message and
+// details are unchanged.
+func WithStaleFenceCode(code evt.RejectionCode) OutcomeOption {
+	return func(config *outcomeConfig) {
+		if code != "" {
+			config.staleFenceCode = code
+		}
+	}
+}
+
+// WithStaleVersionCode replaces the code of the stale-version rejection the engine records when a
+// client-expected head went stale (Transaction.Expect), which is evt.RejectionStaleVersion by
+// default. An empty code keeps the default. The message and details are unchanged.
+func WithStaleVersionCode(code evt.RejectionCode) OutcomeOption {
+	return func(config *outcomeConfig) {
+		if code != "" {
+			config.staleVersionCode = code
+		}
+	}
+}
+
 // WithOutcomes enables durable command outcomes on the store (ADR 0004, C3/C4). Every command then
 // needs a command ID, reads its outcome row before it runs, and is recorded — accepted, accepted
 // with no events, or rejected — in the same transaction as its events, so a retried command
@@ -70,7 +97,12 @@ func WithRecoveryWait(wait time.Duration) OutcomeOption {
 // *evt.OutcomesUnsupportedError before reading or writing anything otherwise. Like the other With
 // options it must be called during Store initialization, before concurrent use.
 func (store *Store) WithOutcomes(options ...OutcomeOption) *Store {
-	config := &outcomeConfig{digester: evt.DefaultDigest, recoveryWait: defaultRecoveryWait}
+	config := &outcomeConfig{
+		digester:         evt.DefaultDigest,
+		recoveryWait:     defaultRecoveryWait,
+		staleFenceCode:   evt.RejectionStaleFence,
+		staleVersionCode: evt.RejectionStaleVersion,
+	}
 	for _, option := range options {
 		option(config)
 	}

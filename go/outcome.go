@@ -56,7 +56,43 @@ const (
 	// went stale and the command cannot be decided again: a caller-stamped read fence failed, or
 	// fence-aware retry ran out of attempts (ADR 0004, C5).
 	RejectionStaleFence RejectionCode = "stale-fence"
+
+	// RejectionStaleVersion is the code the engine records when a client's expected head for a
+	// stream the command read (snapshots.Transaction.Expect) no longer matched the stream, and the
+	// command would otherwise have been accepted.
+	RejectionStaleVersion RejectionCode = "stale-version"
 )
+
+// StaleVersion is one stream whose client-expected head did not match: the head the client
+// expected and the head the command's attempt loaded.
+type StaleVersion struct {
+	EntityID EntityID
+	Expected EventSequence
+	Actual   EventSequence
+}
+
+// StaleVersionRejection is the stale-version rejection the engine records when client-expected
+// heads went stale. Its details list every mismatched stream, sorted by entity ID, as
+// {"streams":[{"actual":n,"entityId":id,"expected":n}]}, so both languages store the same bytes.
+func StaleVersionRejection(stale []StaleVersion) Rejection {
+	sorted := slices.Clone(stale)
+	slices.SortFunc(sorted, func(a, b StaleVersion) int { return strings.Compare(string(a.EntityID), string(b.EntityID)) })
+
+	streams := make([]any, 0, len(sorted))
+	for _, stream := range sorted {
+		streams = append(streams, map[string]any{
+			"entityId": string(stream.EntityID),
+			"expected": int64(stream.Expected),
+			"actual":   int64(stream.Actual),
+		})
+	}
+
+	return Rejection{
+		Code:    RejectionStaleVersion,
+		Message: "a client-expected stream version is stale",
+		Details: map[string]any{"streams": streams},
+	}
+}
 
 // CallerFenceStaleRejection is the stale-fence rejection the engine records when a caller-stamped
 // read fence went stale before the commit: the engine cannot know the caller's decision still
