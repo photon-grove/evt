@@ -62,10 +62,10 @@
     "test": "vitest run"
   },
   "devDependencies": {
-    "@aws-sdk/client-dynamodb": "3.1161.0",
+    "@aws-sdk/client-dynamodb": "3.1163.0",
     "@types/node": "^26.6.6",
-    "oxlint": "1.90.0",
+    "oxlint": "1.92.0",
     "typescript": "^7.0.2",
-    "vitest": "5.0.5"
+    "vitest": "5.1.0"
   }
 }
