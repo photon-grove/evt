@@ -14,10 +14,10 @@
     "@photon-grove/evt": "workspace:*"
   },
   "devDependencies": {
-    "@aws-sdk/client-dynamodb": "3.1161.0",
+    "@aws-sdk/client-dynamodb": "3.1163.0",
     "@types/node": "^26.6.6",
     "@types/pg": "8.23.1",
-    "oxlint": "1.90.0",
+    "oxlint": "1.92.0",
     "pg": "8.23.1",
     "typescript": "^7.0.2"
   }
