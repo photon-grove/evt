@@ -81,10 +81,29 @@ export interface Rejection {
   details?: unknown
 }
 
-/** What a command handler decides: accept with events (possibly none), or reject. */
+/**
+ * What a command handler decides: accept with events (possibly none), or reject.
+ *
+ * On a store with command outcomes, an accepted command's `response` is stored with its outcome,
+ * so a retried command returns the original answer (at most 65536 bytes; empty stores none). A
+ * rejection's `events` commit with the rejected outcome in the same transaction, so the history
+ * shows why the command was refused. A store without outcomes stores neither: it writes nothing
+ * for a rejection.
+ */
 export type Decision<E> =
-  | {kind: 'accept'; events: readonly E[]}
-  | {kind: 'reject'; rejection: Rejection}
+  | {kind: 'accept'; events: readonly E[]; response?: Uint8Array | null | undefined}
+  | {kind: 'reject'; rejection: Rejection; events?: readonly E[] | undefined}
+
+/**
+ * What a command is to its outcome's identity digest: its type string and its payload's canonical
+ * JSON bytes, empty or absent when it has none. Two commands with the same command ID, type,
+ * target, payload and principal are the same command, so everything that distinguishes a request
+ * must be in the payload.
+ */
+export interface CommandDescription {
+  readonly commandType: string
+  readonly payload?: Uint8Array | null | undefined
+}
 
 /** An aggregate type, as {@link defineAggregate} takes it. */
 export interface AggregateDefinition<S, C, D extends EventDefinitions> {
@@ -109,6 +128,11 @@ export interface AggregateDefinition<S, C, D extends EventDefinitions> {
    * its events, in this order, such as the DynamoDB backend's `viewProjector`.
    */
   readonly projectors?: readonly Projector<S>[] | undefined
+  /**
+   * Describes a command to the identity digest of a store with command outcomes. A store with
+   * outcomes needs it to run this type's commands; the entity ID is the command's one target.
+   */
+  identify?(command: C): CommandDescription
 }
 
 /** What a projector sees of a commit: its entity, the state after its events, and the events. */

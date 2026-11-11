@@ -22,6 +22,39 @@ export const MAX_COMMAND_ID_BYTES = 512
 /** The partition-key prefix of the reserved command-outcome rows. */
 export const COMMAND_OUTCOME_PREFIX = 'command-outcome#'
 
+/**
+ * A command's identity, the caller's intent fixed before any state is read: its type, the streams
+ * the request names (`targets`), and its payload's canonical JSON. The command ID and the
+ * principal come from the metadata. The streams a command ends up reading or writing aren't part
+ * of it, since they may depend on state and change between attempts, so everything that
+ * distinguishes a request must be in the targets or the payload.
+ */
+export interface CommandIdentity {
+  readonly commandType: string
+  /** The streams the request names. None for a command that names no stream. */
+  readonly targets?: readonly string[] | undefined
+  /** The payload's canonical JSON, empty or absent when it has none. */
+  readonly payload?: Uint8Array | null | undefined
+}
+
+/**
+ * What a command on a store with outcomes did: the recorded outcome, and what this call wrote.
+ */
+export interface CommandOutcome {
+  /** The outcome this call recorded, or the stored one it replayed. */
+  readonly outcome: Outcome
+  /**
+   * The events this call committed, by entity ID bytes then sequence. Empty when the outcome was
+   * replayed, and for a no-op or a rejection that carries no events.
+   */
+  readonly events: readonly SerializedEvent[]
+  /**
+   * The outcome was read from a stored row (a repeated command, a lost race the winner's row
+   * settled, or an ambiguous write's recovery), rather than produced by this call.
+   */
+  readonly replayed: boolean
+}
+
 /** The engine's rejection codes, which a store may rename (Go and Rust pin them). */
 export const REJECTION_CODES = Object.freeze({
   notFound: 'not-found',
@@ -522,7 +555,8 @@ export async function defaultDigest(input: DigestInput): Promise<string> {
 
 // Refuses a string PostgreSQL can't store (U+0000) or that isn't UTF-8 (a lone surrogate), so a
 // command has the same result on every backend.
-function checkText(what: string, value: string): void {
+/** Refuses text no backend can store alike: U+0000, or a lone surrogate. */
+export function checkText(what: string, value: string): void {
   if (value.includes('\0')) {
     throw new EvtError('invalidArgument', `${what} must not contain U+0000`)
   }
