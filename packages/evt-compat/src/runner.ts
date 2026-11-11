@@ -10,6 +10,7 @@ import {
   type Commit,
   DEFAULT_RETRY_POLICY,
   type DigestInput,
+  type EventOf,
   IdempotencyKeyReuseError,
   type JsonValue,
   type Metadata,
@@ -21,6 +22,8 @@ import {
   Store,
   type StoreOptions,
   StreamHeadDriftError,
+  type StreamRead,
+  type Transaction,
   type TransactionCommit,
   type TransactionalRepository,
   defaultDigest,
@@ -33,7 +36,7 @@ import {
 } from '@photon-grove/evt'
 import {FaultRepository} from '@photon-grove/evt/testing'
 
-import {account, accountCommand, sortedKeys} from './account.js'
+import {type Account, account, accountCommand, sortedKeys} from './account.js'
 import {type Checks, canonical, field, int, list, num, plain, str} from './harness.js'
 
 /** The scenarios TypeScript supports so far, in memory and in the live run. */
@@ -58,6 +61,7 @@ export const SUPPORTED_SCENARIOS: readonly string[] = [
   'outcomes-rejection-events',
   'outcomes-ambiguous',
   'stream-heads-drift',
+  'fence-aware-retry',
 ]
 
 /** The fixture run's name, which every run's identity digests use. */
@@ -68,7 +72,15 @@ const REGION = 'us-west-2'
 const DEFAULT_TIMESTAMP = '2026-10-12T00:00:00Z'
 
 // The outcome keys a supported step's expectation may hold.
-const OUTCOME_KEYS = new Set(['result', 'events', 'deleted', 'sequences', 'code', 'replayed'])
+const OUTCOME_KEYS = new Set([
+  'result',
+  'events',
+  'deleted',
+  'sequences',
+  'code',
+  'replayed',
+  'prepares',
+])
 
 // The step keys this runner reads. A supported scenario that gains another fails loudly rather
 // than running without it.
@@ -97,7 +109,16 @@ const STEP_KEYS = new Set([
   'injectCommitFault',
   'identity',
   'response',
+  'attempts',
+  'reads',
+  'writes',
+  'retryWrites',
+  'interfere',
 ])
+
+// The keys this runner reads of an executeTransaction step's writes and its interference.
+const WRITE_KEYS = new Set(['suffix', 'event'])
+const INTERFERE_KEYS = new Set(['suffix', 'event', 'times'])
 
 // The keys this runner reads of a transaction step's streams, their events and its fences.
 const STREAM_KEYS = new Set(['suffix', 'sequence', 'events', 'snapshot'])
@@ -140,6 +161,15 @@ export function checkStep(step: JsonValue, index: number): void {
   for (const fence of optionalList(step, 'fences')) {
     checkKeys(fence, FENCE_KEYS, `step ${index} fence`)
   }
+  for (const write of [...optionalList(step, 'writes'), ...optionalList(step, 'retryWrites')]) {
+    checkKeys(write, WRITE_KEYS, `step ${index} write`)
+    checkKeys(field(write, 'event'), EVENT_KEYS, `step ${index} write event`)
+  }
+  const interfere = step instanceof Map ? step.get('interfere') : undefined
+  if (interfere instanceof Map) {
+    checkKeys(interfere, INTERFERE_KEYS, `step ${index} interference`)
+    checkKeys(field(interfere, 'event'), EVENT_KEYS, `step ${index} interference event`)
+  }
 }
 
 function checkKeys(value: JsonValue, known: ReadonlySet<string>, what: string): void {
@@ -159,6 +189,8 @@ export interface Outcome {
   code?: string
   /** The command's outcome was read from its stored row. */
   replayed?: true
+  /** How many times a multi-stream command's decision step ran. */
+  prepares?: number
 }
 
 export function expectedOutcome(expect: JsonValue): Outcome {
@@ -182,6 +214,9 @@ export function expectedOutcome(expect: JsonValue): Outcome {
       optionalString(expect, 'code') ?? '',
       expect.has('replayed') && field(expect, 'replayed') === true,
     ),
+    ...(expect.has('prepares') && num(field(expect, 'prepares')) !== 0
+      ? {prepares: num(field(expect, 'prepares'))}
+      : {}),
   }
 }
 
@@ -281,6 +316,7 @@ export class Runner {
   readonly #outcomes: boolean
   readonly #options: StoreOptions
   readonly #bypassHead: RunnerOptions['bypassHead']
+  readonly #run: string
   readonly entityId: string
 
   /** A runner of `scenario` in the run named `run`, whose stream is `compat-<run>-<scenario>`. */
@@ -291,6 +327,7 @@ export class Runner {
     options: RunnerOptions = {},
   ) {
     this.#repository = repository
+    this.#run = run
     this.entityId = `compat-${run}-${str(field(scenario, 'name'))}`
     this.#outcomes = optionalBoolean(scenario, 'outcomes')
     this.#options = {
@@ -363,6 +400,8 @@ export class Runner {
       }
       case 'outcomeOnly':
         return this.#outcomeOnly(step)
+      case 'executeTransaction':
+        return this.#executeTransaction(step)
       case 'resolveOutcome':
         return this.#resolveOutcome(id, step)
       case 'transaction':
@@ -428,6 +467,96 @@ export class Runner {
     } catch (error) {
       return classifyCommand(error)
     }
+  }
+
+  // A multi-stream command under fence-aware retry, with the step's number of immediate attempts.
+  // The decision step reads every stream in `reads` and every one it writes, stamps the step's
+  // fences, and appends `writes` on the first attempt and `retryWrites` (when set) on the ones
+  // after, so its write set can change while its identity, the command's type and payload
+  // targeting the primary stream, stays the same. `interfere` moves a stream before each of the
+  // first commits, as another writer would. The outcome counts the decision step's runs.
+  async #executeTransaction(step: JsonValue): Promise<Outcome> {
+    const base = this.entityId
+    const identity = field(step, 'identity')
+    const payload = identity instanceof Map ? identity.get('payload') : undefined
+    const interference = step instanceof Map ? step.get('interfere') : undefined
+
+    // Before each of the first `times` commits that carry the outcome, the interference's event
+    // lands on its stream as another writer's, under a commit ID of its own.
+    const repository = new FaultRepository(this.#repository as OutcomeRepository)
+    if (interference instanceof Map) {
+      const times = num(field(interference, 'times'))
+      const commandId = optionalString(step, 'commandId') ?? ''
+      const by = str(field(step, 'by'))
+      let moved = 0
+      const interfere = async (recorded: unknown): Promise<void> => {
+        if (recorded === null || recorded === undefined || moved >= times) {
+          return
+        }
+        moved++
+        const id = streamId(base, optionalString(interference, 'suffix') ?? '')
+        const loaded = await this.#store.load(account, id)
+        const writer = new Map<string, JsonValue>([
+          ['by', by],
+          ['commitId', `compat-${by}-${commandId}-interfere-${moved}`],
+        ])
+        await this.#repository.commit({
+          entityId: id,
+          events: [
+            rawEvent(id, loaded.sequence + 1n, writer, rawFields(field(interference, 'event'))),
+          ],
+        })
+      }
+      const inner = this.#repository as OutcomeRepository
+      repository.commit = async (commit, options) => {
+        await interfere(commit.outcome)
+        return inner.commit(commit, options)
+      }
+      repository.commitTransaction = async (transaction, options) => {
+        await interfere(transaction.outcome)
+        return inner.commitTransaction(transaction, options)
+      }
+    }
+
+    const attempts = Math.max(optionalNumber(step, 'attempts') ?? 1, 1)
+    const store = new Store(repository, {
+      ...this.#options,
+      outcomes: {
+        ...outcomeOptions(this.#run),
+        retry: {maxAttempts: attempts, baseDelayMs: 0, maxDelayMs: 0},
+      },
+    })
+
+    let prepares = 0
+    let result: Outcome
+    try {
+      const recorded = await store.executeTransaction(
+        {
+          commandType: str(field(identity, 'type')),
+          targets: [base],
+          payload:
+            payload === undefined || payload === null
+              ? null
+              : encoder.encode(stringifyJson(sortedKeys(payload, true))),
+        },
+        async (transaction) => {
+          prepares++
+          const retryWrites = optionalList(step, 'retryWrites')
+          const writes =
+            prepares > 1 && retryWrites.length > 0 ? retryWrites : optionalList(step, 'writes')
+          await prepareStep(transaction, base, step, writes)
+
+          return {kind: 'accept'}
+        },
+        {metadata: this.#metadata(step)},
+      )
+      result = commandResult(recorded)
+    } catch (error) {
+      result = classifyCommand(error)
+    }
+
+    // Go omits a count of zero, as it omits every empty field.
+    return prepares === 0 ? result : {...result, prepares}
   }
 
   // A command that writes no events, recorded as an accepted outcome carrying the step's response.
@@ -610,6 +739,65 @@ function outcomeOptions(run: string): OutcomeOptions {
     recoveryWaitMs: 100,
     retry: {...DEFAULT_RETRY_POLICY, maxAttempts: 1},
   }
+}
+
+// An executeTransaction step's decision: read, fence, append. Each read is in the read set's order,
+// so it awaits in loops on purpose.
+/* oxlint-disable no-await-in-loop */
+async function prepareStep(
+  transaction: Transaction,
+  base: string,
+  step: JsonValue,
+  writes: readonly JsonValue[],
+): Promise<void> {
+  const reads = new Map<string, StreamRead<Account, typeof account.events>>()
+  const load = async (suffix: string) => {
+    const id = streamId(base, suffix)
+    let read = reads.get(id)
+    if (read === undefined) {
+      read = await transaction.read(account, id)
+      reads.set(id, read)
+    }
+
+    return read
+  }
+
+  for (const suffix of optionalList(step, 'reads')) {
+    await load(str(suffix))
+  }
+  for (const fence of optionalList(step, 'fences')) {
+    transaction.fence({
+      entityId: streamId(base, optionalString(fence, 'suffix') ?? ''),
+      entityType: 'account',
+      head: int(field(fence, 'head')),
+    })
+  }
+  for (const write of writes) {
+    const read = await load(optionalString(write, 'suffix') ?? '')
+    const {type, payload} = rawFields(field(write, 'event'))
+    const definition = account.events[type as keyof typeof account.events]
+    if (definition === undefined) {
+      throw new Error(`unknown account event ${type}`)
+    }
+    const data = definition.codec.decode(encoder.encode(payload))
+    transaction.append(read, [{type, data} as EventOf<typeof account.events>])
+  }
+}
+/* oxlint-enable no-await-in-loop */
+
+// A raw event of a step: its type, version and payload text.
+function rawFields(event: JsonValue): {type: string; version: number; payload: string} {
+  return {
+    type: str(field(event, 'type')),
+    version: num(field(event, 'version')),
+    payload: str(field(event, 'payload')),
+  }
+}
+
+function optionalNumber(value: JsonValue, name: string): number | null {
+  const found = value instanceof Map ? value.get(name) : undefined
+
+  return found === undefined || found === null ? null : num(found)
 }
 
 function classify(error: unknown): Outcome {

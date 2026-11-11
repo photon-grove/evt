@@ -1369,7 +1369,8 @@ Engine-provided rejection codes are `not-found` and `bad-command`
 stale-version rejections ([Fence-aware retry](#fence-aware-retry),
 [Client-expected versions](#client-expected-versions)). A store can replace the code of either
 engine rejection to keep an application's existing wire code (Go `snapshots.WithStaleFenceCode` and
-`WithStaleVersionCode`, Rust `OutcomeConfig::with_stale_fence_code` and `with_stale_version_code`);
+`WithStaleVersionCode`, Rust `OutcomeConfig::with_stale_fence_code` and `with_stale_version_code`,
+TypeScript the `staleFenceCode` and `staleVersionCode` outcome options);
 the message and details stay as pinned. Domain error enums map onto rejection codes in each
 language. Codes are free-form strings beyond the engine-provided ones.
 
@@ -1502,9 +1503,10 @@ the error) and only then by fence provenance:
   recorded against the command ID.
   Only a failed read that a multi-stream prepare step passes on counts: an error the step makes up
   itself, even one shaped like a conflict or a transient failure, is the step's own failure and is
-  returned at once in both languages. A Go transaction is consumed by a failed read; a Rust one
-  stays usable, and a later successful read of the same stream ends the failure, so an error the
-  step returns after it is its own.
+  returned at once in every language. A Go transaction is consumed by a failed read; a Rust or
+  TypeScript one stays usable, and a later successful read of the same stream ends the failure,
+  so an error the step returns after it is its own. TypeScript recognizes the very error object a
+  read threw, of any stream whose reads may run at once.
 - `StreamHeadDrift` is neither. A stream whose head item disagrees with its log
   ([Classification](#failure-classification)) is not a conflict and not transient: the engine returns it at
   once, like any internal failure, records no outcome, and never turns it into a `stale-fence`
@@ -1632,8 +1634,9 @@ identity is `IdempotencyKeyReuse`.
 
 A client can send the head it last saw for a stream the command reads, so the command is refused
 as stale when that stream has moved since. A multi-stream command declares it on its transaction
-(Go `Transaction.Expect(entityID, head)`, Rust `Transaction::expect(entity_id, head)`), for a
-stream the transaction reads before or after the call. The rules, the same in both languages:
+(Go `Transaction.Expect(entityID, head)`, Rust `Transaction::expect(entity_id, head)`, TypeScript
+`Transaction.expect(entityId, head)`), for a stream the transaction reads before or after the call.
+The rules, the same in every language:
 
 - The check runs only when the command is accepted (Go `Complete`, Rust `commit_with_outcome`),
   before anything is written. A command that rejects (`Reject`, `RejectWithEvents`) never consults

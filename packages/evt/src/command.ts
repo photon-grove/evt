@@ -22,13 +22,16 @@ import {
   type CommandOutcome,
   type DigestInput,
   type Outcome,
+  REJECTION_CODES,
   type RecordedIdentity,
+  type StaleVersion,
   canonicalRejection,
   checkCommandId,
   checkMetadata,
   checkText,
   defaultDigest,
   recordedIdentity,
+  staleVersionRejection,
   storedOutcome,
 } from './outcome.js'
 import {type CallOptions, type OutcomeRepository, checkNotReserved} from './repository.js'
@@ -67,7 +70,7 @@ export interface OutcomeOptions {
    */
   recoveryWaitMs?: number | undefined
   /**
-   * Bounds the attempts of a single-aggregate command, {@link DEFAULT_RETRY_POLICY} by default.
+   * Bounds the attempts of a command, {@link DEFAULT_RETRY_POLICY} by default.
    * When the last attempt conflicts, the store records a stale-fence rejection as the outcome.
    */
   retry?: RetryPolicy | undefined
@@ -76,6 +79,12 @@ export interface OutcomeOptions {
    * exhausted retries. `stale-fence` by default; the message and details are unchanged.
    */
   staleFenceCode?: string | undefined
+  /**
+   * The code of the stale-version rejection the engine records when a head the client expected
+   * ({@link Transaction.expect}) went stale. `stale-version` by default; the message and details
+   * are unchanged.
+   */
+  staleVersionCode?: string | undefined
   /** Waits between attempts and between recovery reads. A timer by default; inject one in tests. */
   sleep?: ((ms: number, signal?: AbortSignal) => Promise<void>) | undefined
 }
@@ -85,6 +94,7 @@ export class OutcomeConfig {
   readonly recoveryWaitMs: number
   readonly retry: RetryPolicy
   readonly staleFenceCode: string
+  readonly staleVersionCode: string
   readonly sleep: (ms: number, signal?: AbortSignal) => Promise<void>
   readonly #digest: (input: DigestInput) => string | Promise<string>
 
@@ -102,7 +112,8 @@ export class OutcomeConfig {
 
     this.recoveryWaitMs = wait
     this.retry = {...retry}
-    this.staleFenceCode = options.staleFenceCode || 'stale-fence'
+    this.staleFenceCode = options.staleFenceCode || REJECTION_CODES.staleFence
+    this.staleVersionCode = options.staleVersionCode || REJECTION_CODES.staleVersion
     this.sleep = options.sleep ?? sleep
     this.#digest = options.digest ?? defaultDigest
   }
@@ -110,6 +121,11 @@ export class OutcomeConfig {
   /** The engine's stale-fence rejection under the configured code. */
   staleFence(rejection: Rejection): Rejection {
     return {...rejection, code: this.staleFenceCode}
+  }
+
+  /** The engine's stale-version rejection of `stale` under the configured code. */
+  staleVersion(stale: readonly StaleVersion[]): Rejection {
+    return {...staleVersionRejection(stale), code: this.staleVersionCode}
   }
 
   /** The identity digest, refused when it couldn't be stored or compared. */

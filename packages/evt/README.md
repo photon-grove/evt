@@ -173,8 +173,13 @@ of `AbortSignal`, which the DOM library, `@types/node`, and Bun's and Deno's typ
   principal that recorded it (`OutcomePrincipalMismatchError` otherwise). In a transaction,
   `beginCommand(identity, {metadata})` comes first, and `commitWithOutcome({response})`, `reject`
   and `rejectWithEvents` commit it. A failed fence the caller stamped records the `stale-fence`
-  rejection instead. On a store with outcomes, `execute` and a transaction's `commit` are refused,
-  since they would skip the row. Underneath, every repository is an `OutcomeRepository`: it writes
+  rejection instead, and `expect(id, head)` records the `stale-version` rejection when a stream
+  the client saw at `head` has moved. `executeTransaction(identity, prepare, {metadata})` runs a
+  multi-stream command under the same retry: each attempt begins a transaction and the command,
+  runs `prepare` against it, and commits what it decides (`{kind: 'accept', response}` or
+  `{kind: 'reject', rejection, withEvents}`). An engine fence that moved runs `prepare` again from
+  fresh reads, so it must be safe to repeat. On a store with outcomes, `execute` and a
+  transaction's `commit` are refused, since they would skip the row. Underneath, every repository is an `OutcomeRepository`: it writes
   a commit's `outcome` as its last action, on the condition that no row exists for the command ID,
   and reads it back with `outcome()`, strongly consistent. `FaultRepository` in
   `@photon-grove/evt/testing` makes a commit apply and then fail, or fail without applying, to

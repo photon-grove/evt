@@ -501,9 +501,10 @@ error before any write and is never split.
   once it has elapsed and is treated as exhausted attempts. Worst case is the attempts, about
   0.4 s of waits with the defaults, and a recovery window per attempt for ambiguous writes. Go:
   `snapshots.RetryPolicy` and `Store.WithRetry`; Rust: `RetryPolicy` and
-  `OutcomeConfig::with_retry`. Both implementations assert the defaults against
-  `compat/fixtures/outcomes.json`. There is no wait after the last attempt, and a Go wait ends with
-  the context's error
+  `OutcomeConfig::with_retry`; TypeScript: the `retry` outcome option (`Store.executeWithOutcome`
+  and `Store.executeTransaction`, with a policy of at least one attempt). All three assert the
+  defaults against `compat/fixtures/outcomes.json`. There is no wait after the last attempt, and a
+  Go wait ends with the context's error
 - A failure is classified by the transaction item that failed. An optimistic-concurrency conflict
   at commit time (head update, event put, snapshot condition, engine-filled fence) re-prepares the
   command: the outcome row is read again, the aggregates are loaded again, and the handler or
@@ -517,7 +518,8 @@ error before any write and is never split.
 - A failed caller-stamped fence fails fast: the engine records the `stale-fence` rejection
   immediately, without re-preparing or waiting, because it cannot know the caller's decision still
   holds. A caller-stamped fence that passed does not turn another item's conflict into a rejection
-- A client-expected head (Go `Transaction.Expect`, Rust `Transaction::expect`) is checked only on
+- A client-expected head (Go `Transaction.Expect`, Rust `Transaction::expect`, TypeScript
+  `Transaction.expect`) is checked only on
   acceptance, before any write: a mismatch records the stale-version rejection (details
   `{"streams":[{"actual","entityId","expected"}]}` sorted by entity ID) through the fenced
   rejection commit instead of the acceptance, a domain rejection never consults it, and accepting

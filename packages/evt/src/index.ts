@@ -145,6 +145,7 @@ export {
   type OutcomeCommitOptions,
   StreamRead,
   Transaction,
+  type TransactionDecision,
   type TransactionResult,
 } from './transaction.js'
 export {
