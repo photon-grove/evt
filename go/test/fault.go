@@ -13,13 +13,18 @@ import (
 // really apply while the caller observes an indeterminate error — the situation ambiguous-write
 // recovery exists for. Everything else, including GetOutcome, is the wrapped repository's.
 //
-// Only Commit is intercepted; the engine's outcome path commits through it.
+// Commit is intercepted, as the engine's outcome path commits through it, and so is GetSnapshot,
+// the first read of a load, so a test can run another writer just before a load.
 type FaultRepository struct {
 	evt.OutcomeRepository
 
 	// Intercept, when non-nil, replaces Commit. It receives the result and a function that performs
 	// the real commit on the wrapped repository.
 	Intercept func(ctx context.Context, result evt.SerializedResult, commit func() error) error
+
+	// BeforeLoad, when non-nil, runs before GetSnapshot reads the wrapped repository: before the
+	// load of an aggregate reads anything of its stream.
+	BeforeLoad func(ctx context.Context, entityID evt.EntityID)
 }
 
 // NewFaultRepository wraps repo, which must implement evt.OutcomeRepository.
@@ -56,6 +61,15 @@ func (f *FaultRepository) Commit(ctx context.Context, result evt.SerializedResul
 	}
 
 	return f.Intercept(ctx, result, commit)
+}
+
+// GetSnapshot runs BeforeLoad, then reads the wrapped repository's snapshot.
+func (f *FaultRepository) GetSnapshot(ctx context.Context, entityID evt.EntityID) (*evt.SerializedSnapshot, error) {
+	if f.BeforeLoad != nil {
+		f.BeforeLoad(ctx, entityID)
+	}
+
+	return f.OutcomeRepository.GetSnapshot(ctx, entityID)
 }
 
 // ApplyThenFail arms the repository so the next commit really applies and the caller then observes

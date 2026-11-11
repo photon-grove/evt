@@ -349,10 +349,10 @@ func (tx *Transaction) finish(
 		return nil, err
 	}
 
-	// A pre-v0.9 event in a stream this command read already carries its ID without an outcome
-	// row: the command ran, so no outcome — accepted, rejected, or stale-fence — is recorded for it.
-	if err := tx.checkLegacyDuplicate(); err != nil {
-		return nil, err
+	// A stream this command read already carries its ID: the command ran, so no outcome —
+	// accepted, rejected, or stale-fence — is recorded for it.
+	if tx.seenCommandID() {
+		return tx.alreadyRan(ctx)
 	}
 
 	// A command that would be accepted on a stream the client saw at another head is refused as
@@ -395,17 +395,28 @@ func (tx *Transaction) finish(
 	return outcome, err
 }
 
-// checkLegacyDuplicate applies the load-time duplicate window of the streams the transaction read.
-func (tx *Transaction) checkLegacyDuplicate() error {
-	id := tx.command.id
-
+// seenCommandID applies the load-time duplicate window of the streams the transaction read.
+func (tx *Transaction) seenCommandID() bool {
 	for _, entityID := range tx.order {
-		if tx.streams[entityID].cc.HasCommandID(id) {
-			return evt.NewDuplicateCommandError(id)
+		if tx.streams[entityID].cc.HasCommandID(tx.command.id) {
+			return true
 		}
 	}
 
-	return nil
+	return false
+}
+
+// alreadyRan answers a command whose ID a stream it read already carries. Another attempt of the
+// command may have committed since BeginCommand read the outcome row, so the row is read again:
+// the stored outcome when the digests match, *evt.IdempotencyKeyReuseError when they differ.
+// Without a row it is a pre-v0.9 command, written before outcomes existed: *evt.DuplicateCommandError.
+func (tx *Transaction) alreadyRan(ctx context.Context) (*evt.CommandOutcome, error) {
+	replayed, err := tx.command.preCheck(ctx)
+	if err != nil || replayed != nil {
+		return replayed, err
+	}
+
+	return nil, evt.NewDuplicateCommandError(tx.command.id)
 }
 
 // staleFence records the engine's stale-fence rejection: the state the command was decided on went

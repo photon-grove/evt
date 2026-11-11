@@ -644,9 +644,18 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
 
         let loaded = self.load(entity_id).await.map_err(Failed::deciding)?;
 
-        // Events written before outcomes existed carry command IDs but have no outcome row; the
-        // window catches those duplicates (and only those: this store's own commits write rows).
+        // An event the load folded in already carries the command ID. Another attempt of the
+        // command may have committed since the row was read, so it is read again, and answers the
+        // command when it is there. Without one, it is an event written before outcomes existed:
+        // the command ran, so no outcome is recorded for it.
         if loaded.has_seen(command_id) {
+            if let Some(stored) = pre_check(&self.repository, command_id, pending.digest())
+                .await
+                .map_err(Failed::deciding)?
+            {
+                return Ok(CommandOutcome::replay(stored));
+            }
+
             return Err(Failed::internal(Error::DuplicateCommand(
                 command_id.clone(),
             )));

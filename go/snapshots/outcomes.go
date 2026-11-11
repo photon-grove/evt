@@ -534,9 +534,20 @@ func (store *Store) attemptOutcome(
 		setter.SetID(entityID)
 	}
 
-	// The event window is superseded by the outcome row, but pre-v0.9 commands have no row: an
-	// event that carries this command ID without an outcome is one of those.
+	// An event the load folded in already carries the command ID. Another attempt of the command
+	// may have committed since the row was read, so it is read again, and answers the command when
+	// it is there. Without one, it is a pre-v0.9 command, written before outcomes existed: it ran,
+	// so no outcome is recorded for it.
 	if cc.HasCommandID(cmd.id) {
+		replayed, err = cmd.preCheck(ctx)
+		if err != nil {
+			return executed{}, err
+		}
+
+		if replayed != nil {
+			return executed{outcome: replayed}, nil
+		}
+
 		return executed{}, internal(evt.NewDuplicateCommandError(cmd.id))
 	}
 
