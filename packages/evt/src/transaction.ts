@@ -21,6 +21,7 @@ import {
   type CommandIdentity,
   type CommandOutcome,
   type Outcome,
+  type StaleVersion,
   staleFenceRejection,
 } from './outcome.js'
 import {
@@ -54,6 +55,21 @@ export interface TransactionContext {
   metadata(partial?: Partial<Metadata>): Metadata
   /** How the store records command outcomes, or null when it records none. */
   readonly outcomes?: OutcomeConfig | null | undefined
+  /**
+   * The command the store froze before its first attempt, which {@link Transaction.beginCommand}
+   * installs instead of validating the identity and computing its digest again.
+   */
+  readonly frozen?: PendingCommand | undefined
+  /** Where the transaction notes a failed read, so the store's retry can tell it apart. */
+  readonly readFailures?: ReadFailures | undefined
+}
+
+/**
+ * The error of each stream's last failed read in a transaction, until that stream is read. Reads
+ * can run at once, so a step that passes on any of them is recognized.
+ */
+export interface ReadFailures {
+  readonly byStream: Map<string, unknown>
 }
 
 /**
@@ -66,6 +82,18 @@ export interface TransactionContext {
  *   nothing is written: return it.
  */
 export type Begin = {kind: 'proceed'} | {kind: 'replayed'; outcome: CommandOutcome}
+
+/**
+ * What the decision step of {@link Store.executeTransaction} decided:
+ *
+ * - `accept`: commit what it appended (nothing is an accepted no-op), with `response` stored for a
+ *   retried command to return.
+ * - `reject`: record the domain `rejection`, fenced on everything it read. The staged events are
+ *   discarded, unless `withEvents`: then they commit with the rejection in the same commit.
+ */
+export type TransactionDecision =
+  | {kind: 'accept'; response?: Uint8Array | null | undefined}
+  | {kind: 'reject'; rejection: Rejection; withEvents?: boolean | undefined}
 
 /** Options for {@link Transaction.beginCommand}. */
 export interface BeginOptions extends CallOptions {
@@ -177,6 +205,8 @@ export class Transaction {
   // The command beginCommand froze, until an outcome method takes it.
   #command: PendingCommand | null = null
   #beginning = false
+  // The heads the client expected, by stream.
+  readonly #expected = new Map<string, bigint>()
 
   /** @internal Begun by {@link Store.transaction}. */
   constructor(context: TransactionContext) {
@@ -203,14 +233,19 @@ export class Transaction {
     this.#ids.set(entityId, order)
     this.#pending++
     let loaded: Loaded<S>
+    const failures = this.#context.readFailures
     try {
       loaded = await this.#context.load(aggregate, entityId, options)
     } catch (error) {
       this.#ids.delete(entityId)
+      failures?.byStream.set(entityId, error)
       throw error
     } finally {
       this.#pending--
     }
+
+    // The stream is read now, so an earlier failure to read it is over.
+    failures?.byStream.delete(entityId)
 
     const stream: Stream = {
       aggregate,
@@ -303,8 +338,9 @@ export class Transaction {
     // Held while the command is checked and its row read, so a failed begin can be called again.
     this.#beginning = true
     try {
-      const metadata = this.#context.metadata(options.metadata)
-      const pending = await freezeCommand(config, identity, metadata)
+      const pending =
+        this.#context.frozen ??
+        (await freezeCommand(config, identity, this.#context.metadata(options.metadata)))
       const repository = this.#context.repository as OutcomeRepository
       const stored = await preCheck(repository, pending, options)
       if (stored !== null) {
@@ -372,6 +408,14 @@ export class Transaction {
     if (answered !== null) {
       return answered
     }
+
+    // A command accepted on a stream the client saw at another head is refused as stale, through
+    // the same fenced, outcome-only commit as a domain rejection.
+    const stale = this.#staleVersions()
+    if (stale.length > 0) {
+      return this.#rejectFenced(pending, this.#outcomeConfig().staleVersion(stale), options)
+    }
+
     const prepared = this.#prepare(pending.metadata)
 
     return this.#record(pending, acceptedOutcome(pending, options.response), prepared, options)
@@ -391,6 +435,55 @@ export class Transaction {
     if (answered !== null) {
       return answered
     }
+
+    return this.#rejectFenced(pending, rejection, options)
+  }
+
+  /**
+   * Expects the client to have seen a stream this transaction reads at `head`: the head the
+   * client's view showed it, 0 for none. It's checked when the command is accepted
+   * ({@link commitWithOutcome}), against the head this transaction read: on a mismatch, the
+   * command is recorded with the `stale-version` rejection instead, which lists every stale
+   * stream. A domain rejection wins over it, and each attempt of {@link Store.executeTransaction}
+   * checks it again. It needs a store with outcomes; a negative head, or another head for a stream
+   * already expected, throws `invalidArgument`. Expecting a stream the transaction never reads
+   * fails the commit.
+   */
+  expect(entityId: string, head: bigint): this {
+    this.#checkOpen()
+    if (!this.#context.outcomes) {
+      throw new EvtError(
+        'invalidArgument',
+        'client-expected versions are recorded as command outcomes; construct the store with ' +
+          'outcomes and begin the command with beginCommand',
+      )
+    }
+    if (head < 0n || head > MAX_INT64) {
+      throw new EvtError(
+        'invalidArgument',
+        `expected head ${head} of ${entityId} is outside [0, 2^63 - 1]`,
+      )
+    }
+    const earlier = this.#expected.get(entityId)
+    if (earlier !== undefined && earlier !== head) {
+      throw new EvtError(
+        'invalidArgument',
+        `${entityId} is expected at head ${earlier} and ${head}`,
+      )
+    }
+
+    this.#expected.set(entityId, head)
+
+    return this
+  }
+
+  // Records a rejection with an outcome-only commit, fenced on every stream the transaction read
+  // at the head it read, and on the caller's fences. The staged events are discarded.
+  #rejectFenced(
+    pending: PendingCommand,
+    rejection: Rejection,
+    options: CallOptions,
+  ): Promise<CommandOutcome> {
     const outcome = rejectedOutcome(pending, rejection)
     const streams = [...this.#streams.values()]
     streams.sort((a, b) => a.order - b.order)
@@ -536,6 +629,28 @@ export class Transaction {
     written.sort((a, b) => compareUtf8(a.entityId, b.entityId))
 
     return {streams: commits, fences, events: written.flatMap((commit) => commit.events)}
+  }
+
+  // Every stream the client expected at a head other than the one this transaction read.
+  #staleVersions(): StaleVersion[] {
+    const heads = new Map(
+      [...this.#streams.values()].map((stream) => [stream.loaded.entityId, stream.loaded.sequence]),
+    )
+    const stale: StaleVersion[] = []
+    for (const [entityId, expected] of this.#expected) {
+      const actual = heads.get(entityId)
+      if (actual === undefined) {
+        throw new EvtError(
+          'invalidArgument',
+          `${entityId} has an expected head but the transaction never read it`,
+        )
+      }
+      if (actual !== expected) {
+        stale.push({entityId, expected, actual})
+      }
+    }
+
+    return stale
   }
 
   // A caller's fence on a stream the transaction read is superseded by the read's own.

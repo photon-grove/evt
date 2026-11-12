@@ -38,6 +38,7 @@ import {
   Store,
   type StoreInitializer,
   StreamHeadDriftError,
+  type Transaction,
   type TransactionalRepository,
   StreamHeadsNotMigratedError,
   UnsupportedFeatureError,
@@ -135,6 +136,14 @@ export async function conformance(
       ],
       ['racing commands with one ID: one commits, the rest replay it', () => commandRace(repo)],
       ['an ambiguous write is recovered through the outcome row', () => ambiguousWrite(repo)],
+      [
+        'fence-aware retry re-prepares an engine conflict and records a stale caller fence',
+        () => fenceAwareRetry(repo),
+      ],
+      [
+        'a stale client-expected head records the stale-version rejection',
+        () => expectedHeads(repo),
+      ],
     )
   }
 
@@ -715,6 +724,80 @@ async function ambiguousWrite(repo: OutcomeRepository): Promise<void> {
   )
   ensure(!retried.replayed, 'the retry commits')
   ensureEqual((await repo.events(id)).length, 2, 'each command wrote one event')
+}
+
+// A multi-stream command that another writer interferes with runs again, and one whose caller fence
+// went stale is recorded as rejected at once.
+async function fenceAwareRetry(repo: OutcomeRepository): Promise<void> {
+  const ns = namespace()
+  const type = outcomeLedger(ns)
+  const store = outcomeStore(repo)
+  const [target, watched] = [`${ns}-a`, `${ns}-watched`]
+  const identity = {commandType: 'ledger:copy', targets: [target]}
+  const as = (commandId: string) => ({metadata: {commandId: `${ns}-${commandId}`}})
+
+  // Another writer moves the stream the first attempt read, so it runs again and commits once.
+  let runs = 0
+  const moved = await store.executeTransaction(
+    identity,
+    async (transaction) => {
+      runs++
+      await transaction.read(type, watched)
+      const a = await transaction.read(type, target)
+      if (runs === 1) {
+        await store.executeWithOutcome(type, watched, {type: 'add', amount: 1}, as('mover'))
+      }
+      transaction.append(a, [added(1)])
+      return {kind: 'accept'}
+    },
+    as('c1'),
+  )
+  ensureEqual(runs, 2, 'the decision step ran twice')
+  ensureEqual(moved.outcome.status, 'accepted', 'the re-prepared command commits')
+  ensureEqual((await repo.events(target)).length, 1, 'only the committing attempt wrote')
+
+  // A fence the caller stamped that went stale records the stale-fence rejection, without a retry.
+  runs = 0
+  const staleCaller = await store.executeTransaction(
+    identity,
+    async (transaction) => {
+      runs++
+      transaction.fence({entityId: watched, entityType: type.type, head: 0n})
+      transaction.append(await transaction.read(type, target), [added(1)])
+      return {kind: 'accept'}
+    },
+    as('c2'),
+  )
+  ensureEqual(runs, 1, 'a stale caller fence is never retried')
+  ensureEqual(staleCaller.outcome.rejection?.code, 'stale-fence', 'the stale-fence rejection')
+  ensureEqual((await repo.events(target)).length, 1, 'the stale command wrote nothing')
+}
+
+// A client's expected head is checked when the command is accepted: a current one commits, a stale
+// one records the stale-version rejection and writes nothing, and a domain rejection wins over it.
+async function expectedHeads(repo: OutcomeRepository): Promise<void> {
+  const ns = namespace()
+  const type = outcomeLedger(ns)
+  const store = outcomeStore(repo)
+  const target = `${ns}-a`
+  const as = (commandId: string) => ({metadata: {commandId: `${ns}-${commandId}`}})
+  const command =
+    (head: bigint, decision: 'accept' | 'reject') => async (transaction: Transaction) => {
+      transaction.expect(target, head)
+      transaction.append(await transaction.read(type, target), [added(1)])
+      return decision === 'accept'
+        ? ({kind: 'accept'} as const)
+        : ({kind: 'reject', rejection: {code: 'domain', message: 'no'}} as const)
+    }
+  const identity = {commandType: 'ledger:pay', targets: [target]}
+
+  const current = await store.executeTransaction(identity, command(0n, 'accept'), as('c1'))
+  ensureEqual(current.outcome.status, 'accepted', 'a current head commits')
+  const outdated = await store.executeTransaction(identity, command(0n, 'accept'), as('c2'))
+  ensureEqual(outdated.outcome.rejection?.code, 'stale-version', 'a stale head is rejected')
+  ensureEqual((await repo.events(target)).length, 1, 'the stale command wrote nothing')
+  const domain = await store.executeTransaction(identity, command(0n, 'reject'), as('c3'))
+  ensureEqual(domain.outcome.rejection?.code, 'domain', 'a domain rejection wins')
 }
 
 // A ledger aggregate of the namespace's own entity type, for the store's transaction API.

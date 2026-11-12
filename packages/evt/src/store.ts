@@ -63,7 +63,12 @@ import {
   sleep,
 } from './retry.js'
 import {commitSnapshot, projectCommit, serializeEvents} from './staging.js'
-import {Transaction} from './transaction.js'
+import {
+  type ReadFailures,
+  Transaction,
+  type TransactionContext,
+  type TransactionDecision,
+} from './transaction.js'
 
 /** The default number of events between snapshots, as in Go and Rust. */
 export const DEFAULT_SNAPSHOT_INTERVAL = 5
@@ -304,12 +309,136 @@ export class Store {
       throw new EvtError('invalidArgument', 'the repository has no commitTransaction')
     }
 
+    return this.#transaction(repository, {})
+  }
+
+  /**
+   * Runs a multi-stream command on a store with outcomes, under fence-aware retry. Each attempt
+   * begins a transaction, begins the command in it ({@link Transaction.beginCommand}), runs
+   * `prepare` against it, and commits it as `prepare` decided: `accept` with
+   * {@link Transaction.commitWithOutcome}, `reject` with {@link Transaction.reject}, or with
+   * {@link Transaction.rejectWithEvents} when it keeps its events. A stored outcome with the same
+   * identity digest is returned without running `prepare`, and one with another digest is an
+   * `IdempotencyKeyReuseError`.
+   *
+   * `prepare` is the command's decision step: it reads what it needs, decides, appends to any of
+   * the streams it read, adds the fences it stamps itself, and returns its decision. When the
+   * commit conflicts in a way the engine can decide again (a stream it read or wrote moved, a
+   * fence the engine filled), `prepare` runs again from scratch against fresh reads, after a
+   * backoff, up to the store's retry policy; when the last attempt conflicts too, the store
+   * records the `stale-fence` rejection, so the command ID keeps that answer. A fence the caller
+   * stamped that went stale records the `stale-fence` rejection at once. A throttled backend is
+   * retried the same way and thrown when the attempts run out, and stream head drift is thrown at
+   * once. A read `prepare` passes on unchanged is retried, but never recorded against the command;
+   * any other error it throws is its own failure, thrown at once with nothing recorded.
+   *
+   * `prepare` must be safe to repeat: it decides from the transaction's reads, not from state an
+   * earlier run captured, and only the attempt that commits writes anything. The identity is the
+   * caller's intent, fixed before anything is read: its targets are the streams the request names,
+   * not the ones `prepare` ends up writing, which may change between attempts.
+   */
+  async executeTransaction(
+    identity: CommandIdentity,
+    prepare: (transaction: Transaction) => TransactionDecision | Promise<TransactionDecision>,
+    options: ExecuteOptions = {},
+  ): Promise<CommandOutcome> {
+    const config = this.#outcomeConfig()
+    const repository = this.repository as OutcomeRepository
+    const pending = await freezeCommand(config, identity, this.#metadata(options.metadata))
+
+    const budget = new Budget(config.retry)
+    // Each attempt waits for the one before it.
+    /* oxlint-disable no-await-in-loop */
+    for (;;) {
+      const attempt = await this.#attemptTransaction(
+        repository,
+        identity,
+        pending,
+        prepare,
+        options,
+      )
+      if (attempt.kind === 'done') {
+        return attempt.outcome
+      }
+
+      const kind = retryKind(attempt.error, attempt.phase)
+      if (kind === 'never') {
+        throw attempt.error
+      }
+
+      const delay = budget.next()
+      if (delay === null) {
+        if (kind !== 'conflict') {
+          throw attempt.error
+        }
+
+        const rejection = config.staleFence(retriesExhaustedRejection(budget.attempts))
+        return persistRejection(repository, pending, config, rejection, options)
+      }
+
+      await config.sleep(delay, options.signal)
+    }
+    /* oxlint-enable no-await-in-loop */
+  }
+
+  // One attempt of a multi-stream command: a new transaction, the outcome check, the decision
+  // step and the commit.
+  async #attemptTransaction(
+    repository: OutcomeRepository,
+    identity: CommandIdentity,
+    pending: PendingCommand,
+    prepare: (transaction: Transaction) => TransactionDecision | Promise<TransactionDecision>,
+    options: CallOptions,
+  ): Promise<Attempt> {
+    const readFailures: ReadFailures = {byStream: new Map()}
+    const transaction = this.#transaction(repository, {frozen: pending, readFailures})
+
+    let decision: TransactionDecision
+    try {
+      const begun = await transaction.beginCommand(identity, options)
+      if (begun.kind === 'replayed') {
+        return {kind: 'done', outcome: begun.outcome}
+      }
+    } catch (error) {
+      return failed(error, 'deciding')
+    }
+
+    try {
+      decision = await prepare(transaction)
+    } catch (error) {
+      // An error the step passed on from a failed read is a load failure, retried but never
+      // recorded. Any other is the step's own, even a conflict: it's thrown at once.
+      const passedOn = [...readFailures.byStream.values()].includes(error)
+      return failed(error, passedOn ? 'deciding' : 'internal')
+    }
+
+    try {
+      const outcome =
+        decision.kind === 'accept'
+          ? await transaction.commitWithOutcome({
+              response: decision.response,
+              signal: options.signal,
+            })
+          : decision.withEvents
+            ? await transaction.rejectWithEvents(decision.rejection, options)
+            : await transaction.reject(decision.rejection, options)
+      return {kind: 'done', outcome}
+    } catch (error) {
+      return failed(error, 'committing')
+    }
+  }
+
+  #transaction(
+    repository: TransactionalRepository,
+    extra: Pick<TransactionContext, 'frozen' | 'readFailures'>,
+  ): Transaction {
     return new Transaction({
       repository,
       load: (aggregate, entityId, options) => this.load(aggregate, entityId, options),
       snapshotInterval: (aggregate) => this.snapshotInterval(aggregate),
       metadata: (partial) => this.#metadata(partial),
       outcomes: this.#outcomes,
+      ...extra,
     })
   }
 

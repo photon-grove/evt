@@ -213,9 +213,17 @@ class Recorder extends FaultRepository {
 
 // The streams a step names: its own, and a transaction's written and fenced ones.
 function stepSuffixes(step: JsonValue): string[] {
-  const nested = [...optionalList(step, 'streams'), ...optionalList(step, 'fences')]
+  const interfere = step instanceof Map ? step.get('interfere') : undefined
+  const nested = [
+    ...optionalList(step, 'streams'),
+    ...optionalList(step, 'fences'),
+    ...optionalList(step, 'writes'),
+    ...optionalList(step, 'retryWrites'),
+    ...(interfere instanceof Map ? [interfere] : []),
+  ]
+  const reads = optionalList(step, 'reads').map(str)
 
-  return [step, ...nested].flatMap((value) => optionalString(value, 'suffix') ?? [])
+  return [...reads, ...[step, ...nested].flatMap((value) => optionalString(value, 'suffix') ?? [])]
 }
 
 // An action as the Go fixture generator records it: the operation, the key, the expressions and

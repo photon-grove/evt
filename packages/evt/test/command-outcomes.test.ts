@@ -31,6 +31,7 @@ import {type Outcome, encodeRejection} from '../src/outcome.ts'
 import type {CallOptions, Commit, OutcomeRepository, TransactionCommit} from '../src/repository.ts'
 import {Store, type StoreOptions} from '../src/store.ts'
 import {FaultRepository} from '../src/testing/fault.ts'
+import type {Transaction, TransactionDecision} from '../src/transaction.ts'
 
 const encoder = new TextEncoder()
 const decoder = new TextDecoder()
@@ -1027,5 +1028,400 @@ describe('Transaction with outcomes', () => {
     expect(await failure(transaction.reject({code: 'no', message: 'x'}))).toBeInstanceOf(
       DuplicateCommandError,
     )
+  })
+})
+
+// Adds `amount` to stream `a`, reading `watched` too, and counts its runs.
+function adding(amount: number, runs: {count: number}, before?: () => Promise<void>) {
+  return async (transaction: Transaction): Promise<TransactionDecision> => {
+    runs.count++
+    await transaction.read(ledger, 'watched')
+    const a = await transaction.read(ledger, 'a')
+    await before?.()
+    transaction.append(a, [{type: 'ledger:added', data: {amount}}])
+
+    return {kind: 'accept', response: encoder.encode('done')}
+  }
+}
+
+// Appends a refusal to stream `a` and rejects, keeping the event only `withEvents`.
+function deciding(withEvents: boolean) {
+  return async (transaction: Transaction): Promise<TransactionDecision> => {
+    const a = await transaction.read(ledger, 'a')
+    transaction.append(a, [{type: 'ledger:refused', data: {amount: 1}}])
+    return {kind: 'reject', rejection: {code: 'no', message: 'refused'}, withEvents}
+  }
+}
+
+describe('Store.executeTransaction', () => {
+  const pay = {commandType: 'pay', targets: ['a']}
+  const quick = {retry: {maxAttempts: 3, baseDelayMs: 0, maxDelayMs: 0}}
+
+  test('an engine fence that moved re-prepares, and only the committing attempt writes', async () => {
+    const repository = new MemRepository()
+    const store = outcomeStore(repository, quick)
+    const other = outcomeStore(repository)
+    const runs = {count: 0}
+    let moved = false
+    const result = await store.executeTransaction(
+      pay,
+      adding(5, runs, async () => {
+        if (!moved) {
+          moved = true
+          await other.executeWithOutcome(ledger, 'watched', {type: 'add', amount: 1}, as('x'))
+        }
+      }),
+      as('c1'),
+    )
+
+    expect(runs.count).toBe(2)
+    expect(result).toMatchObject({replayed: false, outcome: {status: 'accepted'}})
+    expect(decoder.decode(result.outcome.response!)).toBe('done')
+    expect(await repository.events('a')).toHaveLength(1)
+
+    const replay = await store.executeTransaction(pay, adding(5, runs), as('c1'))
+    expect(replay.replayed).toBe(true)
+    expect(runs.count).toBe(2)
+  })
+
+  test('a conflict on the last attempt records the stale-fence rejection', async () => {
+    const repository = new MemRepository()
+    const store = outcomeStore(repository, {retry: {maxAttempts: 2, baseDelayMs: 0, maxDelayMs: 0}})
+    const other = outcomeStore(repository)
+    const runs = {count: 0}
+    const result = await store.executeTransaction(
+      pay,
+      adding(5, runs, async () => {
+        await other.executeWithOutcome(
+          ledger,
+          'watched',
+          {type: 'add', amount: 1},
+          as(`x${runs.count}`),
+        )
+      }),
+      as('c1'),
+    )
+
+    expect(runs.count).toBe(2)
+    expect(encodeRejection(result.outcome.rejection!)).toContain('"details":{"attempts":2}')
+    expect(await repository.events('a')).toEqual([])
+    expect(await repository.outcome('c1')).toEqual(result.outcome)
+  })
+
+  test('a stale fence the caller stamped records the rejection at once', async () => {
+    const repository = new MemRepository()
+    const store = outcomeStore(repository, quick)
+    await store.executeWithOutcome(ledger, 'watched', {type: 'add', amount: 1}, as('x'))
+    let runs = 0
+
+    const result = await store.executeTransaction(
+      pay,
+      async (transaction) => {
+        runs++
+        transaction.fence({entityId: 'watched', entityType: 'ledger', head: 0n})
+        transaction.append(await transaction.read(ledger, 'a'), [
+          {type: 'ledger:added', data: {amount: 1}},
+        ])
+        return {kind: 'accept'}
+      },
+      as('c1'),
+    )
+    expect(runs).toBe(1)
+    expect(result.outcome.rejection?.code).toBe('stale-fence')
+  })
+
+  test('a rejection keeps its events only when the decision says so', async () => {
+    const repository = new MemRepository()
+    const store = outcomeStore(repository)
+
+    const plain = await store.executeTransaction(pay, deciding(false), as('c1'))
+    expect(plain.outcome).toMatchObject({status: 'rejected', eventIds: []})
+    const kept = await store.executeTransaction(pay, deciding(true), as('c2'))
+    expect(kept.outcome).toMatchObject({status: 'rejected', eventIds: [eventId('a', 1n)]})
+  })
+
+  test("a read the step passes on is retried, and the step's own errors aren't", async () => {
+    const inner = new MemRepository()
+    const repository = new FaultRepository(inner)
+    let reads = 0
+    repository.events = async (entityId, options) => {
+      if (++reads === 1) {
+        throw new TransientError('throttled')
+      }
+      return inner.events(entityId, options)
+    }
+    const store = outcomeStore(repository, quick)
+
+    let runs = 0
+    const result = await store.executeTransaction(
+      pay,
+      async (transaction) => {
+        runs++
+        await transaction.read(ledger, 'a')
+        return {kind: 'accept'}
+      },
+      as('c1'),
+    )
+    expect(runs).toBe(2)
+    expect(result.outcome.status).toBe('accepted')
+
+    let own = 0
+    const error = await failure(
+      store.executeTransaction(
+        pay,
+        () => {
+          own++
+          throw new ConflictError('a', 'made up')
+        },
+        as('c2'),
+      ),
+    )
+    expect(error).toBeInstanceOf(ConflictError)
+    expect(own).toBe(1)
+    expect(await inner.outcome('c2')).toBeNull()
+  })
+
+  test('a step that passes on either of two reads that failed at once is retried', async () => {
+    const inner = new MemRepository()
+    const repository = new FaultRepository(inner)
+    let reads = 0
+    repository.events = async (entityId, options) => {
+      if (++reads <= 2) {
+        // The second read fails last, so the step passes on the first one's error.
+        await new Promise((resolve) => setTimeout(resolve, entityId === 'b' ? 5 : 0))
+        throw new TransientError(`throttled ${entityId}`)
+      }
+      return inner.events(entityId, options)
+    }
+
+    let runs = 0
+    const result = await outcomeStore(repository, quick).executeTransaction(
+      pay,
+      async (transaction) => {
+        runs++
+        await Promise.all([transaction.read(ledger, 'a'), transaction.read(ledger, 'b')])
+        return {kind: 'accept'}
+      },
+      as('c1'),
+    )
+    expect(runs).toBe(2)
+    expect(result.outcome.status).toBe('accepted')
+  })
+
+  test("a read's old error, thrown after the stream was read, is the step's own", async () => {
+    const inner = new MemRepository()
+    const repository = new FaultRepository(inner)
+    let reads = 0
+    repository.events = async (entityId, options) => {
+      if (++reads === 1) {
+        throw new TransientError('throttled')
+      }
+      return inner.events(entityId, options)
+    }
+
+    let runs = 0
+    const error = await failure(
+      outcomeStore(repository, quick).executeTransaction(
+        pay,
+        async (transaction) => {
+          runs++
+          let first: unknown
+          try {
+            await transaction.read(ledger, 'a')
+          } catch (failed) {
+            first = failed
+          }
+          await transaction.read(ledger, 'a')
+          throw first
+        },
+        as('c1'),
+      ),
+    )
+    expect(error).toBeInstanceOf(TransientError)
+    expect(runs).toBe(1)
+  })
+
+  test('a throttled backend is thrown when the attempts run out, and drift at once', async () => {
+    const inner = new MemRepository()
+    let commits = 0
+    const throttled = new FaultRepository(inner)
+    throttled.commitTransaction = async () => {
+      commits++
+      throw new TransientError('throttled')
+    }
+    const accept = async (transaction: Transaction): Promise<TransactionDecision> => {
+      transaction.append(await transaction.read(ledger, 'a'), [
+        {type: 'ledger:added', data: {amount: 1}},
+      ])
+      return {kind: 'accept'}
+    }
+
+    const exhausted = await failure(
+      outcomeStore(throttled, quick).executeTransaction(pay, accept, as('c1')),
+    )
+    expect(exhausted).toBeInstanceOf(TransientError)
+    expect(commits).toBe(3)
+    expect(await inner.outcome('c1')).toBeNull()
+
+    const store = outcomeStore(inner, quick)
+    await store.executeWithOutcome(ledger, 'a', {type: 'add', amount: 1}, as('x'))
+    headFixtures(inner).appendBypassingHead({
+      ...(await inner.events('a'))[0]!,
+      id: eventId('a', 2n),
+      sequence: 2n,
+    })
+    let runs = 0
+    const drift = await failure(
+      store.executeTransaction(
+        pay,
+        async (transaction) => {
+          runs++
+          return accept(transaction)
+        },
+        as('c2'),
+      ),
+    )
+    expect(drift).toBeInstanceOf(StreamHeadDriftError)
+    expect(runs).toBe(1)
+    expect(await inner.outcome('c2')).toBeNull()
+  })
+
+  test('a failed outcome check is retried', async () => {
+    const inner = new MemRepository()
+    const repository = new FaultRepository(inner)
+    let checks = 0
+    repository.outcome = async (commandId, options) => {
+      if (++checks === 1) {
+        throw new TransientError('throttled')
+      }
+      return inner.outcome(commandId, options)
+    }
+
+    const result = await outcomeStore(repository, quick).executeTransaction(
+      pay,
+      () => ({kind: 'accept'}),
+      as('c1'),
+    )
+    expect(result.outcome.status).toBe('accepted')
+  })
+
+  test('the write set can change between attempts under one identity', async () => {
+    const repository = new MemRepository()
+    const store = outcomeStore(repository, quick)
+    const other = outcomeStore(repository)
+    let runs = 0
+    const result = await store.executeTransaction(
+      pay,
+      async (transaction) => {
+        runs++
+        await transaction.read(ledger, 'watched')
+        const target = await transaction.read(ledger, runs === 1 ? 'first' : 'second')
+        if (runs === 1) {
+          await other.executeWithOutcome(ledger, 'watched', {type: 'add', amount: 1}, as('x'))
+        }
+        transaction.append(target, [{type: 'ledger:added', data: {amount: 1}}])
+        return {kind: 'accept'}
+      },
+      as('c1'),
+    )
+    expect(result.outcome.eventIds).toEqual([eventId('second', 1n)])
+    expect(result.outcome.identity?.targets).toEqual(['a'])
+    expect(await repository.events('first')).toEqual([])
+  })
+})
+
+describe('Transaction.expect', () => {
+  test('a stale expected head records the stale-version rejection on acceptance', async () => {
+    const repository = new MemRepository()
+    const store = outcomeStore(repository, {staleVersionCode: 'outdated'})
+    await store.executeWithOutcome(ledger, 'a', {type: 'add', amount: 1}, as('x'))
+
+    const result = await store.executeTransaction(
+      {commandType: 'pay', targets: ['a']},
+      async (transaction) => {
+        transaction.expect('a', 0n).expect('a', 0n)
+        transaction.append(await transaction.read(ledger, 'a'), [
+          {type: 'ledger:added', data: {amount: 1}},
+        ])
+        return {kind: 'accept'}
+      },
+      as('c1'),
+    )
+    expect(encodeRejection(result.outcome.rejection!)).toContain('"code":"outdated"')
+    expect(encodeRejection(result.outcome.rejection!)).toContain(
+      '{"actual":1,"entityId":"a","expected":0}',
+    )
+    expect(await repository.events('a')).toHaveLength(1)
+  })
+
+  test('a current head commits, and a domain rejection wins over a stale one', async () => {
+    const repository = new MemRepository()
+    const store = outcomeStore(repository)
+    await store.executeWithOutcome(ledger, 'a', {type: 'add', amount: 1}, as('x'))
+
+    const current = await store.executeTransaction(
+      {commandType: 'pay'},
+      async (transaction) => {
+        transaction.expect('a', 1n)
+        transaction.append(await transaction.read(ledger, 'a'), [
+          {type: 'ledger:added', data: {amount: 1}},
+        ])
+        return {kind: 'accept'}
+      },
+      as('c1'),
+    )
+    expect(current.outcome.status).toBe('accepted')
+
+    const refused = await store.executeTransaction(
+      {commandType: 'pay'},
+      async (transaction) => {
+        transaction.expect('a', 0n)
+        await transaction.read(ledger, 'a')
+        return {kind: 'reject', rejection: {code: 'domain', message: 'no'}}
+      },
+      as('c2'),
+    )
+    expect(refused.outcome.rejection?.code).toBe('domain')
+  })
+
+  test('an expected stream that moves before the commit is checked again on the retry', async () => {
+    const repository = new MemRepository()
+    const store = outcomeStore(repository, {retry: {maxAttempts: 3, baseDelayMs: 0, maxDelayMs: 0}})
+    const other = outcomeStore(repository)
+    let runs = 0
+    const result = await store.executeTransaction(
+      {commandType: 'pay'},
+      async (transaction) => {
+        runs++
+        transaction.expect('a', 0n)
+        await transaction.read(ledger, 'a')
+        const b = await transaction.read(ledger, 'b')
+        if (runs === 1) {
+          await other.executeWithOutcome(ledger, 'a', {type: 'add', amount: 1}, as('x'))
+        }
+        transaction.append(b, [{type: 'ledger:added', data: {amount: 1}}])
+        return {kind: 'accept'}
+      },
+      as('c1'),
+    )
+    expect(runs).toBe(2)
+    expect(result.outcome.rejection?.code).toBe('stale-version')
+    expect(await repository.events('b')).toEqual([])
+  })
+
+  test('refuses a bad expectation', async () => {
+    const plain = new Store(new MemRepository()).transaction()
+    expect(() => plain.expect('a', 0n)).toThrow(EvtError)
+
+    const transaction = outcomeStore().transaction()
+    expect(() => transaction.expect('a', -1n)).toThrow(EvtError)
+    expect(() => transaction.expect('a', 2n ** 63n)).toThrow(EvtError)
+    transaction.expect('a', 1n)
+    expect(() => transaction.expect('a', 2n)).toThrow(EvtError)
+
+    const unread = outcomeStore().transaction()
+    await unread.beginCommand({commandType: 'pay'}, as('c1'))
+    unread.expect('a', 0n)
+    expect(await failure(unread.commitWithOutcome())).toMatchObject({code: 'invalidArgument'})
   })
 })
