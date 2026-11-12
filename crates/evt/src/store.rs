@@ -649,9 +649,12 @@ impl<A: Aggregate, R: Repository> Store<A, R> {
         // command when it is there. Without one, it is an event written before outcomes existed:
         // the command ran, so no outcome is recorded for it.
         if loaded.has_seen(command_id) {
-            if let Some(stored) = pre_check(&self.repository, command_id, pending.digest())
-                .await
-                .map_err(Failed::deciding)?
+            // Boxed: the outcome read is a large future on some backends, and a second inline one
+            // would grow this attempt's poll frame in debug builds.
+            if let Some(stored) =
+                Box::pin(pre_check(&self.repository, command_id, pending.digest()))
+                    .await
+                    .map_err(Failed::deciding)?
             {
                 return Ok(CommandOutcome::replay(stored));
             }

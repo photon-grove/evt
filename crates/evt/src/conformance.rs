@@ -4507,14 +4507,11 @@ pub async fn outcome_cases<R: Repository>(repo: &R, other: &R) {
         "ambiguous writes are settled by re-reading the outcome row",
         Box::pin(outcome_ambiguous(repo)).await,
     );
-    record(
-        "a lost outcome put resolves through the winner's row and writes nothing",
-        Box::pin(outcome_race(repo)).await,
-    );
-    record(
-        "an attempt that committed after the outcome check is replayed, not a duplicate",
-        Box::pin(outcome_race_before_load(repo)).await,
-    );
+    // The races run in a function of their own, like the client-expected versions below, so
+    // this one's future (and its poll frame in debug builds) stays within a test thread's stack.
+    for (name, result) in Box::pin(race_cases(repo)).await {
+        record(name, result);
+    }
     record(
         "an outcome read validates the command ID like a write",
         Box::pin(outcome_read_validation(repo)).await,
@@ -4526,10 +4523,6 @@ pub async fn outcome_cases<R: Repository>(repo: &R, other: &R) {
     record(
         "a command may not declare a reserved target stream",
         Box::pin(outcome_reserved_targets(repo)).await,
-    );
-    record(
-        "a winner of the same command that moved a fenced stream resolves to its outcome",
-        Box::pin(outcome_fence_race(repo)).await,
     );
     record(
         "a failed caller-stamped fence persists a stale-fence rejection",
@@ -5629,6 +5622,25 @@ async fn outcome_race<R: Repository>(repo: &R) -> CaseResult {
     );
 
     Ok(())
+}
+
+/// The cases where another attempt of the same command, or another command under its ID, wins a
+/// race against this one.
+async fn race_cases<R: Repository>(repo: &R) -> Vec<(&'static str, CaseResult)> {
+    vec![
+        (
+            "a lost outcome put resolves through the winner's row and writes nothing",
+            Box::pin(outcome_race(repo)).await,
+        ),
+        (
+            "an attempt that committed after the outcome check is replayed, not a duplicate",
+            Box::pin(outcome_race_before_load(repo)).await,
+        ),
+        (
+            "a winner of the same command that moved a fenced stream resolves to its outcome",
+            Box::pin(outcome_fence_race(repo)).await,
+        ),
+    ]
 }
 
 async fn outcome_race_before_load<R: Repository>(repo: &R) -> CaseResult {
