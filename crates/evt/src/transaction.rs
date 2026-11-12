@@ -1025,7 +1025,16 @@ impl<'a, R: Repository> Transaction<'a, R> {
             return Ok(None);
         }
 
-        match pre_check(self.repository, &pending.command_id, &pending.digest).await? {
+        // Boxed: the outcome read is a large future on some backends, and keeping it on the heap
+        // keeps the futures of the outcome-recording methods that await this one small (the
+        // conformance cases poll them on a default test-thread stack, in debug builds).
+        match Box::pin(pre_check(
+            self.repository,
+            &pending.command_id,
+            &pending.digest,
+        ))
+        .await?
+        {
             Some(stored) => Ok(Some(CommandOutcome::replay(stored))),
             None => Err(Error::DuplicateCommand(pending.command_id.clone())),
         }
