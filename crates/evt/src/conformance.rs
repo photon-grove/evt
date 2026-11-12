@@ -4060,6 +4060,8 @@ where
 /// - [fail the next outcome-carrying commit without applying it](Self::arm_before_apply);
 /// - [commit a rival commit first](Self::race_with), as another writer winning a race between a
 ///   command's outcome pre-check and its commit;
+/// - [commit a rival commit before the next load](Self::race_before_load), as another writer
+///   winning a race between a command's outcome pre-check and its load;
 /// - [fail an outcome read](Self::fail_outcome_read_after), [return a malformed row for
 ///   one](Self::corrupt_outcome_read_after), or [stall one forever](Self::stall_outcome_read_after)
 ///   (its read deadline then fires at once, standing in for the passage of time).
@@ -4076,6 +4078,8 @@ struct FaultState<Op> {
     /// A held commit that lands after a number of outcome reads (see `arm_land_after_reads`).
     delayed: Option<(Commit<Op>, usize)>,
     rival: Option<Commit<Op>>,
+    /// A rival commit that lands just before the next snapshot read (see `race_before_load`).
+    load_rival: Option<Commit<Op>>,
     reads_before_failure: Option<(usize, ReadFault)>,
     /// A stalled read is armed or running: the read deadline fires at once.
     stalling: bool,
@@ -4131,6 +4135,7 @@ impl<R: Repository> FaultInjectingRepository<R> {
                 fault: None,
                 delayed: None,
                 rival: None,
+                load_rival: None,
                 reads_before_failure: None,
                 stalling: false,
                 landing: false,
@@ -4183,6 +4188,13 @@ impl<R: Repository> FaultInjectingRepository<R> {
     /// commit, so that commit finds the rival's rows already written.
     pub fn race_with(&self, rival: Commit<R::Operation>) {
         self.state().rival = Some(rival);
+    }
+
+    /// Commits `rival` through the wrapped repository just before the next snapshot read, the
+    /// first read of a load, so a command that found no outcome row loads a stream that already
+    /// carries the rival's events.
+    pub fn race_before_load(&self, rival: Commit<R::Operation>) {
+        self.state().load_rival = Some(rival);
     }
 
     /// Fails an outcome read with [`Error::Backend`]: the read after `reads` successful ones.
@@ -4412,6 +4424,11 @@ impl<R: Repository> Repository for FaultInjectingRepository<R> {
     }
 
     async fn snapshot(&self, entity_id: &EntityId) -> Result<Option<SerializedSnapshot>, Error> {
+        let rival = self.state().load_rival.take();
+        if let Some(rival) = rival {
+            self.inner.commit(rival).await?;
+        }
+
         self.inner.snapshot(entity_id).await
     }
 
@@ -4490,10 +4507,11 @@ pub async fn outcome_cases<R: Repository>(repo: &R, other: &R) {
         "ambiguous writes are settled by re-reading the outcome row",
         Box::pin(outcome_ambiguous(repo)).await,
     );
-    record(
-        "a lost outcome put resolves through the winner's row and writes nothing",
-        Box::pin(outcome_race(repo)).await,
-    );
+    // The races run in a function of their own, like the client-expected versions below, so
+    // this one's future (and its poll frame in debug builds) stays within a test thread's stack.
+    for (name, result) in Box::pin(race_cases(repo)).await {
+        record(name, result);
+    }
     record(
         "an outcome read validates the command ID like a write",
         Box::pin(outcome_read_validation(repo)).await,
@@ -4505,10 +4523,6 @@ pub async fn outcome_cases<R: Repository>(repo: &R, other: &R) {
     record(
         "a command may not declare a reserved target stream",
         Box::pin(outcome_reserved_targets(repo)).await,
-    );
-    record(
-        "a winner of the same command that moved a fenced stream resolves to its outcome",
-        Box::pin(outcome_fence_race(repo)).await,
     );
     record(
         "a failed caller-stamped fence persists a stale-fence rejection",
@@ -5606,6 +5620,112 @@ async fn outcome_race<R: Repository>(repo: &R) -> CaseResult {
         repo.events(&other.id).await?.is_empty(),
         "the failed commit's events were not written"
     );
+
+    Ok(())
+}
+
+/// The cases where another attempt of the same command, or another command under its ID, wins a
+/// race against this one.
+async fn race_cases<R: Repository>(repo: &R) -> Vec<(&'static str, CaseResult)> {
+    vec![
+        (
+            "a lost outcome put resolves through the winner's row and writes nothing",
+            Box::pin(outcome_race(repo)).await,
+        ),
+        (
+            "an attempt that committed after the outcome check is replayed, not a duplicate",
+            Box::pin(outcome_race_before_load(repo)).await,
+        ),
+        (
+            "a winner of the same command that moved a fenced stream resolves to its outcome",
+            Box::pin(outcome_fence_race(repo)).await,
+        ),
+    ]
+}
+
+async fn outcome_race_before_load<R: Repository>(repo: &R) -> CaseResult {
+    let fault = FaultInjectingRepository::new(repo);
+    let store = outcome_store(&fault);
+
+    // Another attempt of the command commits between this one's outcome check and its load, so
+    // the load's duplicate window sees the command ID. The row answers it: a replay, not a
+    // pre-outcome duplicate.
+    let id = ledger_id();
+    let command = command_id();
+    fault.race_before_load(rival_commit(&id, &command, 5, 5)?);
+    let result = store
+        .execute_with_outcome(&id, Add(5), command_metadata(&command))
+        .await?;
+    ensure!(
+        result.replayed && result.is_accepted(),
+        "the attempt replays the winner: {result:?}"
+    );
+    ensure_eq!(repo.events(&id).await?.len(), 1, "the command applied once");
+
+    // The same race with another identity is IdempotencyKeyReuse.
+    let id = ledger_id();
+    let command = command_id();
+    fault.race_before_load(rival_commit(&id, &command, 6, 6)?);
+    expect_reuse(
+        store
+            .execute_with_outcome(&id, Add(5), command_metadata(&command))
+            .await,
+        "a race lost to another command",
+    )?;
+
+    // A transaction: the winner commits after begin_command read the row and before the read.
+    // Its outcome-recording methods replay it, whatever this attempt decided, or refuse a reused
+    // command ID.
+    let identity = CommandIdentity::new("ledger:pay");
+    for (decide, digest_of) in [("reject", "ours"), ("accept", "ours"), ("accept", "other")] {
+        let id = ledger_id();
+        let command = command_id();
+        let metadata = command_metadata(&command);
+        let digest = match digest_of {
+            "ours" => default_digest(&identity.digest_input(&metadata))
+                .map_err(|err| Failure(err.to_string()))?,
+            _ => ledger_digest(&id, 5)?,
+        };
+        let events = serialize_events::<Ledger>(
+            &id,
+            EventSequence::ZERO,
+            &[LedgerEvent::from(Added { amount: 5 })],
+            &Metadata::default().with_command_id(command.clone()),
+        )?;
+
+        let mut transaction = store.transaction();
+        ensure!(
+            matches!(
+                transaction.begin_command(&identity, &metadata).await?,
+                Begin::Proceed
+            ),
+            "no outcome row yet, so the command proceeds"
+        );
+        fault.race_before_load(
+            Commit::new(id.clone(), events)
+                .with_outcome(Outcome::accepted(command.clone(), digest)),
+        );
+        transaction.read::<Ledger>(&id).await?;
+
+        let result = match decide {
+            "reject" => {
+                transaction
+                    .reject(Rejection::new("invalid-amount", "amount must be positive"))
+                    .await
+            }
+            _ => transaction.commit_with_outcome(None).await,
+        };
+        if digest_of == "other" {
+            expect_reuse(result, "a transaction that lost to another command")?;
+        } else {
+            let result = result.map_err(|err| Failure(format!("{decide}: {err}")))?;
+            ensure!(
+                result.replayed && result.is_accepted(),
+                "{decide} replays the winner's accepted outcome: {result:?}"
+            );
+        }
+        ensure_eq!(repo.events(&id).await?.len(), 1, "only the winner wrote");
+    }
 
     Ok(())
 }
