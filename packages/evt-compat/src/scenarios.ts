@@ -200,7 +200,7 @@ export function viewRows(repository: MemRepository, scenario: JsonValue, base: s
         dynamoItem: {
           entityID: {S: row.entityId},
           entityType: {S: row.entityType},
-          payload: {S: new TextDecoder().decode(row.payload)},
+          payload: {S: new TextDecoder('utf-8', {ignoreBOM: true}).decode(row.payload)},
           pk: {S: row.pk},
           sk: {S: row.sk},
         },

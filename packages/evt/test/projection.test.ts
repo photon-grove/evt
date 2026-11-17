@@ -452,6 +452,19 @@ describe('DynamoRepository views', () => {
     })
   })
 
+  test("keeps a payload's leading byte order mark", async () => {
+    const client = new Scripted()
+    const payload = new Uint8Array([0xef, 0xbb, 0xbf, 0x7b, 0x7d])
+    await new DynamoRepository(client, 'events', {viewsTable: 'views'}).commit({
+      entityId: 'a',
+      events: [event('a', 1)],
+      views: [projected(putView('k', 'a', 'a', 'ledger', payload))],
+    })
+
+    const put = client.transactions[0]![2]!.Put!
+    expect(put.Item['payload']).toEqual({S: '\uFEFF{}'})
+  })
+
   test('refuses views without a views table, before any request', async () => {
     const client = new Scripted()
     const error = await failure(
@@ -668,6 +681,44 @@ describe('Store commit projectors', () => {
     }
     await new Store(repository, {commitProjectors: [vandal, totals]}).execute(ledger, 'a', 5)
     expect(decoder.decode(repository.view('totals', 'a')!.payload)).toBe('{"total":5}')
+  })
+
+  test('a store without projectors never encodes a state it does not snapshot', async () => {
+    const unencodable = defineAggregate({
+      ...ledger,
+      state: {
+        encode: () => {
+          throw new Error('no snapshots for this type')
+        },
+        decode: () => ({total: 0}),
+      },
+    })
+    const repository = new MemRepository()
+    await new Store(repository, {snapshotInterval: 0}).execute(unencodable, 'a', 1)
+    expect(await repository.events('a')).toHaveLength(1)
+  })
+
+  test("a projector's copy of a Buffer-backed state is its own", async () => {
+    const buffered = defineAggregate({
+      ...ledger,
+      state: {
+        encode: (state: {total: number}) => Buffer.from(JSON.stringify(state)),
+        decode: (bytes: Uint8Array) => JSON.parse(decoder.decode(bytes)) as {total: number},
+      },
+    })
+    const vandal: CommitProjector = {
+      name: 'vandal',
+      project: (commit) => {
+        commit.streams[0]!.state.fill(0x20)
+        return []
+      },
+    }
+    const repository = new MemRepository()
+    const store = new Store(repository, {snapshotInterval: 1, commitProjectors: [vandal, totals]})
+    await store.execute(buffered, 'a', 5)
+
+    expect(decoder.decode(repository.view('totals', 'a')!.payload)).toBe('{"total":5}')
+    expect((await store.load(buffered, 'a')).state).toEqual({total: 5})
   })
 
   test('a retry projects again, and only the committing attempt writes views', async () => {

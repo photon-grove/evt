@@ -804,7 +804,7 @@ export class Store {
           entityId,
           entityType: aggregate.type,
           events,
-          state: snapshot?.payload ?? aggregate.state.encode(state),
+          state: () => snapshot?.payload ?? aggregate.state.encode(state),
         },
       ]),
     }

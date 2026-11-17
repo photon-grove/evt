@@ -36,9 +36,11 @@ why. You tune the repository with chainable options:
 
 The TypeScript package's `DynamoRepository` (`@photon-grove/evt/dynamodb`) writes the same table.
 It takes the AWS SDK's low-level `DynamoDB` client, needs the same one-time initialization
-(`repository.initialize()`), and has `lazyInitialization`, `consistentRead` and `retention`
-options. It writes the per-entity view row ([Entity-views table](#entity-views-table)), but not
-commit-wide views yet, so don't point it at entity types that have commit-wide projectors.
+(`repository.initialize()`), and has `lazyInitialization`, `consistentRead`, `retention` and
+`viewsTable` options. It writes the per-entity view row ([Entity-views table](#entity-views-table)),
+and, with `viewsTable` set, the rows of a store's commit-wide projectors (`commitProjectors`), in
+the commit's transaction. It runs current-state projectors only so far: it refuses one that names
+a `history`, so don't point it at entity types whose commit-wide projectors are history-dependent.
 
 ## Event-log table
 

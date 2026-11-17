@@ -656,7 +656,7 @@ export class Transaction {
                 entityId: stream.loaded.entityId,
                 entityType: stream.aggregate.type,
                 events: stream.events,
-                state:
+                state: () =>
                   commits.find((commit) => commit.entityId === stream.loaded.entityId)?.snapshot
                     ?.payload ?? stream.aggregate.state.encode(stream.state),
               },

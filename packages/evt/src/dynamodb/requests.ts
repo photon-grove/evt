@@ -278,7 +278,8 @@ function viewAction(viewsTable: string, op: ViewOperation): TransactItem {
   }
 }
 
-const viewDecoder = new TextDecoder('utf-8', {fatal: true})
+// It keeps a leading byte order mark, as every backend stores the payload's bytes as they are.
+const viewDecoder = new TextDecoder('utf-8', {fatal: true, ignoreBOM: true})
 
 // A written stream's actions: its head update, its event puts and its snapshot put.
 function streamItems(table: string, commit: Commit, ttl: CommitTtl | undefined): TransactItem[] {

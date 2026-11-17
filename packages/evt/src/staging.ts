@@ -114,12 +114,12 @@ export function projectCommit<S, C, D extends EventDefinitions>(
       entityType: aggregate.type,
       entityId,
       state,
-      encodedState: encodedState.slice(),
+      encodedState: new Uint8Array(encodedState),
       events: Object.freeze(
         events.map((event) =>
           Object.freeze({
             ...event,
-            payload: event.payload && event.payload.slice(),
+            payload: event.payload && new Uint8Array(event.payload),
             metadata: Object.freeze(copyMetadata(event.metadata)),
           }),
         ),
@@ -144,8 +144,11 @@ export interface WrittenStream {
   readonly entityId: string
   readonly entityType: string
   readonly events: readonly SerializedEvent[]
-  /** The state after the commit, as its snapshot would carry it. */
-  readonly state: Uint8Array
+  /**
+   * The state after the commit, as its snapshot would carry it. Encoded only when a projector
+   * runs, so a store without projectors never encodes a state it doesn't snapshot.
+   */
+  state(): Uint8Array
 }
 
 /**
@@ -176,11 +179,11 @@ export function projectStreams(
         stream.entityType,
         stream.events.map((event) =>
           Object.assign({}, event, {
-            payload: event.payload && event.payload.slice(),
+            payload: event.payload && new Uint8Array(event.payload),
             metadata: copyMetadata(event.metadata),
           }),
         ),
-        stream.state.slice(),
+        new Uint8Array(stream.state()),
       ),
     ),
   })

@@ -74,7 +74,7 @@ export interface ViewOperation {
 }
 
 const encoder = new TextEncoder()
-const decoder = new TextDecoder('utf-8', {fatal: true})
+const decoder = new TextDecoder('utf-8', {fatal: true, ignoreBOM: true})
 
 /** An operation that writes a row at `pk` and `sk`, owned by `owner`. */
 export function putView(
@@ -351,12 +351,17 @@ function checkUnreserved(view: ProjectedView): void {
 // The view a projector is given: a current-state projector gets an empty commit ID and no events,
 // and the state of every stream; a history-dependent one gets the commit ID, and the events and
 // state of the streams of the types it names only.
-// Each projector gets its own copies, so none can change what another one sees.
+// Each projector gets its own copies, so none can change what another one sees. A copy is a new
+// array, never a slice, which a Node Buffer shares with its source.
 function visibleTo(view: CommitView, history: readonly string[]): CommitView {
   if (history.length === 0) {
     return {
       commitId: '',
-      streams: view.streams.map((stream) => ({...stream, events: [], state: stream.state.slice()})),
+      streams: view.streams.map((stream) => ({
+        ...stream,
+        events: [],
+        state: new Uint8Array(stream.state),
+      })),
     }
   }
 
@@ -364,7 +369,7 @@ function visibleTo(view: CommitView, history: readonly string[]): CommitView {
     commitId: view.commitId,
     streams: view.streams.map((stream) =>
       history.includes(stream.entityType)
-        ? {...stream, events: stream.events.map(copyEvent), state: stream.state.slice()}
+        ? {...stream, events: stream.events.map(copyEvent), state: new Uint8Array(stream.state)}
         : {...stream, events: [], state: new Uint8Array()},
     ),
   }
@@ -373,7 +378,7 @@ function visibleTo(view: CommitView, history: readonly string[]): CommitView {
 function copyEvent(event: SerializedEvent): SerializedEvent {
   return {
     ...event,
-    payload: event.payload && event.payload.slice(),
+    payload: event.payload && new Uint8Array(event.payload),
     metadata: {
       ...event.metadata,
       trace: event.metadata.trace && new Map(event.metadata.trace),
