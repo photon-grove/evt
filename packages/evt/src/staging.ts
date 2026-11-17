@@ -12,7 +12,9 @@ import {
 import {EvtError} from './errors.js'
 import {type SerializedEvent, eventId} from './event.js'
 import type {Metadata} from './metadata.js'
-import type {NewSnapshot, ProjectorGroup} from './repository.js'
+import {type CommitProjector, type ProjectedView, commitStream, projectViews} from './projection.js'
+import type {NewSnapshot, ProjectorGroup, Repository} from './repository.js'
+import {compareUtf8} from './utf8.js'
 import {MAX_COMMIT_ITEM_BYTES, snapshotCommitSize, snapshotEventsDue} from './snapshots.js'
 
 const INT64_MAX = 2n ** 63n - 1n
@@ -134,5 +136,82 @@ export function copyMetadata(metadata: Metadata): Metadata {
     trace: metadata.trace && new Map(metadata.trace),
     origin: metadata.origin && {...metadata.origin},
     extensions: new Map(metadata.extensions),
+  }
+}
+
+/** A stream a commit writes, as the commit-wide projectors read it. */
+export interface WrittenStream {
+  readonly entityId: string
+  readonly entityType: string
+  readonly events: readonly SerializedEvent[]
+  /** The state after the commit, as its snapshot would carry it. */
+  readonly state: Uint8Array
+}
+
+/**
+ * The commit-wide projectors' view operations for a commit that writes `streams`: none when there
+ * are no projectors or no events. The repository must write views, and only current-state
+ * projectors run here, since a history-dependent one needs its entity types declared in the
+ * store's feature manifest first. The projectors read copies, sorted by entity ID bytes.
+ */
+export function projectStreams(
+  projectors: readonly CommitProjector[],
+  repository: Repository,
+  streams: readonly WrittenStream[],
+): ProjectedView[] {
+  const written = streams.filter((stream) => stream.events.length > 0)
+  if (projectors.length === 0 || written.length === 0) {
+    return []
+  }
+  readyProjectors(projectors, repository)
+
+  const sorted = [...written]
+  sorted.sort((a, b) => compareUtf8(a.entityId, b.entityId))
+
+  return projectViews(projectors, {
+    commitId: sorted[0]!.events[0]!.metadata.commitId,
+    streams: sorted.map((stream) =>
+      commitStream(
+        stream.entityId,
+        stream.entityType,
+        stream.events.map((event) =>
+          Object.assign({}, event, {
+            payload: event.payload && event.payload.slice(),
+            metadata: copyMetadata(event.metadata),
+          }),
+        ),
+        stream.state.slice(),
+      ),
+    ),
+  })
+}
+
+/**
+ * Refuses commit-wide projectors the repository can't serve: it must write view operations, or
+ * their rows would be dropped, and a history-dependent projector needs a manifest declaration this
+ * package can't make yet.
+ */
+export function readyProjectors(
+  projectors: readonly CommitProjector[],
+  repository: Repository,
+): void {
+  if (projectors.length === 0) {
+    return
+  }
+
+  const name = repository.constructor.name || 'repository'
+  if (repository.writesViews?.() !== true) {
+    throw new EvtError(
+      'viewsUnsupported',
+      `repository ${name} does not write view operations; refusing a commit-wide projector`,
+    )
+  }
+  const historyDependent = projectors.find((projector) => (projector.history ?? []).length > 0)
+  if (historyDependent !== undefined) {
+    throw new EvtError(
+      'historyDeclarationUnsupported',
+      `repository ${name} cannot declare history-dependent entity types; refusing a ` +
+        `history-dependent projector (${JSON.stringify(historyDependent.name)})`,
+    )
   }
 }

@@ -47,6 +47,10 @@ export class FaultRepository implements OutcomeRepository {
     return this.#intercept(() => this.inner.commitTransaction(transaction, options))
   }
 
+  writesViews(): boolean {
+    return this.inner.writesViews?.() === true
+  }
+
   outcome(commandId: string, options?: CallOptions): Promise<Outcome | null> {
     return this.inner.outcome(commandId, options)
   }

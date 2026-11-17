@@ -6,7 +6,8 @@
 
 import type {SerializedEvent, SerializedSnapshot} from '../event.js'
 import {int64Argument, safeIntegerArgument} from '../fields.js'
-import {EvtError} from '../errors.js'
+import {EvtError, ViewsNotConfiguredError} from '../errors.js'
+import type {ProjectedView, ViewOperation} from '../projection.js'
 import type {Commit, NormalizedTransaction, ProjectorGroup, ReadFence} from '../repository.js'
 import type {TransactItem} from './client.js'
 import {type HeadAction, headFence, headUpdate} from './head.js'
@@ -111,6 +112,7 @@ export function commitTransaction(
   commit: Commit,
   markerVersion: bigint,
   ttl?: CommitTtl,
+  viewsTable?: string,
 ): TransactItem[] {
   if (commit.events.length === 0) {
     throw new RangeError('a commit transaction needs at least one event')
@@ -120,16 +122,19 @@ export function commitTransaction(
     streams: [commit],
     fences: [],
     projections: commit.projections ?? [],
+    views: commit.views ?? [],
     outcome: null,
   }
 
-  return transactionItems(table, transaction, markerVersion, () => ttl)
+  return transactionItems(table, transaction, markerVersion, () => ttl, viewsTable)
 }
 
 /** Where each stream's and fence's actions sit in a transaction, to classify a cancellation. */
 export interface TransactionLayout {
-  /** The index after the control checks and the projector operations. */
+  /** The index after the control checks and the projector groups' operations. */
   readonly projectorEnd: number
+  /** Each view operation's action, in order, after the projector groups'. */
+  readonly views: readonly {readonly index: number; readonly view: ProjectedView}[]
   readonly streams: readonly StreamLayout[]
   readonly fences: readonly {readonly index: number; readonly fence: ReadFence}[]
   /** The outcome put's index, when the transaction records one. */
@@ -159,20 +164,32 @@ export function transactionItems(
   transaction: NormalizedTransaction,
   markerVersion: bigint,
   ttl: (commit: Commit) => CommitTtl | undefined,
+  viewsTable?: string,
 ): TransactItem[] {
-  return buildTransaction(table, transaction, markerVersion, ttl).items
+  return buildTransaction(table, transaction, markerVersion, ttl, viewsTable).items
 }
 
-/** {@link transactionItems}, with where each stream's and fence's actions sit. */
+/**
+ * {@link transactionItems}, with where each stream's and fence's actions sit. View operations go
+ * to `viewsTable`, after the projector groups: without one, a transaction that carries any is
+ * refused with a {@link ViewsNotConfiguredError}.
+ */
 export function buildTransaction(
   table: string,
   transaction: NormalizedTransaction,
   markerVersion: bigint,
   ttl: (commit: Commit) => CommitTtl | undefined,
+  viewsTable?: string,
 ): {items: TransactItem[]; layout: TransactionLayout} {
+  const views = viewActions(transaction.views, viewsTable)
   const items = [markerCheck(table, markerVersion), rebuildLockCheck(table)]
   items.push(...projectorItems(transaction.projections))
   const projectorEnd = items.length
+  const viewLayout = views.map(({action, view}) => {
+    items.push(action)
+
+    return {index: items.length - 1, view}
+  })
 
   const streams: StreamLayout[] = []
   for (const commit of transaction.streams) {
@@ -200,8 +217,68 @@ export function buildTransaction(
     outcome = items.length - 1
   }
 
-  return {items, layout: {projectorEnd, streams, fences, outcome}}
+  return {items, layout: {projectorEnd, views: viewLayout, streams, fences, outcome}}
 }
+
+// The condition expressions of a view action: every write is conditioned on the row's owner, and a
+// put that claims a key, or a delete that releases one, on the row's absence or presence.
+const VIEW_ABSENT = 'attribute_not_exists(pk)'
+const VIEW_OWNED = 'attribute_not_exists(pk) OR entityID = :owner'
+const VIEW_PRESENT = 'attribute_exists(pk) AND entityID = :owner'
+
+/**
+ * The actions of view operations in `viewsTable`: a put writes the row's five attributes, and a
+ * delete removes it, each conditioned on the row's owner and the operation's condition.
+ */
+export function viewActions(
+  views: readonly ProjectedView[],
+  viewsTable: string | undefined,
+): {action: TransactItem; view: ProjectedView}[] {
+  if (views.length === 0) {
+    return []
+  }
+  if (viewsTable === undefined || viewsTable === '') {
+    throw new ViewsNotConfiguredError(DYNAMODB_BACKEND)
+  }
+
+  return views.map((view) => ({action: viewAction(viewsTable, view.op), view}))
+}
+
+function viewAction(viewsTable: string, op: ViewOperation): TransactItem {
+  const owner = {':owner': {S: op.owner}}
+  if (op.kind === 'delete') {
+    return {
+      Delete: {
+        TableName: viewsTable,
+        Key: {pk: {S: op.pk}, sk: {S: op.sk}},
+        ConditionExpression: op.condition === 'present' ? VIEW_PRESENT : VIEW_OWNED,
+        ExpressionAttributeValues: owner,
+      },
+    }
+  }
+
+  const item = {
+    pk: {S: op.pk},
+    sk: {S: op.sk},
+    entityID: {S: op.owner},
+    entityType: {S: op.entityType},
+    payload: {S: viewDecoder.decode(op.payload)},
+  }
+  if (op.condition === 'absent') {
+    return {Put: {TableName: viewsTable, Item: item, ConditionExpression: VIEW_ABSENT}}
+  }
+
+  return {
+    Put: {
+      TableName: viewsTable,
+      Item: item,
+      ConditionExpression: VIEW_OWNED,
+      ExpressionAttributeValues: owner,
+    },
+  }
+}
+
+const viewDecoder = new TextDecoder('utf-8', {fatal: true})
 
 // A written stream's actions: its head update, its event puts and its snapshot put.
 function streamItems(table: string, commit: Commit, ttl: CommitTtl | undefined): TransactItem[] {

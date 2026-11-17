@@ -14,6 +14,7 @@ import {
   type NormalizedTransaction,
   type TransactionCommit,
   commitAsTransaction,
+  MAX_VIEW_PK_BYTES,
   compareUtf8,
   encodeEnvelope,
   encodeEvent,
@@ -30,6 +31,7 @@ import {
   transactionItems,
 } from '@photon-grove/evt/dynamodb'
 import {MemRepository, headFixtures} from '@photon-grove/evt/memory'
+import {LEDGER_PK} from './account.js'
 import {FaultRepository} from '@photon-grove/evt/testing'
 
 import {type Checks, canonical, field, list, loadFixture, plain, str} from './harness.js'
@@ -46,12 +48,27 @@ import {
   expectedOutcome,
   optionalList,
   optionalString,
+  stepViews,
   streamId,
   transactionCommit,
 } from './runner.js'
 
 // The expectations only the scenarios TypeScript doesn't support yet produce.
-const LATER_EXPECTATIONS = ['views']
+const LATER_EXPECTATIONS: readonly string[] = []
+
+// The results of a transaction step refused before any request, which records no actions.
+const REFUSED_BEFORE_WRITE = new Set([
+  'viewKeyTooLong',
+  'duplicateViewKey',
+  'projectorOnly',
+  'commitTooLarge',
+  'reserved',
+  'retentionConflict',
+  'unsupported',
+])
+
+// The views table the recorded actions name, which the fixture labels "views" whatever it is.
+const VIEWS_TABLE = 'views'
 
 // The marker version a fresh store's transactions check, and the table the fixture's actions
 // leave out.
@@ -116,10 +133,17 @@ async function runScenario(
       continue
     }
 
-    // The request a DynamoDB writer sends for the step, whether it commits or conflicts.
-    if (str(field(step, 'op')) === 'transaction') {
+    // The request a DynamoDB writer sends for the step, whether it commits or conflicts, unless
+    // the step was refused before any request.
+    if (str(field(step, 'op')) === 'transaction' && !REFUSED_BEFORE_WRITE.has(want.result)) {
       const transaction = normalizeTransaction(transactionCommit(runner.entityId, step))
-      const items = transactionItems(TABLE, transaction, MARKER_VERSION, () => undefined)
+      const items = transactionItems(
+        TABLE,
+        transaction,
+        MARKER_VERSION,
+        () => undefined,
+        VIEWS_TABLE,
+      )
       transactions.push({step: index, actions: items.map(action)})
     }
   }
@@ -131,6 +155,11 @@ async function runScenario(
 
   checks.equal(`${name}: entity ID`, runner.entityId, str(field(expected, 'entityId')))
   compareObserved(checks, name, await observe(repository, runner, runner.entityId), expected)
+  checks.equal(
+    `${name}: views`,
+    canonical(viewRows(repository, scenario, runner.entityId)),
+    canonical(optionalList(expected, 'views').map(plain)),
+  )
   if (outcomes) {
     checks.equal(
       `${name}: outcomes`,
@@ -153,6 +182,50 @@ async function runScenario(
       compareStream(checks, `${name} sibling ${suffix}`, observed, sibling)
     }
   }
+}
+
+/**
+ * The view rows a scenario left in its own partitions, as the fixture records them: the partitions
+ * its steps' views name and, with the ledger projector, the ledger's, by bytes, each row by sort key
+ * bytes, keeping the rows whose key names the scenario's stream.
+ */
+export function viewRows(repository: MemRepository, scenario: JsonValue, base: string): unknown[] {
+  return viewPartitions(scenario, base).flatMap((pk) =>
+    repository
+      .views()
+      .filter((row) => row.pk === pk && (row.pk.includes(base) || row.sk.includes(base)))
+      .map((row) => ({
+        pk: row.pk,
+        sk: row.sk,
+        dynamoItem: {
+          entityID: {S: row.entityId},
+          entityType: {S: row.entityType},
+          payload: {S: new TextDecoder().decode(row.payload)},
+          pk: {S: row.pk},
+          sk: {S: row.sk},
+        },
+      })),
+  )
+}
+
+/** The view partitions a scenario writes, by bytes: its steps' views' and the ledger's. */
+export function viewPartitions(scenario: JsonValue, base: string): string[] {
+  const partitions = new Set<string>()
+  for (const step of list(field(scenario, 'steps'))) {
+    for (const view of stepViews(base, step)) {
+      if (new TextEncoder().encode(view.op.pk).length <= MAX_VIEW_PK_BYTES) {
+        partitions.add(view.op.pk)
+      }
+    }
+  }
+  if (scenario instanceof Map && scenario.get('projector') === true) {
+    partitions.add(LEDGER_PK)
+  }
+
+  const sorted = [...partitions]
+  sorted.sort(compareUtf8)
+
+  return sorted
 }
 
 // The outcome rows a scenario's commands left, as DynamoDB items, by command ID bytes.
@@ -206,7 +279,9 @@ class Recorder extends FaultRepository {
     // The repository sends nothing for a commit that writes nothing at all.
     const {streams, fences, outcome} = normalized
     if (streams.length > 0 || fences.length > 0 || outcome !== null) {
-      this.calls.push(transactionItems(TABLE, normalized, MARKER_VERSION, () => undefined))
+      this.calls.push(
+        transactionItems(TABLE, normalized, MARKER_VERSION, () => undefined, VIEWS_TABLE),
+      )
     }
   }
 }
@@ -241,11 +316,17 @@ function action(item: TransactItem): unknown {
     },
   ]
   const key = body.Key ?? body.Item ?? {}
-  const recorded: Record<string, unknown> = {
-    operation,
-    pk: attribute(key, 'pk', 'S'),
-    sk: Number(attribute(key, 'sk', 'N')),
-  }
+  // A views-table action has a string sort key, recorded as skText beside a zero sk.
+  const textKey = 'S' in ((key['sk'] ?? {}) as object)
+  const recorded: Record<string, unknown> = textKey
+    ? {
+        operation,
+        table: 'views',
+        pk: attribute(key, 'pk', 'S'),
+        sk: 0,
+        skText: attribute(key, 'sk', 'S'),
+      }
+    : {operation, pk: attribute(key, 'pk', 'S'), sk: Number(attribute(key, 'sk', 'N'))}
   if (body.UpdateExpression !== undefined) {
     recorded.update = body.UpdateExpression
   }

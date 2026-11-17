@@ -5,15 +5,18 @@
 
 import {
   type Codec,
+  type CommitProjector,
   type Decision,
   type EventOf,
   JsonNumber,
   type JsonValue,
   defineAggregate,
   defineEvents,
+  deleteView,
   jsonUpcaster,
   compareUtf8,
   parseJson,
+  putView,
   stringifyJson,
 } from '@photon-grove/evt'
 
@@ -489,4 +492,35 @@ function safeInteger(value: JsonValue, name: string): number {
   }
 
   return number
+}
+
+/** The partition the shared ledger projector writes, one that names no entity. */
+export const LEDGER_PK = 'ledger'
+
+/**
+ * The shared commit-wide projector of the `projector` scenarios, as Go's `LedgerProjector` and
+ * Rust's write it: a current-state projector that keeps one ledger row per account it sees, keyed
+ * by the stream, with the balance, the status and the number of tags, and deletes the row while
+ * the balance is zero.
+ */
+export const ledgerProjector: CommitProjector = {
+  name: 'ledger',
+  project(commit) {
+    return commit.streams.map((stream) => {
+      const current = account.state.decode(stream.state)
+      if (current.balanceCents === 0) {
+        return deleteView(LEDGER_PK, stream.entityId, stream.entityId)
+      }
+
+      const payload = stringifyJson(
+        new Map<string, JsonValue>([
+          ['balanceCents', new JsonNumber(String(current.balanceCents))],
+          ['status', current.status],
+          ['tags', new JsonNumber(String(current.tags?.length ?? 0))],
+        ]),
+      )
+
+      return putView(LEDGER_PK, stream.entityId, stream.entityId, stream.entityType, payload)
+    })
+  },
 }
