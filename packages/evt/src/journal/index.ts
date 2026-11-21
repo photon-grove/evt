@@ -2,6 +2,23 @@
 // written in the commit that wrote the events. The stored shapes are the storage format's
 // "Journal" section, and compat/fixtures/journal.json, which Rust generates, pins them.
 
+export {
+  type Allocated,
+  Journal,
+  type JournalOptions,
+  JournalRowTooLargeError,
+  type ScopeResolver,
+  allocate,
+} from './config.js'
+export {PROJECTOR_NAME, PositionTaken, journalProjector} from './projector.js'
+export {
+  type Gap,
+  type JournalPage,
+  type JournalStore,
+  MAX_PAGE_ROWS,
+  highWatermark,
+  page,
+} from './read.js'
 export {type JournalState, replay, stateViews} from './replay.js'
 export {
   DEFAULT_MAX_ROW_BYTES,

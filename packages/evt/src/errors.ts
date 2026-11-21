@@ -74,6 +74,7 @@ import type {ProjectedView} from './projection.js'
  * - `invalidJournal`: a journal configuration, scope or stored allocation is invalid, such as an
  *   empty or oversized scope, or a malformed allocation in an event's metadata. Nothing was
  *   written.
+ * - `journalRowTooLarge`: a journal row is over the configured size cap. Nothing was written.
  */
 export type EvtErrorCode =
   | 'invalidJson'
@@ -117,6 +118,7 @@ export type EvtErrorCode =
   | 'historyDeclarationUnsupported'
   | 'commitOrder'
   | 'invalidJournal'
+  | 'journalRowTooLarge'
 
 export class EvtError extends Error {
   override readonly name: string = 'EvtError'

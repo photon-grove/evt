@@ -25,6 +25,31 @@ export const RESERVED_VIEW_PREFIXES: readonly string[] = Object.freeze([
   'journal-compaction#',
 ])
 
+/**
+ * The metadata extension key the engine keeps for the journal's allocations. Only the engine's own
+ * projectors see it: the journal adds it as it commits, after the store ran its projectors, so a
+ * live event never carries it and a stored one does, and hiding it keeps a live commit and a replay
+ * of the stored events in agreement.
+ */
+export const ENGINE_ALLOCATION_KEY = 'evt.journal'
+
+// The engine's own projectors (the journal's). Membership is the seal: nothing outside this
+// package can add a projector, so an application projector can't opt into the engine's metadata
+// or partitions.
+const engineProjectors = new WeakSet<CommitProjector>()
+
+/** Marks one of the engine's own projectors. Internal: the package entry points don't export it. */
+export function engineProjector<P extends CommitProjector>(projector: P): P {
+  engineProjectors.add(projector)
+
+  return projector
+}
+
+/** Whether a projector is one of the engine's own, which an application can't register. */
+export function isEngineProjector(projector: CommitProjector): boolean {
+  return engineProjectors.has(projector)
+}
+
 /** The longest view partition key, in UTF-8 bytes (DynamoDB's own limit). */
 export const MAX_VIEW_PK_BYTES = 2048
 
@@ -216,9 +241,10 @@ export function projectViews(
   const projected: ProjectedView[] = []
   projectors.forEach((projector, projectorIndex) => {
     const history = projector.history ?? []
+    const engine = isEngineProjector(projector)
     let operations: readonly ViewOperation[]
     try {
-      operations = projector.project(visibleTo(view, history))
+      operations = projector.project(visibleTo(view, history, engine))
     } catch (error) {
       throw new ProjectorError(projector.name, error)
     }
@@ -226,7 +252,9 @@ export function projectViews(
     operations.forEach((op, operation) => {
       const item: ProjectedView = {projector: projector.name, projectorIndex, operation, op}
       checkOwner(item, view, history)
-      checkUnreserved(item)
+      if (!engine) {
+        checkUnreserved(item)
+      }
       projected.push(item)
     })
   })
@@ -350,10 +378,11 @@ function checkUnreserved(view: ProjectedView): void {
 
 // The view a projector is given: a current-state projector gets an empty commit ID and no events,
 // and the state of every stream; a history-dependent one gets the commit ID, and the events and
-// state of the streams of the types it names only.
+// state of the streams of the types it names only, without the engine's metadata unless it's one
+// of the engine's own projectors.
 // Each projector gets its own copies, so none can change what another one sees. A copy is a new
 // array, never a slice, which a Node Buffer shares with its source.
-function visibleTo(view: CommitView, history: readonly string[]): CommitView {
+function visibleTo(view: CommitView, history: readonly string[], engine: boolean): CommitView {
   if (history.length === 0) {
     return {
       commitId: '',
@@ -369,13 +398,22 @@ function visibleTo(view: CommitView, history: readonly string[]): CommitView {
     commitId: view.commitId,
     streams: view.streams.map((stream) =>
       history.includes(stream.entityType)
-        ? {...stream, events: stream.events.map(copyEvent), state: new Uint8Array(stream.state)}
+        ? {
+            ...stream,
+            events: stream.events.map((event) => copyEvent(event, engine)),
+            state: new Uint8Array(stream.state),
+          }
         : {...stream, events: [], state: new Uint8Array()},
     ),
   }
 }
 
-function copyEvent(event: SerializedEvent): SerializedEvent {
+function copyEvent(event: SerializedEvent, engine: boolean): SerializedEvent {
+  const extensions = new Map(event.metadata.extensions)
+  if (!engine) {
+    extensions.delete(ENGINE_ALLOCATION_KEY)
+  }
+
   return {
     ...event,
     payload: event.payload && new Uint8Array(event.payload),
@@ -383,7 +421,7 @@ function copyEvent(event: SerializedEvent): SerializedEvent {
       ...event.metadata,
       trace: event.metadata.trace && new Map(event.metadata.trace),
       origin: event.metadata.origin && {...event.metadata.origin},
-      extensions: new Map(event.metadata.extensions),
+      extensions,
     },
   }
 }

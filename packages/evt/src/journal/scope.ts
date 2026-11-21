@@ -5,10 +5,11 @@ import {EvtError} from '../errors.js'
 import type {SerializedEvent} from '../event.js'
 import {JsonNumber, type JsonValue, parseJson, quote} from '../json.js'
 import type {Metadata} from '../metadata.js'
+import {ENGINE_ALLOCATION_KEY} from '../projection.js'
 import {compareUtf8, isHighSurrogate, isLowSurrogate, utf8Length} from '../utf8.js'
 
 /** The metadata extension key an event's allocations are stored under. */
-export const ALLOCATION_KEY = 'evt.journal'
+export const ALLOCATION_KEY = ENGINE_ALLOCATION_KEY
 
 /** The longest scope, in UTF-8 bytes. */
 export const MAX_SCOPE_BYTES = 512
@@ -102,9 +103,7 @@ export interface Allocation {
  * objects, in the order given (an event's are ascending by scope bytes).
  */
 export function encodeAllocations(list: readonly Allocation[]): string {
-  const items = list.map(
-    ({scope, position}) => `{"scope":${quote(scope)},"position":${position}}`,
-  )
+  const items = list.map(({scope, position}) => `{"scope":${quote(scope)},"position":${position}}`)
 
   return `[${items.join(',')}]`
 }

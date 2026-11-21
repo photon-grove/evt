@@ -8,7 +8,9 @@ import {
   decodeEvent,
   encodeEvent,
   encodeManifest,
+  groupCommits,
   parseJson,
+  projectViews,
   stringifyJson,
 } from '@photon-grove/evt'
 import {markerItem, viewRowItem} from '@photon-grove/evt/dynamodb'
@@ -16,12 +18,14 @@ import {
   ALLOCATION_KEY,
   COUNTER_SORT_KEY,
   DEFAULT_MAX_ROW_BYTES,
+  Journal,
   MAX_SCOPE_BYTES,
   POSITION_WIDTH,
   allocations,
   counterPartitionKey,
   counterView,
   encodeAllocations,
+  journalProjector,
   journalRowFromView,
   parseRowSortKey,
   replay,
@@ -163,6 +167,29 @@ function commitVectors(checks: Checks, commit: JsonValue): void {
     )
   }
 
+  // The engine's regroup-and-replay of the journal's projector reproduces the rows too.
+  checks.run('journal projector replays the rows', () => {
+    const journal = new Journal(['account'], () => [])
+    const projected = groupCommits(events).flatMap((view) =>
+      projectViews([journalProjector(journal)], view),
+    )
+    const items = projected.map(({op}) =>
+      viewRowItem({
+        pk: op.pk,
+        sk: op.sk,
+        entityId: op.owner,
+        entityType: op.entityType,
+        payload: op.payload,
+      }),
+    )
+    // The projector writes in event order; compare as sets.
+    checks.equal(
+      'journal projector rows',
+      sortedTexts(items).join('\n'),
+      sortedTexts(state.rows.map(({row}) => viewRowItem(row))).join('\n'),
+    )
+  })
+
   const measured = field(commit, 'measuredRowSize')
   const event = events.find((candidate) => candidate.id === str(field(measured, 'event')))!
   checks.equal(
@@ -175,6 +202,14 @@ function commitVectors(checks: Checks, commit: JsonValue): void {
 // A position, which the fixture writes as a decimal string so a u64 survives every JSON reader.
 function at(value: JsonValue): bigint {
   return BigInt(str(value))
+}
+
+// Documents as sorted canonical texts, to compare as sets.
+function sortedTexts(values: unknown[]): string[] {
+  const texts = values.map(canonical)
+  texts.sort()
+
+  return texts
 }
 
 function metadataWith(value: string): SerializedEvent['metadata'] {
