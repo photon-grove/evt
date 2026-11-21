@@ -157,3 +157,21 @@ export {
   Store,
   type StoreOptions,
 } from './store.js'
+export {
+  DEFAULT_VIEW_SK,
+  type PageOptions,
+  type ViewPage,
+  type ViewRepository,
+  type ViewRow,
+  decodeViewCursor,
+  encodeViewCursor,
+} from './views.js'
+export {
+  type DecodeErrorHandler,
+  type LenientListOptions,
+  SingleView,
+  type ValuePage,
+  ViewCodec,
+  ViewDecodeError,
+  decodeJsonView,
+} from './viewcodec.js'

@@ -53,3 +53,21 @@ export {
   snapshotTransaction,
   transactionItems,
 } from './requests.js'
+export {
+  type BatchGetItemInput,
+  type BatchWriteItemInput,
+  type DynamoViewClient,
+  DynamoViewRepository,
+  type DynamoViewRepositoryOptions,
+  ENTITY_TYPE_INDEX,
+  MAX_VIEW_BATCH_GET,
+  MAX_VIEW_BATCH_WRITE,
+  type ViewQueryInput,
+  type WriteRequest,
+  encodeItemCursor,
+  viewKey,
+  viewQueryByEntityType,
+  viewQueryByPk,
+  viewRowFromItem,
+  viewRowItem,
+} from './view-repository.js'

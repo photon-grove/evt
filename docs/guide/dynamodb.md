@@ -277,9 +277,27 @@ way. The entity-type listings read the `entityType-index` global secondary index
 can only read eventually consistently, so a row a commit just wrote can be missing from them for a
 moment. Rust's `DynamoViewRepository` behaves the same way (`with_consistent_read`).
 
+The TypeScript package's `DynamoViewRepository` (`@photon-grove/evt/dynamodb`) sends the same
+requests and writes the same items, with the same consistency (`{consistentRead: false}` opts the
+partition listings out), and `ViewCodec<T>` is its typed layer, `viewcodec.Codec` and
+`viewcodec.Single` in one:
+
+```ts
+const views = new DynamoViewRepository(new DynamoDB({}), 'views')
+const handles = new ViewCodec<{owner: string}>(views, 'account')
+await handles.put('handles', 'ada', 'acct-1', {owner: 'acct-1'})
+const page = await views.listViewsByPkPaged('handles', {limit: 50})
+// page.nextCursor continues the listing, in this process or in a Go or Rust one
+```
+
+A page's cursor is padded base64url JSON of the last key, Go's byte for byte. Rust and TypeScript
+refuse a cursor that doesn't continue the same listing, which DynamoDB would refuse anyway, with an
+invalid-argument error before any request.
+
 The view repository refuses U+0000 in a written row's key, owner, entity type or payload (a
 `PutViews` batch holding one writes nothing), and in a key or entity type a read, delete or list
-names, with `evt.ErrInvalidArgument` before any request (Rust `Error::InvalidArgument`).
+names, with `evt.ErrInvalidArgument` before any request (Rust `Error::InvalidArgument`, TypeScript
+an `EvtError` with code `invalidArgument`).
 PostgreSQL can't store it, so every backend refuses it alike. A row written with U+0000 before
 this check can no longer be read, listed or deleted through the repository: remove it out of band.
 
