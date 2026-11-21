@@ -10,3 +10,4 @@ export {
   controlFixtures,
   headFixtures,
 } from './repository.js'
+export {MemViewRepository} from './views.js'

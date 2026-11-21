@@ -12,8 +12,8 @@ npm install @photon-grove/evt
 ```
 
 So far it has the core, multi-stream transactions with read fences, command outcomes,
-commit-wide projectors, the in-memory, DynamoDB and PostgreSQL backends, and the testing helpers.
-The
+commit-wide projectors, the in-memory, DynamoDB and PostgreSQL backends, the view repository
+with its typed view codec, and the testing helpers. The
 [feature matrix](https://github.com/photon-grove/evt/blob/main/docs/reference/feature-matrix.md)
 tracks each one. The
 [getting started guide](https://github.com/photon-grove/evt/blob/main/docs/guide/getting-started.md#the-same-model-in-typescript)
@@ -23,10 +23,10 @@ builds a bank account aggregate with it, end to end.
 
 | Import                       | Contents                                                                   |
 | ---------------------------- | -------------------------------------------------------------------------- |
-| `@photon-grove/evt`          | Aggregates, codecs, upcasters, the `Store`, retry, and the wire codecs     |
-| `@photon-grove/evt/memory`   | `MemRepository`, the in-memory backend for tests and local development     |
+| `@photon-grove/evt`          | Aggregates, codecs, the `Store`, retry, `ViewCodec`, and the wire codecs   |
+| `@photon-grove/evt/memory`   | `MemRepository` and `MemViewRepository`, for tests and local use           |
 | `@photon-grove/evt/testing`  | `scenario` and `Fixture`, the given/when/then helpers over `MemRepository` |
-| `@photon-grove/evt/dynamodb` | `DynamoRepository`, `viewProjector`, and the item and request codecs       |
+| `@photon-grove/evt/dynamodb` | `DynamoRepository`, `viewProjector`, `DynamoViewRepository`, item codecs   |
 | `@photon-grove/evt/postgres` | `PgRepository`, its `ViewWriter`, and the schema: tables and `schemaDdl`   |
 
 ## DynamoDB
@@ -105,6 +105,50 @@ Any other error the database raises fails the commit with a `ProjectorOperationE
 `reason` is the SQLSTATE, and each view counts in the commit budget as one action the size of its
 SQL text. Without a writer, a commit that carries view operations is refused with a
 `ViewsNotConfiguredError`.
+
+## Views
+
+A `ViewRepository` reads and writes view rows outside the commit path, as Go's
+`dynamo.ViewRepository` and Rust's `ViewRepository` do: `getView`, `putView` (with an optional
+`ttl` in Unix seconds), `putViews`, `deleteView`, `batchGetViews`, and listings by partition key and
+by entity type, whole or a page at a time. `DynamoViewRepository` works on the views table the
+[DynamoDB guide](https://github.com/photon-grove/evt/blob/main/docs/guide/dynamodb.md#entity-views-table)
+describes, and `MemViewRepository` keeps rows in memory:
+
+```ts
+import {DynamoDB} from '@aws-sdk/client-dynamodb'
+import {ViewCodec} from '@photon-grove/evt'
+import {DynamoViewRepository} from '@photon-grove/evt/dynamodb'
+
+interface Balance {
+  accountId: string
+  cents: number
+}
+
+const views = new DynamoViewRepository(new DynamoDB({}), 'views')
+const balances = new ViewCodec<Balance>(views, 'balance').single(
+  (accountId: string) => `balance#${accountId}`,
+  (balance) => balance.accountId,
+)
+await balances.put('acct-1', {accountId: 'acct-1', cents: 500})
+const balance = await balances.get('acct-1') // null when there is no row
+```
+
+Point reads and partition listings are strongly consistent on DynamoDB, so a handler reads its
+own commit's rows; `{consistentRead: false}` halves the cost of a partition listing. Entity-type
+listings read the `entityType-index` index, so they can lag behind a commit. A page's `nextCursor`
+is Go's cursor byte for byte, so a Go, Rust or TypeScript process can continue another's listing.
+A cursor from another listing is refused, as are U+0000 or a lone surrogate anywhere in a row or a
+key, an empty `pk`, and a payload that isn't UTF-8.
+
+`ViewCodec<T>` writes a value as a row's payload with a payload codec, `json()` by default, and
+decodes it back; a row that doesn't decode throws a `ViewDecodeError` naming it, and the lenient
+`listByPk` and `listAll` skip such rows and report them to `onDecodeError`. A view a Go or Rust
+service reads must declare its properties in the Go struct's order, as for events. These writes are
+unconditional and part of no commit, so keep them to rows no commit-wide projector owns, and to
+rebuilds: a view is a projection, and every row must come back when the events are replayed.
+PostgreSQL has no view repository in Go, and Rust's `PgViewRepository` belongs to the PostgreSQL
+views table, which comes later.
 
 ## Runtimes
 

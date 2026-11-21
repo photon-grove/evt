@@ -16,7 +16,8 @@ export function slugifyHeading(text: string): string {
 export function titleFromMarkdown(markdown: string): string | undefined {
   const match = markdown.match(/^#\s+(.+?)\s*$/m)
 
-  return match ? match[1].trim() : undefined
+  // Titles render as plain text, so drop inline-code backticks rather than show them.
+  return match ? match[1].replace(/`([^`]*)`/g, '$1').trim() : undefined
 }
 
 // humanizeSlug is the last-resort title for a doc with no H1: turn the final path segment into
