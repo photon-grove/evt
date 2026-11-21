@@ -25,6 +25,11 @@ import {
  */
 export class FaultRepository implements OutcomeRepository {
   readonly inner: OutcomeRepository
+  /** The wrapped repository's declaration, present only when it declares. */
+  declare readonly declareHistoryDependent?: (
+    types: readonly string[],
+    options?: CallOptions,
+  ) => Promise<void>
   #fault: {apply: boolean; cause: unknown} | null = null
 
   constructor(inner: OutcomeRepository) {
@@ -33,6 +38,11 @@ export class FaultRepository implements OutcomeRepository {
     }
 
     this.inner = inner
+    // A capability the store tests for, so it's here only when the wrapped repository has it.
+    const declare = inner.declareHistoryDependent
+    if (declare !== undefined) {
+      this.declareHistoryDependent = (types, options) => declare.call(inner, types, options)
+    }
   }
 
   /** The next commit applies, and then throws an `IndeterminateError` with `cause`. */

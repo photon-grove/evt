@@ -129,6 +129,14 @@ export interface Repository {
    */
   writesViews?(): boolean
 
+  /**
+   * Durably adds the entity types to the feature manifest's historyDependent set, so compaction
+   * refuses them in every process. Types already declared are left alone, and nothing is written
+   * when there are none to add. A store runs a history-dependent commit-wide projector only on a
+   * repository that declares, and declares its types before the first commit that runs it.
+   */
+  declareHistoryDependent?(types: readonly string[], options?: CallOptions): Promise<void>
+
   /** Every stored event of the stream, ascending. */
   events(entityId: string, options?: CallOptions): Promise<SerializedEvent[]>
 

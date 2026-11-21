@@ -26,6 +26,7 @@ if [ -z "$ts_scenarios" ]; then
   echo "the TypeScript driver lists no scenarios" >&2
   exit 1
 fi
+ts_exclusive="$("${ts_driver[@]}" exclusive --backend "$backend")"
 
 # pass RUN [go|rust]: one cross-language run under its own run ID. With a writer name, the
 # TypeScript driver writes that language's steps, and the pass takes only the scenarios TypeScript
@@ -59,24 +60,36 @@ pass() {
 
   # An exclusive scenario holds store-wide state across its steps (a rebuild lock refuses every
   # other scenario's commits), so it runs alone, after the interleaved scenarios, one step at a
-  # time. TypeScript supports none yet, so only the first pass runs them. A failed exclusive step
-  # must not leave its rebuild lock or a declared feature behind for the next run: settle the fence
-  # and the feature marker.
+  # time. A pass in which TypeScript stands in runs the exclusive scenarios it supports. A failed
+  # exclusive step must not leave its rebuild lock or a declared feature behind for the next run:
+  # settle the fence and the feature marker.
+  local exclusive_scenarios scenario exclusive_steps
   if [ -z "$as" ]; then
-    trap '"$go_driver" settle -backend "$backend" || true' ERR
-    local exclusive_scenarios scenario exclusive_steps
     exclusive_scenarios="$("$go_driver" exclusive)"
-    while IFS= read -r scenario; do
-      [ -n "$scenario" ] || continue
-      exclusive_steps="$("$go_driver" steps -only "$scenario")"
-      echo "run ${run}: ${exclusive_steps} exclusive steps of ${scenario} against ${backend}"
-      for ((index = 0; index < exclusive_steps; index++)); do
-        "$go_driver" step -backend "$backend" -run "$run" -index "$index" -only "$scenario"
-        "$rust_driver" step --backend "$backend" --run "$run" --index "$index" --only "$scenario"
-      done
-    done <<<"$exclusive_scenarios"
-    trap - ERR
+  else
+    exclusive_scenarios="$ts_exclusive"
   fi
+  trap '"$go_driver" settle -backend "$backend" || true' ERR
+  while IFS= read -r scenario; do
+    [ -n "$scenario" ] || continue
+    exclusive_steps="$("$go_driver" steps -only "$scenario")"
+    echo "run ${run}: ${exclusive_steps} exclusive steps of ${scenario} against ${backend}"
+    for ((index = 0; index < exclusive_steps; index++)); do
+      if [ "$as" = go ]; then
+        "${ts_driver[@]}" step --backend "$backend" --run "$run" --index "$index" --as go \
+          --only "$scenario"
+      else
+        "$go_driver" step -backend "$backend" -run "$run" -index "$index" -only "$scenario"
+      fi
+      if [ "$as" = rust ]; then
+        "${ts_driver[@]}" step --backend "$backend" --run "$run" --index "$index" --as rust \
+          --only "$scenario"
+      else
+        "$rust_driver" step --backend "$backend" --run "$run" --index "$index" --only "$scenario"
+      fi
+    done
+  done <<<"$exclusive_scenarios"
+  trap - ERR
 
   "$go_driver" verify -backend "$backend" -run "$run" -scenarios "$listed"
   "$rust_driver" verify --backend "$backend" --run "$run" --scenarios "$listed"
