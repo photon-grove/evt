@@ -68,9 +68,11 @@ export function followSystemTheme(
   return () => query.removeEventListener('change', listener)
 }
 
-// initialLang is Rust unless the reader picked Go.
+// initialLang is Rust unless the reader picked Go or TypeScript.
 export function initialLang(store: PreferenceStore | null): Lang {
-  return readPreference(store, LANG_KEY) === 'go' ? 'go' : 'rust'
+  const value = readPreference(store, LANG_KEY)
+
+  return value === 'go' || value === 'ts' ? value : 'rust'
 }
 
 // Reading window.localStorage itself throws when site data is blocked.

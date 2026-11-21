@@ -96,12 +96,12 @@ const DOC_CONFIG: Record<string, DocConfig> = {
   'reference/storage-format': {
     group: REFERENCE,
     order: 20,
-    summary: 'The normative byte-level format that Rust and Go both read and write.',
+    summary: 'The normative byte-level format that Rust and Go both read and write, and that TypeScript checks itself against.',
   },
   'reference/feature-matrix': {
     group: REFERENCE,
     order: 21,
-    summary: 'Which features each language implements today.',
+    summary: 'Which features Go, Rust and TypeScript each implement today.',
   },
 }
 

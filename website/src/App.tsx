@@ -9,9 +9,13 @@ import {
   type ContentCard,
   cookbook,
   examples,
+  fixtures,
+  implementations,
   installCommand,
   type Lang,
+  langExt,
   langs,
+  npmUrl,
   packages,
   quickStart,
   repoUrl,
@@ -21,6 +25,8 @@ import {diagrams} from './diagrams'
 import {docBySlug} from './docs'
 import {DocPage, DocsIndex} from './DocsView'
 import {highlightCode} from './highlight'
+import type {Status} from './markdown'
+import {siteParityRows} from './parity'
 import {type Theme, useLang, useTheme} from './preferences'
 import {photonGroveUrl} from './siteConfig'
 import {useHashRoute} from './useHashRoute'
@@ -51,9 +57,10 @@ function LangSwitch({lang, onChange, label}: {lang: Lang; onChange: (lang: Lang)
           key={option.id}
           className={option.id === lang ? 'is-active' : undefined}
           aria-pressed={option.id === lang}
+          title={option.label}
           onClick={() => onChange(option.id)}
         >
-          {option.label}
+          {option.short}
         </button>
       ))}
     </div>
@@ -88,6 +95,30 @@ function CodeCard({file, code, language, children}: {file: string; code: string;
       <pre>
         <HighlightedCode code={code} language={language} />
       </pre>
+    </figure>
+  )
+}
+
+// PendingCard stands in for a code sample in a language that doesn't have the feature yet.
+function PendingCard({file, note, children}: {file: string; note: string; children?: React.ReactNode}) {
+  return (
+    <figure className="code-card is-pending">
+      <figcaption className="code-head">
+        <span className="dots" aria-hidden="true">
+          <i />
+          <i />
+          <i />
+        </span>
+        <span className="code-file">{file}</span>
+        {children}
+      </figcaption>
+      <div className="pending-body">
+        <span className="pending-badge">Not in this language yet</span>
+        <p>{note}</p>
+        <a className="card-link" href="#/docs/reference/feature-matrix">
+          Feature matrix →
+        </a>
+      </div>
     </figure>
   )
 }
@@ -146,7 +177,7 @@ function Brand() {
     <a className="brand" href="#/" aria-label="evt home">
       <EvtMark size={34} />
       <span className="brand-word">evt</span>
-      <span className="brand-text">Event sourcing for Rust and Go</span>
+      <span className="brand-text">Event sourcing for Rust, Go and TypeScript</span>
     </a>
   )
 }
@@ -155,18 +186,196 @@ function Nav({theme, onToggleTheme}: {theme: Theme; onToggleTheme: () => void}) 
   return (
     <header className="nav">
       <Brand />
-      <nav aria-label="Primary navigation">
+      <nav className="nav-links" aria-label="Primary navigation">
         <a href="#start">Quick start</a>
         <a href="#concepts">Concepts</a>
+        <a href="#languages">Languages</a>
         <a href="#features">Features</a>
-        <a href="#examples">Examples</a>
+        <a href="#status">Status</a>
         <a href="#/docs">Docs</a>
+      </nav>
+      <div className="nav-actions">
         <ThemeToggle theme={theme} onToggle={onToggleTheme} />
         <a className="nav-cta" href={repoUrl}>
           GitHub ↗
         </a>
-      </nav>
+      </div>
     </header>
+  )
+}
+
+function TourCode({stop, lang, onLang}: {stop: (typeof tour)[number]; lang: Lang; onLang: (lang: Lang) => void}) {
+  const file = `${stop.id}.${langExt(lang)}`
+  const code = stop.code[lang]
+  const switcher = <LangSwitch lang={lang} onChange={onLang} label="Code language" />
+
+  if (code === undefined) {
+    return (
+      <PendingCard file={file} note={stop.pending?.[lang] ?? 'This piece has not reached this language yet.'}>
+        {switcher}
+      </PendingCard>
+    )
+  }
+
+  return (
+    <CodeCard file={file} code={code} language={lang}>
+      {switcher}
+    </CodeCard>
+  )
+}
+
+function StatusPill({status}: {status: Status | undefined}) {
+  if (!status) {
+    return <span className="status status-na">Unknown</span>
+  }
+
+  return (
+    <span className={`status status-${status.kind}`} title={status.label}>
+      <span className="status-dot" aria-hidden="true" />
+      <span className="status-text">{status.kind === 'na' ? '—' : status.label}</span>
+    </span>
+  )
+}
+
+const LEGEND: {kind: Status['kind']; label: string}[] = [
+  {kind: 'shipped', label: 'Shipped'},
+  {kind: 'progress', label: 'In progress'},
+  {kind: 'planned', label: 'Planned'},
+  {kind: 'deferred', label: 'Deferred'},
+  {kind: 'na', label: 'Not applicable'},
+]
+
+function ParityBand() {
+  const rows = useMemo(() => siteParityRows(), [])
+  if (rows.length === 0) {
+    return null
+  }
+
+  return (
+    <section className="band parity-band" id="status">
+      <div className="section-heading">
+        <p className="eyebrow">Status</p>
+        <h2>Where each language stands today.</h2>
+        <p className="section-sub">
+          This grid is read from the <a href="#/docs/reference/feature-matrix">feature matrix</a> when
+          the site is built, so it shows what is on the default branch, not plans. TypeScript is being
+          ported in phases, and its cells fill in as each phase lands.
+        </p>
+      </div>
+      <ul className="parity-legend" aria-label="Legend">
+        {LEGEND.map((item) => (
+          <li key={item.kind}>
+            <span className={`status status-${item.kind}`}>
+              <span className="status-dot" aria-hidden="true" />
+            </span>
+            {item.label}
+          </li>
+        ))}
+      </ul>
+      <div className="parity-frame">
+        <table className="parity">
+          <thead>
+            <tr>
+              <th scope="col">Capability</th>
+              {langs.map((option) => (
+                <th scope="col" key={option.id}>
+                  <span className="parity-lang-long">{option.label}</span>
+                  <span className="parity-lang-short" aria-hidden="true">
+                    {option.short}
+                  </span>
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((row) => (
+              <tr key={row.label}>
+                <th scope="row">{row.label}</th>
+                {langs.map((option) => (
+                  <td key={option.id}>
+                    <StatusPill status={row.statuses[option.id]} />
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <p className="parity-more">
+        <a className="card-link" href="#/docs/reference/feature-matrix">
+          Every capability, with notes →
+        </a>
+      </p>
+    </section>
+  )
+}
+
+function LanguagesBand() {
+  return (
+    <section className="band languages-band" id="languages">
+      <div className="section-heading">
+        <p className="eyebrow">One format, three languages</p>
+        <h2>Write a stream from Rust. Read it from Go.</h2>
+        <p className="section-sub">
+          evt isn't a binding. Each language is a native implementation of one normative storage
+          format, and shared golden fixtures check them byte for byte. Go and Rust also take turns
+          writing the same streams in live runs against DynamoDB and PostgreSQL, and the TypeScript
+          driver joins those runs for the scenarios it supports.
+        </p>
+      </div>
+
+      <div className="format-flow">
+        <ul className="impl-grid">
+          {implementations.map((impl) => (
+            <li key={impl.lang}>
+              <a className={`impl impl-${impl.lang}`} href={impl.href}>
+                <span className="impl-top">
+                  <span className={`lang-badge lang-badge-${impl.lang}`}>{langs.find((option) => option.id === impl.lang)?.label}</span>
+                  <span className={`impl-status impl-status-${impl.status}`}>{impl.statusLabel}</span>
+                </span>
+                <code className="impl-name">{impl.name}</code>
+                <span className="impl-body">{impl.body}</span>
+                <span className="impl-registry">{impl.registry} ↗</span>
+              </a>
+            </li>
+          ))}
+        </ul>
+
+        <div className="format-spine" aria-hidden="true">
+          <span />
+          <span />
+          <span />
+        </div>
+
+        <a className="format-bar" href="#/docs/reference/storage-format">
+          <span className="format-title">
+            <strong>One storage format</strong>
+            <span className="format-normative">normative</span>
+          </span>
+          <span className="format-parts">
+            DynamoDB items · PostgreSQL rows · event JSON · snapshots · outcome rows · stream envelopes
+          </span>
+          <span className="format-link">Read the spec →</span>
+        </a>
+
+        <div className="fixture-panel">
+          <p className="fixture-caption">
+            <strong>compat/fixtures</strong> · Go generates most vectors and Rust its extensions'.
+            TypeScript checks itself against the ones it covers so far. Nobody edits them by hand.
+          </p>
+          <ul className="fixture-list">
+            {fixtures.map((fixture) => (
+              <li key={fixture.file}>
+                <a href={`${repoUrl}/blob/main/compat/fixtures/${fixture.file}`}>
+                  <code>{fixture.file}</code>
+                  <span className={`tag tag-${fixture.writer.toLowerCase()}`}>{fixture.writer}</span>
+                </a>
+              </li>
+            ))}
+          </ul>
+        </div>
+      </div>
+    </section>
   )
 }
 
@@ -241,9 +450,7 @@ function ConceptTour({lang, onLang}: {lang: Lang; onLang: (lang: Lang) => void})
             </button>
           </div>
         </div>
-        <CodeCard file={`${stop.id}.${lang === 'go' ? 'go' : 'rs'}`} code={stop.code[lang]} language={lang}>
-          <LangSwitch lang={lang} onChange={onLang} label="Code language" />
-        </CodeCard>
+        <TourCode stop={stop} lang={lang} onLang={onLang} />
       </div>
     </section>
   )
@@ -256,21 +463,27 @@ function Home({lang, onLang}: {lang: Lang; onLang: (lang: Lang) => void}) {
     <>
       <section className="hero" id="top">
         <div className="hero-copy">
-          <p className="eyebrow">Event sourcing for Rust and Go</p>
+          <p className="eyebrow">Event sourcing for Rust, Go and TypeScript</p>
           <h1>
             Immutable events as truth. <span className="accent">Views you can rebuild.</span>
           </h1>
           <p className="lede">
-            evt is a library for event-sourced services. Aggregates handle commands, the events they
-            decide on go into an append-only log in <strong>DynamoDB</strong> or{' '}
-            <strong>PostgreSQL</strong>, and views are projections derived from that log, so it can
-            reproduce them. Rust and Go read and write the same bytes.
+            evt is a library for event-sourced services. Aggregates turn commands into immutable
+            events, each command commits atomically to an append-only log in{' '}
+            <strong>DynamoDB</strong> or <strong>PostgreSQL</strong>, and views are derived from that
+            log, so it can reproduce them. <strong>Rust, Go and TypeScript</strong> implement one
+            storage format, checked byte for byte.
           </p>
           <div className="install">
-            <LangSwitch lang={lang} onChange={onLang} label="Install language" />
-            <span className="prompt">$</span>
-            <code>{installCommand[lang]}</code>
-            <CopyButton value={installCommand[lang]} label="Copy install command" />
+            <div className="install-head">
+              <LangSwitch lang={lang} onChange={onLang} label="Install language" />
+              {lang === 'ts' ? <span className="install-note">being ported</span> : null}
+            </div>
+            <div className="install-line">
+              <span className="prompt">$</span>
+              <code>{installCommand[lang]}</code>
+              <CopyButton value={installCommand[lang]} label="Copy install command" />
+            </div>
           </div>
           <div className="hero-actions">
             <a className="button primary" href="#start">
@@ -282,7 +495,7 @@ function Home({lang, onLang}: {lang: Lang; onLang: (lang: Lang) => void}) {
           </div>
           <ul className="hero-facts" aria-label="At a glance">
             <li>Apache-2.0</li>
-            <li>Rust crates · Go module</li>
+            <li>Rust crate · Go module · npm package</li>
             <li>No runtime, no base types</li>
           </ul>
         </div>
@@ -302,6 +515,8 @@ function Home({lang, onLang}: {lang: Lang; onLang: (lang: Lang) => void}) {
           ))}
         </div>
       </section>
+
+      <LanguagesBand />
 
       <section className="band split-band" id="start">
         <div className="split-copy">
@@ -345,6 +560,8 @@ function Home({lang, onLang}: {lang: Lang; onLang: (lang: Lang) => void}) {
           ))}
         </div>
       </section>
+
+      <ParityBand />
 
       <section className="band diagram-section" id="diagrams">
         <div className="section-heading">
@@ -459,6 +676,7 @@ export function App() {
             <a href="#/docs/reference/feature-matrix">Feature matrix</a>
             <a href="https://pkg.go.dev/github.com/photon-grove/evt/go">pkg.go.dev ↗</a>
             <a href="https://docs.rs/photon-evt">docs.rs ↗</a>
+            <a href={npmUrl}>npm ↗</a>
             <a href={repoUrl}>GitHub ↗</a>
           </nav>
         </div>

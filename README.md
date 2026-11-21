@@ -2,7 +2,7 @@
   <a href="https://photon-grove.github.io/evt/">
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="docs/assets/evt-banner-dark.svg">
-      <img alt="evt: event sourcing for Rust and Go" src="docs/assets/evt-banner-light.svg" width="820">
+      <img alt="evt: event sourcing for Rust, Go and TypeScript" src="docs/assets/evt-banner-light.svg" width="820">
     </picture>
   </a>
 </p>
@@ -25,18 +25,27 @@
   <a href="docs/reference/feature-matrix.md">Feature matrix</a>
 </p>
 
-evt is an event-sourcing library for Rust, with a Go module that reads and writes the same log.
-The record of truth is an append-only log of events, and an aggregate's state (an account, an
-order, a document) is whatever you get by folding its events in order. You don't adopt a runtime
-or inherit from a base type. You implement a handful of traits or interfaces and use the pieces
-you need.
+evt is an event-sourcing library with three native implementations, in Rust, Go and TypeScript,
+that read and write one storage format byte for byte. The record of truth is an append-only log
+of immutable events, and an aggregate's state (an account, an order, a document) is whatever you
+get by folding its events in order. You don't adopt a runtime or inherit from a base type. You
+implement a handful of traits or interfaces and use the pieces you need.
 
 Reach for it when the history matters as much as the current state: an audit trail you can trust,
 read models you can delete and rebuild, and retries that never record the same fact twice. Because
-the Rust and Go code share one storage format byte for byte, a Rust service and a Go service can
-append to the same streams. A TypeScript package, [`@photon-grove/evt`](packages/evt/README.md), is
-being built to the same format in phases. So far it has the core, the in-memory backend and the
-testing helpers.
+the implementations share their storage format, a Rust service and a Go service can append to the
+same streams today, and the TypeScript package is held to the same fixtures as it's built.
+
+## Pick your language
+
+| | Install | Status |
+| --- | --- | --- |
+| **Rust** · [`photon-evt`](crates/evt/README.md) | `cargo add photon-evt` | Shipping, with the most features: the core, fenced rebuilds, the sync journal, and [`photon-evt-lambda`](crates/evt-lambda/README.md) for DynamoDB Streams |
+| **Go** · [`github.com/photon-grove/evt/go`](go/README.md) | `go get github.com/photon-grove/evt/go` | Shipping: the original module, with the core, fenced rebuilds and the `evt-doctor` CLI. The journal is Rust-only for now |
+| **TypeScript** · [`@photon-grove/evt`](packages/evt/README.md) | `npm install @photon-grove/evt` | Being ported in phases. The core, command outcomes, fence-aware retry and the in-memory backend are in. Multi-stream transactions, read fences and the DynamoDB and PostgreSQL backends are landing, and commit-wide projectors, rebuilds, views and the journal come after |
+
+The [feature matrix](docs/reference/feature-matrix.md) tracks every capability in each language,
+and a PR that changes one updates its row, so it describes the code on `main` rather than plans.
 
 ## Highlights
 
@@ -46,9 +55,9 @@ testing helpers.
 | **Three backends, one contract**      | DynamoDB (single table, `pk`/`sk`), PostgreSQL, and an in-memory store for tests. Every backend passes the same conformance suite.       |
 | **Multi-stream transactions**         | Append to several aggregates in one atomic commit, with read fences on streams you only looked at.                                      |
 | **Durable command outcomes**          | A retried command gets its stored answer, accepted or rejected, instead of running twice. Rejections can carry events of their own.     |
-| **Views derived from events**         | Projectors write read-model rows in the same commit as the events. In Go, `RebuildProjections` replays the log into per-entity views behind a rebuild fence; the Rust port is in progress. |
+| **Views derived from events**         | Commit-wide projectors write read-model rows in the same commit as the events. Rust's `ProjectionRebuild` rebuilds them from the log behind a rebuild fence, and Go's `RebuildProjections` rebuilds per-entity views under the same fence. |
 | **Snapshots and upcasters**           | Inline snapshots keep loads short, snapshot-verified compaction trims old history, and versioned upcasters let payloads change shape.    |
-| **Rust and Go, wire-compatible**      | Golden fixtures and live interleaved runs keep both languages writing the same bytes. See the [feature matrix](docs/reference/feature-matrix.md). |
+| **One format, three languages**       | Golden fixtures and live interleaved runs keep Go and Rust writing the same bytes, and TypeScript checks itself against the same fixtures. See [how it's checked](#one-format-three-languages). |
 | **Realtime sync and Lambda (Rust)**   | A per-scope sync journal with gap detection and compaction, and `photon-evt-lambda` for DynamoDB Streams handlers.                       |
 
 ## How a command flows
@@ -65,17 +74,27 @@ flowchart LR
     cmd([Command]) --> agg[Aggregate decides]
     agg -- events --> commit(One atomic commit)
     commit --> log[(Event log)]
+    commit --> outcome[(Command outcome)]
     commit --> views[(Views)]
     log -. rebuild .-> views
     log -- stream --> handlers[Stream handlers]
 ```
 
-Projectors can add view rows to that same commit, so a read model stays in step with the events
-behind it, and every row stays a deterministic function of the log.
-[Projections and rebuilds](docs/guide/projections.md) covers what can rebuild views today, and
-[Concepts](docs/guide/concepts.md) walks through each piece.
+With command outcomes turned on, the same commit records what the command decided, so a retry
+with the same command ID gets that answer back instead of running again. Projectors can add view
+rows to the commit too, so a read model stays in step with the events behind it, and every row
+stays a deterministic function of the log. [Command outcomes and retries](docs/guide/commands.md),
+[Projections and rebuilds](docs/guide/projections.md) and [Concepts](docs/guide/concepts.md) walk
+through each piece.
 
-## Quick start: Rust
+## Quick start
+
+The same counter in each language: an `Incremented` event per command, run against the in-memory
+backend you'd use in tests. Swapping in the DynamoDB or PostgreSQL repository changes nothing in
+the aggregate.
+
+<details open>
+<summary><b>Rust</b></summary>
 
 ```sh
 cargo add photon-evt                      # add --features dynamodb or postgres for a durable backend
@@ -83,10 +102,8 @@ cargo add photon-evt                      # add --features dynamodb or postgres 
 
 An aggregate handles commands and applies events. `domain_events!` declares the event enum with
 its stored type names and versions, and the `Aggregate` trait carries the command, event and error
-types. This counter emits an `Incremented` event for each command, and `MemRepository` runs it
-against an in-memory log, which is what you'd use in tests. Swapping in `DynamoRepository` or
-`PostgresRepository` (behind the `dynamodb` and `postgres` features) changes nothing in the
-aggregate.
+types. `MemRepository` runs it against an in-memory log, and `DynamoRepository` and
+`PostgresRepository` sit behind the `dynamodb` and `postgres` features.
 
 ```rust
 use photon_evt::{Aggregate, MemRepository, Metadata, Store, domain_events};
@@ -143,16 +160,18 @@ write. If another writer got there first, the commit fails as a conflict. The
 [`photon-evt` README](crates/evt/README.md) covers transactions, command outcomes, the journal and
 testing, and [`photon-evt-lambda`](crates/evt-lambda/README.md) is its AWS Lambda side.
 
-## Quick start: Go
+</details>
+
+<details>
+<summary><b>Go</b></summary>
 
 ```sh
 go get github.com/photon-grove/evt/go
 ```
 
 The Go module has the same shape. This counter emits an `Incremented` event for each `Increment`
-command, and `mem.NewStore()` runs it against an in-memory log. Swapping in
-`dynamo.NewRepository` or `postgres.NewRepository` behind `snapshots.NewStore` changes nothing in
-the aggregate. A DynamoDB table is initialized once at
+command, and `mem.NewStore()` runs it against an in-memory log. The durable stores are
+`dynamo.NewRepository` or `postgres.NewRepository` behind `snapshots.NewStore`. A DynamoDB table is initialized once at
 deploy time with `evt-doctor init` (or `repo.Initialize(ctx)`), and writers refuse an
 uninitialized table rather than scan it.
 
@@ -237,18 +256,88 @@ it's what a commit checks against. [`go/examples/banking`](go/examples/banking) 
 version with conflicts and not-found errors, and [`go/README.md`](go/README.md) lists the
 packages. This program runs in CI exactly as written.
 
+</details>
+
+<details>
+<summary><b>TypeScript</b></summary>
+
+```sh
+npm install @photon-grove/evt
+```
+
+`defineEvents` gives each event type a version and a codec, and `defineAggregate` ties the events
+to a state codec, an initial state, `handle` and `apply`. `handle` returns a decision, accept with
+events or reject with a code, and `apply` returns the next state. The event's type and payload JSON
+match the Rust counter's, so either language could read this stream.
+
+```ts
+import {Store, defineAggregate, defineEvents, json} from '@photon-grove/evt'
+import {MemRepository} from '@photon-grove/evt/memory'
+
+const counterEvents = defineEvents({
+  'counter:incremented': {version: 1, codec: json<{by: number}>()},
+})
+
+const counter = defineAggregate({
+  type: 'counter',
+  events: counterEvents,
+  state: json<{total: number}>(),
+  initial: () => ({total: 0}),
+
+  handle: (_state, by: number) => ({
+    kind: 'accept',
+    events: [{type: 'counter:incremented', data: {by}}],
+  }),
+
+  apply: (state, event) => ({total: state.total + event.data.by}),
+})
+
+const store = new Store(new MemRepository())
+await store.execute(counter, 'counter-1', 2)
+
+const loaded = await store.load(counter, 'counter-1')
+console.log(loaded.state.total, loaded.sequence) // 2 1n
+```
+
+The package is ESM only, with no runtime dependencies, and CI runs it on Node, Bun and Deno.
+Sequences are `bigint`s because Go and Rust store them as 64-bit integers. The
+[package README](packages/evt/README.md) covers the DynamoDB and PostgreSQL repositories,
+transactions and command outcomes, and the getting started guide's
+[TypeScript walkthrough](docs/guide/getting-started.md#the-same-model-in-typescript) builds a bank
+account end to end.
+
+</details>
+
+## One format, three languages
+
+evt isn't one library with bindings. Each language is a native implementation of the
+[storage format](docs/reference/storage-format.md), which is normative: the DynamoDB items,
+PostgreSQL rows, event and metadata JSON, snapshots, outcome rows and stream envelopes, down to the
+byte. Three things hold the implementations to it:
+
+- **Golden fixtures.** [`compat/fixtures`](compat/) holds encode and decode vectors, scenario
+  outputs and exact DynamoDB requests. Go generates most of them and Rust generates its extensions'
+  (the journal and Lambda), and nobody edits them by hand. TypeScript checks itself against the
+  ones it covers so far.
+- **Live interleaved runs.** Go and Rust take turns writing the same streams in local DynamoDB and
+  PostgreSQL, then both verify every stream. The TypeScript driver joins those runs for the
+  scenarios it supports.
+- **Conformance suites.** Each language has a backend-neutral conformance suite, and every
+  repository it ships passes it on the in-memory store, DynamoDB and PostgreSQL.
+
 ## Examples
 
 Every example compiles and runs in CI. [The examples page](docs/guide/examples.md) lists them all
 with their run commands.
 
-| Example | Rust | Go |
-| --- | --- | --- |
-| Banking: commands, conflicts, not-found errors | [`banking.rs`](crates/evt/examples/banking.rs) | [`go/examples/banking`](go/examples/banking) |
-| Todo: a commit-wide projector, its rows replayed from the log | [`todo.rs`](crates/evt/examples/todo.rs) | [`go/examples/todo`](go/examples/todo) |
-| Transfer: two accounts in one commit (the Go version also replays retries from stored outcomes) | in [`banking.rs`](crates/evt/examples/banking.rs) | [`go/examples/transfer`](go/examples/transfer) |
-| Sync journal: scopes, high watermark, gap-checked paging | [`journal.rs`](crates/evt/examples/journal.rs) | — |
-| Lambda: a DynamoDB Streams batch with partial batch failures | [`stream_handler.rs`](crates/evt-lambda/examples/stream_handler.rs) | — |
+| Example | Rust | Go | TypeScript |
+| --- | --- | --- | --- |
+| Getting started: the guide's bank account, end to end | [`getting_started.rs`](crates/evt/examples/getting_started.rs) | — | [`getting-started.ts`](packages/evt/examples/getting-started.ts) |
+| Banking: commands, conflicts, not-found errors | [`banking.rs`](crates/evt/examples/banking.rs) | [`go/examples/banking`](go/examples/banking) | — |
+| Todo: a commit-wide projector, its rows replayed from the log | [`todo.rs`](crates/evt/examples/todo.rs) | [`go/examples/todo`](go/examples/todo) | — |
+| Transfer: two accounts in one commit (the Go version also replays retries from stored outcomes) | in [`banking.rs`](crates/evt/examples/banking.rs) | [`go/examples/transfer`](go/examples/transfer) | — |
+| Sync journal: scopes, high watermark, gap-checked paging | [`journal.rs`](crates/evt/examples/journal.rs) | — | — |
+| Lambda: a DynamoDB Streams batch with partial batch failures | [`stream_handler.rs`](crates/evt-lambda/examples/stream_handler.rs) | — | — |
 
 ## Documentation
 
@@ -260,8 +349,9 @@ with their run commands.
 | **Upgrade** | [Upgrading to v0.9](docs/guide/upgrading-to-v0.9.md) · [Migrating to stream heads](docs/guide/migrating-to-stream-heads.md) |
 | **Reference** | [Storage format](docs/reference/storage-format.md) (normative) · [Feature matrix](docs/reference/feature-matrix.md) · [Architecture decisions](docs/adr/) |
 
-The same pages, with interactive architecture diagrams, are on the
-[docs site](https://photon-grove.github.io/evt/).
+The same pages are on the [docs site](https://photon-grove.github.io/evt/), with a concepts tour
+in all three languages, interactive architecture diagrams, and a parity grid read from the feature
+matrix.
 
 ## What's in the repo
 
@@ -269,9 +359,9 @@ The same pages, with interactive architecture diagrams, are on the
 | --- | --- |
 | [`crates/`](crates/) | `photon-evt`, `photon-evt-lambda`, and `evt-compat`, the cross-language test harness |
 | [`go/`](go/) | The Go module `github.com/photon-grove/evt/go`, tagged `go/vX.Y.Z` because Go requires that prefix for a module in a subdirectory |
-| [`compat/`](compat/) | Shared scenarios and golden fixtures that keep the two languages writing the same bytes |
-| [`docs/`](docs/) | The guide, the reference, and the architecture decision records |
 | [`packages/evt`](packages/evt/) | The TypeScript package `@photon-grove/evt`, with its fixture runner in `packages/evt-compat` |
+| [`compat/`](compat/) | Shared scenarios and golden fixtures that hold every language to the same bytes |
+| [`docs/`](docs/) | The guide, the reference, and the architecture decision records |
 | [`website/`](website/), [`packages/react-flow-diagrams`](packages/react-flow-diagrams/) | The docs site and the diagram package it uses |
 
 ## Contributing
