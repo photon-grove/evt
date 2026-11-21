@@ -1,10 +1,19 @@
 import {describe, expect, test} from 'vitest'
 
-import {EvtError, TransientError} from '../src/errors.ts'
+import {
+  CommitTooLargeError,
+  EvtError,
+  ProjectorError,
+  ProjectorOperationError,
+  TransientError,
+  ViewsNotConfiguredError,
+} from '../src/errors.ts'
 import {type SerializedEvent, eventId} from '../src/event.ts'
 import {emptyMetadata} from '../src/metadata.ts'
+import {type ProjectedView, type ViewOperation, deleteView, putView} from '../src/projection.ts'
 import type {PgClient, PgConnection, PgResult} from '../src/postgres/client.ts'
 import {PgRepository} from '../src/postgres/repository.ts'
+import type {ViewStatement, ViewWriter} from '../src/postgres/views.ts'
 
 function event(sequence: number): SerializedEvent {
   return {
@@ -46,9 +55,15 @@ interface Fake {
 }
 
 // A client over that store. `fail` returns what a statement throws, `pooled` false leaves out
-// connect(), and `delay` holds every statement for that many milliseconds.
+// connect(), `delay` holds every statement for that many milliseconds, and `respond` answers a
+// statement in the store's place when it returns a result.
 function fake(
-  options: {fail?: (text: string) => unknown; pooled?: boolean; delay?: number} = {},
+  options: {
+    fail?: (text: string) => unknown
+    pooled?: boolean
+    delay?: number
+    respond?: (text: string) => PgResult | undefined
+  } = {},
 ): Fake {
   const log: string[] = []
   const values: (unknown[] | undefined)[] = []
@@ -64,7 +79,7 @@ function fake(
       throw failure
     }
 
-    return answer(text)
+    return options.respond?.(text) ?? answer(text)
   }
 
   const client: PgClient = {query}
@@ -256,5 +271,248 @@ describe('PgRepository', () => {
   test('refuses invalid table names at construction', () => {
     const {client} = fake()
     expect(() => new PgRepository(client, {eventsTable: 'x; DROP TABLE y'})).toThrow(EvtError)
+  })
+})
+
+// A view operation of the `handles` projector.
+function projected(op: ViewOperation, operation = 0): ProjectedView {
+  return {projector: 'handles', projectorIndex: 0, operation, op}
+}
+
+// A PostgreSQL error as `pg` raises it.
+function pgError(code: string, constraint?: string): Error {
+  return Object.assign(new Error(`SQLSTATE ${code}`), {code, constraint})
+}
+
+// A writer that puts every operation into a `views` table, with the compat drivers' statements.
+const writer: ViewWriter = (op) => {
+  if (op.kind === 'delete') {
+    return op.condition === 'present'
+      ? {sql: 'DELETE FROM views WHERE pk = $1', args: [op.pk, op.sk, op.owner]}
+      : {sql: 'WITH gone AS (DELETE FROM views) SELECT 1', args: [op.pk, op.sk, op.owner]}
+  }
+  const insert = 'INSERT INTO views (pk, sk, owner, payload) VALUES ($1, $2, $3, $4)'
+  return op.condition === 'absent'
+    ? {sql: insert, args: [op.pk, op.sk, op.owner, op.payload], keyConstraint: 'views_pkey'}
+    : {sql: `${insert} ON CONFLICT (pk, sk) DO UPDATE`, args: [op.pk, op.sk, op.owner, op.payload]}
+}
+
+// A writer whose statements are `size` bytes long and over.
+function sized(size: number): ViewWriter {
+  return () => ({sql: `SELECT 1 ${'-'.repeat(size)}`})
+}
+
+// A writer of short statements that name their sort keys.
+const short: ViewWriter = (view): ViewStatement => ({sql: `SELECT 1 /* ${view.sk} */`})
+
+// `count` puts of distinct rows.
+function puts(count: number): ViewOperation[] {
+  return Array.from({length: count}, (_, n) =>
+    putView('k', String(n).padStart(3, '0'), 'a', 'ledger', '{}'),
+  )
+}
+
+// A COMMIT that fails with a unique violation.
+function failAtCommit(text: string): unknown {
+  return text === 'COMMIT' ? pgError('23505') : undefined
+}
+
+// Commits one event of stream `a` with a snapshot and the given view operations.
+function commitViews(repo: PgRepository, ...ops: ViewOperation[]): Promise<void> {
+  const payload = new TextEncoder().encode('{}')
+  return repo.commit({
+    entityId: 'a',
+    events: [event(1)],
+    snapshot: {entityType: 'ledger', sequence: 1n, payload},
+    views: ops.map((op, index) => projected(op, index)),
+  })
+}
+
+async function rejection(promise: Promise<unknown>): Promise<unknown> {
+  try {
+    await promise
+  } catch (error) {
+    return error
+  }
+  throw new Error('expected a failure')
+}
+
+// A client whose view statements resolve `result`, and a repository with the writer on it.
+function answering(result: PgResult): {repo: PgRepository; log: string[]} {
+  const {client, log} = fake({respond: (text) => (/views/.test(text) ? result : undefined)})
+  return {repo: new PgRepository(client, {viewWriter: writer}), log}
+}
+
+// What a commit whose view statement raises `error` rejects with.
+function raising(error: unknown, op: ViewOperation): Promise<unknown> {
+  const {client} = fake({fail: (text) => (/views/.test(text) ? error : undefined)})
+  return rejection(commitViews(new PgRepository(client, {viewWriter: writer}), op))
+}
+
+describe('PgRepository view writer', () => {
+  test('runs view statements after the events and before the snapshot, with their own args', async () => {
+    const {client, log, values} = fake()
+    const repo = new PgRepository(client, {viewWriter: writer})
+    expect(repo.writesViews()).toBe(true)
+    await commitViews(repo, putView('k', 'one', 'a', 'ledger', '{"n":1}'))
+
+    expect(transaction(log).slice(-5)).toEqual([
+      'INSERT INTO evt_events (entity_id,',
+      'INSERT INTO views (pk,',
+      'SELECT sequence::text AS sequence',
+      'INSERT INTO evt_snapshots (entity_id,',
+      'COMMIT',
+    ])
+    const args = values[log.findIndex((text) => text.startsWith('INSERT INTO views'))]
+    expect(args?.slice(0, 3)).toEqual(['k', 'one', 'a'])
+    expect(args?.[3]).toEqual(new TextEncoder().encode('{"n":1}'))
+  })
+
+  test.each<[string, ViewOperation, PgResult]>([
+    [
+      'a put that affects no row',
+      putView('k', 'one', 'a', 'ledger', '{}'),
+      {rows: [], rowCount: 0},
+    ],
+    [
+      'a delete of a required row that affects none',
+      deleteView('k', 'one', 'a', {condition: 'present'}),
+      {rows: [], rowCount: 0},
+    ],
+    ['a delete that reports a foreign row', deleteView('k', 'one', 'a'), {rows: [{}]}],
+    [
+      'a delete that reports a foreign row the driver counts as none',
+      deleteView('k', 'one', 'a'),
+      {rows: [{}], affectedRows: 0},
+    ],
+  ])('fails the condition: %s', async (_name, op, result) => {
+    const {repo, log} = answering(result)
+    const error = await rejection(commitViews(repo, op))
+    expect(error).toBeInstanceOf(ProjectorOperationError)
+    expect(error).toMatchObject({reason: 'ConditionalCheckFailed', pk: 'k', sk: 'one'})
+    expect(log.at(-1)).toBe('ROLLBACK')
+  })
+
+  test.each<[string, ViewOperation, PgResult]>([
+    ['a put that affects a row', putView('k', 'one', 'a', 'ledger', '{}'), {rows: [], rowCount: 1}],
+    [
+      'a delete of a required row that PGlite counts',
+      deleteView('k', 'one', 'a', {condition: 'present'}),
+      {rows: [], affectedRows: 1},
+    ],
+    ['a delete that reports nothing', deleteView('k', 'one', 'a'), {rows: [], rowCount: 0}],
+    [
+      'an absent put, which needs no count',
+      putView('k', 'one', 'a', 'ledger', '{}', {condition: 'absent'}),
+      {rows: []},
+    ],
+  ])('holds the condition: %s', async (_name, op, result) => {
+    const {repo, log} = answering(result)
+    await commitViews(repo, op)
+    expect(log.at(-1)).toBe('COMMIT')
+  })
+
+  test('refuses a statement whose count the driver does not report', async () => {
+    const {repo} = answering({rows: []})
+    const error = await rejection(commitViews(repo, deleteView('k', 'one', 'a')))
+    expect(error).toMatchObject({code: 'invalidViewOperation'})
+  })
+
+  test('maps the errors a view statement raises', async () => {
+    const taken = new Error('taken')
+    const claim = putView('k', 'one', 'a', 'ledger', '{}', {condition: 'absent', conflict: taken})
+    const plain = putView('k', 'one', 'a', 'ledger', '{}')
+
+    // The key constraint, named in any case, is the failed condition.
+    expect(await raising(pgError('23505', 'Views_PKey'), claim)).toMatchObject({
+      reason: 'ConditionalCheckFailed',
+      mapped: taken,
+    })
+    // Another constraint's violation, or one on a put without the condition, is the statement's.
+    expect(await raising(pgError('23505', 'views_payload_key'), claim)).toMatchObject({
+      reason: '23505',
+    })
+    expect(await raising(pgError('23505', 'views_pkey'), plain)).toMatchObject({
+      reason: '23505',
+      mapped: undefined,
+    })
+    expect(await raising(pgError('23514'), claim)).toMatchObject({
+      code: 'projectorOperation',
+      reason: '23514',
+    })
+    // A rollback is transient or passes through, and so does a lost connection.
+    expect(await raising(pgError('40001'), claim)).toBeInstanceOf(TransientError)
+    expect(await raising(pgError('40003'), claim)).toMatchObject({code: '40003'})
+    const lost = new Error('connection reset')
+    expect(await raising(lost, claim)).toBe(lost)
+  })
+
+  test('an integrity violation at COMMIT of a commit with views is the projector failure', async () => {
+    const {client} = fake({fail: failAtCommit})
+    const repo = new PgRepository(client, {viewWriter: writer})
+    const error = await rejection(commitViews(repo, putView('k', 'one', 'a', 'ledger', '{}')))
+    expect(error).toBeInstanceOf(ProjectorError)
+    expect(error).toMatchObject({projector: '(at commit)'})
+
+    const bare = fake({fail: failAtCommit})
+    const refused = await rejection(
+      new PgRepository(bare.client).commit({entityId: 'a', events: [event(1)]}),
+    )
+    expect(refused).not.toBeInstanceOf(ProjectorError)
+  })
+
+  test.each<[string, string, ViewWriter | undefined, ViewOperation]>([
+    ['no writer', 'viewsNotConfigured', undefined, putView('k', 'one', 'a', 'ledger', '{}')],
+    [
+      'an empty statement',
+      'invalidViewOperation',
+      () => ({sql: '  '}),
+      putView('k', 'one', 'a', 'ledger', '{}'),
+    ],
+    [
+      'an absent put without its key constraint',
+      'invalidViewOperation',
+      () => ({sql: 'INSERT INTO views VALUES ($1)', args: ['k']}),
+      putView('k', 'one', 'a', 'ledger', '{}', {condition: 'absent'}),
+    ],
+  ])('refuses %s before any query', async (_name, code, viewWriter, op) => {
+    const {client, log} = fake()
+    const repo = new PgRepository(client, viewWriter && {viewWriter})
+    const error = await rejection(commitViews(repo, op))
+    expect(error).toMatchObject({code})
+    expect(error instanceof ViewsNotConfiguredError).toBe(viewWriter === undefined)
+    expect(log).toEqual([])
+  })
+
+  test("passes a writer's own error through, before any query", async () => {
+    const refused = new Error('no table for this row')
+    const {client, log} = fake()
+    const repo = new PgRepository(client, {
+      viewWriter: () => {
+        throw refused
+      },
+    })
+    expect(await rejection(commitViews(repo, putView('k', 'one', 'a', 'ledger', '{}')))).toBe(
+      refused,
+    )
+    expect(log).toEqual([])
+  })
+
+  test('budgets each view as one action sized by its SQL text', async () => {
+    const {client, log} = fake()
+    const op = putView('k', 'one', 'a', 'ledger', '{}')
+    const long = new PgRepository(client, {viewWriter: sized(400_000)})
+    expect(await rejection(commitViews(long, op))).toBeInstanceOf(CommitTooLargeError)
+
+    // Two control checks, the head, the event and the snapshot leave room for 95 views.
+    const many = new PgRepository(client, {viewWriter: short})
+    expect(await rejection(commitViews(many, ...puts(96)))).toBeInstanceOf(CommitTooLargeError)
+    expect(log).toEqual([])
+
+    const fits = fake({
+      respond: (text) => (text.startsWith('SELECT 1 /*') ? {rows: [{}]} : undefined),
+    })
+    await commitViews(new PgRepository(fits.client, {viewWriter: short}), ...puts(95))
+    expect(fits.log.at(-1)).toBe('COMMIT')
   })
 })

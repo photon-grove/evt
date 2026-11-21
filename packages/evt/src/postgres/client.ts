@@ -1,9 +1,15 @@
 // The PostgreSQL client a PgRepository takes: a structural interface that `pg`'s Pool, Neon's
 // serverless Pool and PGlite satisfy without an adapter, so this package imports no driver.
 
-/** The result of one statement: its rows, as the driver returns them. */
+/**
+ * The result of one statement: its rows, as the driver returns them, and the number of rows it
+ * affected, which `pg` and Neon report as `rowCount` and PGlite as `affectedRows`. Only a view
+ * writer's statements read the count.
+ */
 export interface PgResult {
   readonly rows: readonly unknown[]
+  readonly rowCount?: number | null
+  readonly affectedRows?: number
 }
 
 /** Something that runs one statement: `$1`, `$2` and so on in `text` take `values` in order. */

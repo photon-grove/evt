@@ -12,9 +12,8 @@ npm install @photon-grove/evt
 ```
 
 So far it has the core, multi-stream transactions with read fences, command outcomes,
-commit-wide projectors (in memory and on DynamoDB), the in-memory, DynamoDB and PostgreSQL
-backends, and the testing helpers. Commit-wide projectors on PostgreSQL come in a later release,
-and the
+commit-wide projectors, the in-memory, DynamoDB and PostgreSQL backends, and the testing helpers.
+The
 [feature matrix](https://github.com/photon-grove/evt/blob/main/docs/reference/feature-matrix.md)
 tracks each one. The
 [getting started guide](https://github.com/photon-grove/evt/blob/main/docs/guide/getting-started.md#the-same-model-in-typescript)
@@ -28,7 +27,7 @@ builds a bank account aggregate with it, end to end.
 | `@photon-grove/evt/memory`   | `MemRepository`, the in-memory backend for tests and local development     |
 | `@photon-grove/evt/testing`  | `scenario` and `Fixture`, the given/when/then helpers over `MemRepository` |
 | `@photon-grove/evt/dynamodb` | `DynamoRepository`, `viewProjector`, and the item and request codecs       |
-| `@photon-grove/evt/postgres` | `PgRepository`, and the schema: table names, relations and `schemaDdl`     |
+| `@photon-grove/evt/postgres` | `PgRepository`, its `ViewWriter`, and the schema: tables and `schemaDdl`   |
 
 ## DynamoDB
 
@@ -89,6 +88,22 @@ initializes a fresh store itself on its first write, as Go's and Rust's do, and 
 there for a deploy step that treats every backend alike. Every transaction runs at `READ
 COMMITTED`, whatever the server's default. An abort is checked between statements and rolls the
 transaction back.
+
+evt defines no PostgreSQL view schema, so commit-wide projectors write to tables the application
+owns, through the `viewWriter` option, a function from a view operation to the statement that
+writes it, `{sql, args, keyConstraint}`, as Go's `WithViewWriter` takes. The statements run in the
+commit's transaction, after the events and before the snapshots, and the repository reads each
+condition from the statement's outcome, so the statements must store the row's owner and enforce
+it: a put with `condition: 'absent'` is a plain `INSERT` whose unique violation of the
+`keyConstraint` it names fails the condition, any other put an `INSERT ... ON CONFLICT DO UPDATE ...
+WHERE` the owner matches, which affects no row when it doesn't, a delete with `condition:
+'present'` must delete the owner's row, and any other delete reports the rows of another owner it
+found (`WITH gone AS (DELETE ...) SELECT 1 FROM ... WHERE owner <> $3`). The count is the rows a
+statement returns, or the driver's `rowCount` (`affectedRows` on PGlite) when it returns none.
+Any other error the database raises fails the commit with a `ProjectorOperationError` whose
+`reason` is the SQLSTATE, and each view counts in the commit budget as one action the size of its
+SQL text. Without a writer, a commit that carries view operations is refused with a
+`ViewsNotConfiguredError`.
 
 ## Runtimes
 
@@ -153,8 +168,8 @@ of `AbortSignal`, which the DOM library, `@types/node`, and Bun's and Deno's typ
   commit with a `ProjectorOperationError` naming the projector and the operation, with the
   operation's own `conflict` error as `mapped`. Operations are checked before any write (keys up to
   2048 and 1024 bytes, no key twice, none in the engine's journal partitions), and counted in the
-  commit budget. `MemRepository` keeps the rows (`view`, `views`), and `DynamoRepository` writes
-  them to its `viewsTable`. Only current-state projectors run for now: one that names a `history`
+  commit budget. `MemRepository` keeps the rows (`view`, `views`), `DynamoRepository` writes
+  them to its `viewsTable`, and `PgRepository` through its `viewWriter`. Only current-state projectors run for now: one that names a `history`
   is refused. `groupCommits` regroups stored events into the commits that wrote them.
 - **Rebuilds.** While a projection rebuild holds the store, every commit fails with a
   `RebuildInProgressError`. It's retryable, so `executeWithRetry` runs the command again after its
@@ -248,8 +263,7 @@ long as they agree on these:
 
 A TypeScript writer of an entity type that has commit-wide projectors registered in a Go or Rust
 service must register the same projectors, writing the same bytes, as every writer of the type
-does. Until the TypeScript package writes PostgreSQL views, don't write such a type on PostgreSQL:
-its commits would land without their view rows.
+does, and on PostgreSQL a view writer that issues the same statements.
 
 The [known differences](https://github.com/photon-grove/evt/blob/main/docs/reference/storage-format.md#known-differences)
 between the languages are in the storage format, and

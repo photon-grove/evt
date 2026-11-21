@@ -10,6 +10,7 @@ export {
   selectOutcomeSql,
 } from './outcome.js'
 export {POSTGRES_BACKEND, PgRepository, type PgRepositoryOptions} from './repository.js'
+export {type ViewStatement, type ViewWriter} from './views.js'
 
 export {
   DEFAULT_EVENTS_TABLE,
