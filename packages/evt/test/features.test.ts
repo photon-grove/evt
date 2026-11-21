@@ -96,6 +96,19 @@ describe('MemRepository initialization', () => {
   })
 })
 
+// A manifest that declares stream-heads and postgres-views at `version`.
+function postgresViews(version: number) {
+  return {
+    version: 1n,
+    features: new Map([
+      ['postgres-views', version],
+      ['stream-heads', 1],
+    ]),
+    historyDependent: [],
+    retention: [],
+  }
+}
+
 describe('the feature manifest', () => {
   test('an unsupported declaration lists every pair, sorted by name', () => {
     const manifest = {
@@ -135,6 +148,12 @@ describe('the feature manifest', () => {
 
     expect(() => checkSupported(manifest)).toThrow(UnsupportedFeatureError)
     expect(manifest.historyDependent).toEqual([])
+  })
+
+  test('postgres-views at version 1 is supported on every backend, as in Rust', () => {
+    // Only a PostgreSQL repository without the views table refuses it, by its own rule.
+    expect(() => checkSupported(postgresViews(1))).not.toThrow()
+    expect(() => checkSupported(postgresViews(2))).toThrow(UnsupportedFeatureError)
   })
 
   test('the supported pairs are frozen', () => {

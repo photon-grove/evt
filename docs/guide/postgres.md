@@ -124,8 +124,8 @@ for streams whose early events were compacted away.
 
 ### Views
 
-In Go, evt defines no PostgreSQL view schema (Rust has one, [below](#the-rust-views-table)). Your
-application owns its view tables and their DDL. But
+In Go, evt defines no PostgreSQL view schema (Rust and TypeScript have one,
+[below](#the-views-table)). Your application owns its view tables and their DDL. But
 [commit-wide projectors](projections.md#commit-wide-projectors) still commit their rows atomically
 with the events, through a view writer that turns each view operation into the SQL statement for
 your table:
@@ -224,9 +224,10 @@ It reads a statement's count from the rows it returns, or, when it returns none,
 `RETURNING 1` to the puts and the `present` deletes and mark their statements `returning: true`,
 so that a statement returning no row is a failed condition.
 
-#### The Rust views table
+#### The views table
 
-`photon-evt`'s `PostgresRepository::ensure_schema` also creates an evt-owned views table,
+`photon-evt`'s `PostgresRepository::ensure_schema`, and TypeScript's `PgRepository.ensureSchema`,
+also create an evt-owned views table,
 `{events}__evt_views` ([ADR 0008](../adr/0008-postgresql-views-table-and-journal.md)), and
 `view_repository()` reads and writes it with the same semantics as the DynamoDB view repository:
 
@@ -242,15 +243,26 @@ views.purge_expired(now_unix_seconds).await?; // PostgreSQL does not expire rows
 Its keys order by UTF-8 bytes, as on DynamoDB, and its payloads keep their exact bytes. It needs a
 `UTF8` database, and it refuses a row whose entity type, `pk` and `sk` together exceed 2,600 bytes,
 the most a btree index entry holds. Like every backend's view repository, it refuses U+0000, which
-`text` can't hold, with `InvalidArgument`. The TypeScript package doesn't have this table yet, so,
-as in Go, it has no PostgreSQL view repository: its `DynamoViewRepository` and `MemViewRepository`
-are the two it offers.
+`text` can't hold, with `InvalidArgument`.
 
-`with_views_table()` makes the table the commit's view target, in place of a view writer: evt
-builds every statement with the DynamoDB repository's owner rules, so you write no SQL. The
-repository declares the `postgres-views` marker feature before its first commit, after which a Go
-writer, or a Rust repository with a view writer, refuses the store instead of putting views
-somewhere else. The [sync journal](../reference/storage-format.md#journal) works on PostgreSQL through the same table:
+In TypeScript it's `PgViewRepository`, which `repository.viewRepository()` returns, with the same
+rows, order and cursors, so a Rust process can continue a TypeScript listing:
+
+```ts
+const views = repository.viewRepository()
+const payload = new TextEncoder().encode('{"name":"core"}')
+await views.putView({pk: 'USER#1#teams', sk: 't1', entityId: 'user-1', entityType: 'team', payload})
+const page = await views.listViewsByPkPaged('USER#1#teams', {limit: 50})
+await views.purgeExpired(Math.floor(Date.now() / 1000))
+```
+
+`with_views_table()` (TypeScript: `new PgRepository(pool, {viewsTable: true})`) makes the table
+the commit's view target, in place of a view writer: evt builds every statement with the DynamoDB
+repository's owner rules, so you write no SQL, and counts each one in the commit budget as its
+DynamoDB item, so the budget refuses the same commits on both backends. The repository declares the
+`postgres-views` marker feature before its first commit, after which a Go writer, or a Rust or
+TypeScript repository without the views table, refuses the store instead of putting views somewhere
+else. The TypeScript repository doesn't apply an expected payload yet, nor does it journal. The [sync journal](../reference/storage-format.md#journal) works on PostgreSQL through the same table:
 wrap the repository in a `JournalRepository` and it journals, pages and compacts as it does on
 DynamoDB. Each journaled commit runs `pg_notify` per scope it wrote, and a `JournalListener`
 (one dedicated connection) turns those into wake-ups: page the scope it names, and every scope on

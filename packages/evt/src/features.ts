@@ -20,11 +20,24 @@ export const STREAM_HEADS_FEATURE = 'stream-heads'
 export const STREAM_HEADS_VERSION = 1
 
 /**
- * The `(feature, stored-format version)` pairs this package models. The other features the
- * storage format defines (`journal`, `journal-compaction`, `postgres-views`) are Rust-first, so a
- * store that declares any of them is refused.
+ * The feature a PostgreSQL store declares once its commit-wide views live in the evt-owned views
+ * table (`{events}__evt_views`, ADR 0008). Only a PostgreSQL repository with `viewsTable: true`
+ * writes such a store. Every other PostgreSQL writer refuses it, Go's and one with a view writer
+ * included, so a store's views never split across two tables.
+ */
+export const POSTGRES_VIEWS_FEATURE = 'postgres-views'
+
+/** The stored-format version of {@link POSTGRES_VIEWS_FEATURE}. */
+export const POSTGRES_VIEWS_VERSION = 1
+
+/**
+ * The `(feature, stored-format version)` pairs this package models: `stream-heads`, which every
+ * writer also requires, and `postgres-views`, which a PostgreSQL repository without the views
+ * table refuses on its own, as Rust's does. The other features the storage format defines
+ * (`journal`, `journal-compaction`) are Rust-first, so a store that declares either is refused.
  */
 export const SUPPORTED_FEATURES: readonly FeaturePair[] = Object.freeze([
+  Object.freeze({name: POSTGRES_VIEWS_FEATURE, version: POSTGRES_VIEWS_VERSION}),
   Object.freeze({name: STREAM_HEADS_FEATURE, version: STREAM_HEADS_VERSION}),
 ])
 

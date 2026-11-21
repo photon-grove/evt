@@ -11,12 +11,15 @@ export {
 } from './outcome.js'
 export {POSTGRES_BACKEND, PgRepository, type PgRepositoryOptions} from './repository.js'
 export {type ViewStatement, type ViewWriter} from './views.js'
+export {PgViewRepository} from './view-repository.js'
 
 export {
   DEFAULT_EVENTS_TABLE,
   DEFAULT_SNAPSHOTS_TABLE,
   MAX_EVENTS_TABLE_NAME_BYTES,
   MAX_SNAPSHOTS_TABLE_NAME_BYTES,
+  MAX_VIEW_INDEX_KEY_BYTES,
+  MAX_VIEW_PAGE_ROWS,
   type PgTables,
   RESERVED_INFIX,
   SCHEMA_LOCK,
@@ -28,4 +31,6 @@ export {
   rebuildLockTable,
   schemaDdl,
   streamHeadsTable,
+  viewsDdl,
+  viewsTable,
 } from './schema.js'
