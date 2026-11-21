@@ -220,6 +220,16 @@ of `AbortSignal`, which the DOM library, `@types/node`, and Bun's and Deno's typ
   before the first commit that runs it, so compaction refuses them in every process. A repository
   without `declareHistoryDependent` refuses it with `historyDeclarationUnsupported`.
   `groupCommits` regroups stored events into the commits that wrote them.
+- **Enumeration.** Every repository is an `EventLog`: `streamAllEvents(filter)` walks the log in
+  batches (one per entity in memory and on PostgreSQL, one per Scan page on DynamoDB), and
+  `entityHeads(entityType)` reports each entity's head, the larger of its highest event sequence
+  and what its snapshot covers. Neither yields a snapshot, a head item or an engine row in the
+  `SYSTEM#` or `command-outcome#` namespaces, and both read the whole log on DynamoDB, so keep
+  them to rebuilds and diagnostics. `store.streamEntities(aggregate)` folds each entity of the
+  aggregate's type from its events, as Go's `StreamEntities` does, and
+  `store.streamEntitiesFromSnapshots(aggregate)` loads each from its snapshot and the events
+  after it, so a compacted stream loads too. Both yield `{ok, entityId, loaded}`, or the entity's
+  `error` and go on with the next.
 - **Rebuilds.** While a projection rebuild holds the store, every commit fails with a
   `RebuildInProgressError`. It's retryable, so `executeWithRetry` runs the command again after its
   backoff, though a rebuild usually outlasts the default policy's attempts.

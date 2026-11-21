@@ -97,7 +97,7 @@ pass() {
     "${ts_driver[@]}" verify --backend "$backend" --run "$run"
   fi
 
-  # Event-log enumeration (P3): both languages must list the same events, unfiltered and by type.
+  # Event-log enumeration (P3): every language must list the same events, unfiltered and by type.
   local go_list="target/compat/enumerate-go-${backend}.txt"
   local rust_list="target/compat/enumerate-rust-${backend}.txt"
   "$go_driver" enumerate -backend "$backend" -run "$run" >"$go_list"
@@ -107,6 +107,11 @@ pass() {
     exit 1
   fi
   diff -u "$go_list" "$rust_list"
+  if [ -n "$as" ]; then
+    local ts_list="target/compat/enumerate-ts-${backend}.txt"
+    "${ts_driver[@]}" enumerate --backend "$backend" --run "$run" >"$ts_list"
+    diff -u "$go_list" "$ts_list"
+  fi
 
   echo "run ${run}: ${label} agree on ${scope} and on their enumeration"
 }

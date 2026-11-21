@@ -46,6 +46,9 @@ import {
   StreamHeadsNotMigratedError,
   UnsupportedFeatureError,
   type ViewOperation,
+  type EventLog,
+  type StreamFilter,
+  compareUtf8,
   defineAggregate,
   defineEvents,
   deleteView,
@@ -54,6 +57,8 @@ import {
   eventId,
   json,
   isConflict,
+  isEventLog,
+  isReserved,
   putView,
   isRetryable,
 } from '@photon-grove/evt'
@@ -124,6 +129,18 @@ export async function conformance(
   }
   if (repo.writesViews?.() === true) {
     cases.push(['views commit with their events, each conditioned on its owner', () => views(repo)])
+  }
+  if (isEventLog(repo)) {
+    cases.push(
+      [
+        'enumeration yields every stream, by type, and never an engine row',
+        () => enumeration(repo),
+      ],
+      [
+        'entity heads cover compaction, and seeded enumeration loads a compacted stream',
+        () => entityHeads(repo),
+      ],
+    )
   }
   if (recordsOutcomes(repo)) {
     cases.push(
@@ -874,6 +891,133 @@ async function views(repo: Repository): Promise<void> {
     'views without an event',
     (error) => error instanceof ProjectorOnlyCommitError,
   )
+}
+
+// Every batch the log yields, narrowed to the namespace's streams, checking that no batch is empty
+// and none holds an engine row, and that a log that batches by entity yields one entity a batch.
+async function enumerated(
+  repo: Repository & EventLog,
+  ns: string,
+  filter?: StreamFilter,
+): Promise<SerializedEvent[]> {
+  const events: SerializedEvent[] = []
+  for await (const batch of repo.streamAllEvents(filter)) {
+    ensure(batch.length > 0, 'an empty batch')
+    for (const event of batch) {
+      ensure(!isReserved(event.entityId), `an engine row ${event.entityId} was enumerated`)
+    }
+    if (repo.batchesByEntity) {
+      ensure(new Set(batch.map((event) => event.entityId)).size === 1, 'a batch of two entities')
+      const sequences = batch.map((event) => event.sequence)
+      const ascending = [...sequences]
+      ascending.sort((a, b) => (a < b ? -1 : 1))
+      ensureEqual(sequences, ascending, 'a batch out of order')
+    }
+    events.push(...batch.filter((event) => event.entityId.startsWith(`${ns}-`)))
+  }
+  events.sort((a, b) =>
+    a.entityId === b.entityId
+      ? a.sequence < b.sequence
+        ? -1
+        : 1
+      : compareUtf8(a.entityId, b.entityId),
+  )
+
+  return events
+}
+
+async function enumeration(repo: Repository & EventLog): Promise<void> {
+  const ns = namespace()
+  const a = new Stream(ns, 'a')
+  const b = new Stream(ns, 'b', 'other')
+  await a.commit(repo, a.events(1, 3))
+  await b.commit(repo, b.events(1, 2), b.newSnapshot(1, '{}'))
+  if (recordsOutcomes(repo)) {
+    // An outcome-only commit writes a row in the reserved namespace and no event.
+    await repo.commitTransaction({streams: [], fences: [], outcome: outcome(`${ns}-cmd`)})
+  }
+
+  const all = await enumerated(repo, ns)
+  ensureEqual(
+    all.map((event) => `${event.entityId}:${event.sequence}`),
+    [`${a.id}:1`, `${a.id}:2`, `${a.id}:3`, `${b.id}:1`, `${b.id}:2`],
+    'every event, and never a snapshot',
+  )
+  ensureEqual(all, [...a.events(1, 3), ...b.events(1, 2)], 'the events as stored')
+
+  const typed = await enumerated(repo, ns, {entityType: b.entityType})
+  ensureEqual(typed, b.events(1, 2), 'the events of one type')
+  ensureEqual(await enumerated(repo, ns, {entityType: `${ns}-none`}), [], 'a type with no events')
+}
+
+async function entityHeads(repo: Repository & EventLog): Promise<void> {
+  const ns = namespace()
+  const plain = new Stream(ns, 'plain')
+  const compacted = new Stream(ns, 'compacted')
+  const other = new Stream(ns, 'other', 'other')
+  await plain.commit(repo, plain.events(1, 2))
+  await compacted.commit(repo, compacted.events(1, 3), compacted.newSnapshot(1, '{"total":6}'))
+  await compacted.commit(repo, compacted.events(4, 4))
+  ensureEqual(await repo.compactBelow(compacted.id, 2n), 2, 'the stream compacts below 3')
+  const emptied = new Stream(ns, 'emptied')
+  await emptied.commit(repo, emptied.events(1, 2), emptied.newSnapshot(1, '{"total":3}'))
+  ensureEqual(await repo.compactBelow(emptied.id, 2n), 2, 'the stream compacts whole')
+  await other.commit(repo, other.events(1, 1))
+
+  const mine = (heads: Map<string, bigint>) => {
+    const entries = [...heads].filter(([id]) => id.startsWith(`${ns}-`))
+    entries.sort(([x], [y]) => compareUtf8(x, y))
+
+    return entries
+  }
+  for (const [id] of await repo.entityHeads()) {
+    ensure(!isReserved(id), `entity heads yielded the engine row ${id}`)
+  }
+  ensureEqual(
+    mine(await repo.entityHeads()),
+    [
+      [compacted.id, 4n],
+      [emptied.id, 2n],
+      [other.id, 1n],
+      [plain.id, 2n],
+    ],
+    "each entity's head, a compacted one's from what its snapshot covers",
+  )
+  ensureEqual(
+    mine(await repo.entityHeads(plain.entityType)),
+    [
+      [compacted.id, 4n],
+      [emptied.id, 2n],
+      [plain.id, 2n],
+    ],
+    'the heads of one type',
+  )
+
+  // Seeded enumeration loads the compacted stream from its snapshot; folding the log can't.
+  const store = new Store(repo)
+  const aggregate = ledger(ns)
+  const seeded = []
+  for await (const entity of store.streamEntitiesFromSnapshots(aggregate)) {
+    seeded.push(entity)
+  }
+  ensureEqual(
+    seeded.map((entity) => (entity.ok ? [entity.entityId, entity.loaded.state.total] : null)),
+    [
+      [compacted.id, 10],
+      [emptied.id, 3],
+      [plain.id, 3],
+    ],
+    'each entity loaded from its snapshot and the events after it',
+  )
+  const folded = new Map<string, unknown>()
+  for await (const entity of store.streamEntities(aggregate)) {
+    if (entity.entityId.startsWith(`${ns}-`)) {
+      folded.set(entity.entityId, entity.ok ? entity.loaded.state.total : entity.error)
+    }
+  }
+  ensureEqual(folded.get(plain.id), 3, 'a stream folded from its events')
+  ensure(folded.get(compacted.id) instanceof SequenceGapError, 'a compacted stream fails to fold')
+  ensure(!folded.has(emptied.id), 'a stream with no events left has nothing to fold')
 }
 
 // A view operation of the `handles` projector.

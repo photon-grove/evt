@@ -26,6 +26,13 @@ import {
 } from './command.js'
 import {commitIds} from './commit-id.js'
 import {
+  type EnumeratedEntity,
+  type EventLog,
+  type StreamFilter,
+  foldEntities,
+  isEventLog,
+} from './enumerate.js'
+import {
   DuplicateCommandError,
   EvtError,
   OutcomePrincipalMismatchError,
@@ -71,6 +78,7 @@ import {
   serializeEvents,
 } from './staging.js'
 import type {CommitProjector, ProjectedView} from './projection.js'
+import {compareUtf8} from './utf8.js'
 import {
   type ReadFailures,
   Transaction,
@@ -231,6 +239,69 @@ export class Store {
       }
     }
     /* oxlint-enable no-await-in-loop */
+  }
+
+  /**
+   * Every entity of the aggregate's type folded from the event log alone, as Go's
+   * `StreamEntities` does, for rebuilds and diagnostics: a stream whose early events were
+   * compacted fails with a `SequenceGapError` instead of loading, which
+   * {@link streamEntitiesFromSnapshots} avoids. `filter.entityType` names another type whose
+   * events fold into this aggregate, after a rename say. An entity that fails to fold is yielded
+   * as an error, and a backend failure rejects the iteration. The repository must enumerate its
+   * log ({@link EventLog}), or the call fails with `invalidArgument`.
+   */
+  async *streamEntities<S, C, D extends EventDefinitions>(
+    aggregate: Aggregate<S, C, D>,
+    filter: StreamFilter = {},
+    options: CallOptions = {},
+  ): AsyncGenerator<EnumeratedEntity<S>> {
+    const log = this.#eventLog()
+    const entityType = filter.entityType ?? aggregate.type
+    yield* foldEntities(aggregate, log, {entityType}, options)
+  }
+
+  /**
+   * Every entity of the aggregate's type, each loaded as {@link load} loads it: from its latest
+   * snapshot and the events after it, so a compacted stream loads (Go's
+   * `StreamEntitiesFromSnapshots`, Rust's `stream_entities_from_snapshots`). The entities are the
+   * entity heads', by ID bytes. An entity that fails to load is yielded as an error.
+   */
+  async *streamEntitiesFromSnapshots<S, C, D extends EventDefinitions>(
+    aggregate: Aggregate<S, C, D>,
+    filter: StreamFilter = {},
+    options: CallOptions = {},
+  ): AsyncGenerator<EnumeratedEntity<S>> {
+    const log = this.#eventLog()
+    const heads = await log.entityHeads(filter.entityType ?? aggregate.type, options)
+    const ids = [...heads.keys()]
+    ids.sort(compareUtf8)
+    // One entity at a time, so memory holds one.
+    /* oxlint-disable no-await-in-loop */
+    for (const entityId of ids) {
+      let loaded: Loaded<S>
+      try {
+        loaded = await this.load(aggregate, entityId, options)
+      } catch (error) {
+        options.signal?.throwIfAborted()
+        yield {ok: false, entityId, error}
+        continue
+      }
+      yield {ok: true, entityId, loaded}
+    }
+    /* oxlint-enable no-await-in-loop */
+  }
+
+  // The repository as an event log, or a refusal.
+  #eventLog(): Repository & EventLog {
+    const repository = this.repository
+    if (!isEventLog(repository)) {
+      throw new EvtError(
+        'invalidArgument',
+        `repository ${repository.constructor.name || 'repository'} does not enumerate its log`,
+      )
+    }
+
+    return repository
   }
 
   /**

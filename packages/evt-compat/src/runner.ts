@@ -41,6 +41,8 @@ import {
   deleteView,
   emptyMetadata,
   encodeEvent,
+  isEventLog,
+  isReserved,
   encodeSnapshot,
   eventId,
   groupCommits,
@@ -83,6 +85,7 @@ export const SUPPORTED_SCENARIOS: readonly string[] = [
   'commit-too-large',
   'commit-grouping',
   'feature-marker',
+  'reserved-namespaces',
 ]
 
 /** The fixture run's name, which every run's identity digests use. */
@@ -145,6 +148,7 @@ const STEP_KEYS = new Set([
   'retention',
   'historyDependent',
   'retract',
+  'entityPrefix',
 ])
 
 // The keys this runner reads of an executeTransaction step's writes and its interference.
@@ -152,7 +156,7 @@ const WRITE_KEYS = new Set(['suffix', 'event'])
 const INTERFERE_KEYS = new Set(['suffix', 'event', 'times'])
 
 // The keys this runner reads of a transaction step's streams, their events and its fences.
-const STREAM_KEYS = new Set(['suffix', 'sequence', 'events', 'snapshot'])
+const STREAM_KEYS = new Set(['suffix', 'sequence', 'events', 'snapshot', 'entityPrefix'])
 const EVENT_KEYS = new Set(['type', 'version', 'payload', 'pad'])
 const FENCE_KEYS = new Set(['suffix', 'head', 'callerStamped', 'entityType'])
 
@@ -431,15 +435,19 @@ export class Runner {
 
   async step(step: JsonValue): Promise<Outcome> {
     const op = str(field(step, 'op'))
-    const id = streamId(this.entityId, optionalString(step, 'suffix') ?? '')
+    // A prefix puts the stream in a reserved namespace, which every write path refuses.
+    const prefix = optionalString(step, 'entityPrefix') ?? ''
+    const id = prefix + streamId(this.entityId, optionalString(step, 'suffix') ?? '')
 
     switch (op) {
       case 'execute':
         return this.#execute(id, step)
       case 'appendRaw': {
         const raw = field(step, 'event')
-        const loaded = await this.#store.load(account, id)
-        const event = rawEvent(id, loaded.sequence + 1n, step, rawFields(raw))
+        // A stream in a reserved namespace is never loaded: the write is refused before anything
+        // is read, so it's tried at sequence 1.
+        const sequence = prefix === '' ? (await this.#store.load(account, id)).sequence : 0n
+        const event = rawEvent(id, sequence + 1n, step, rawFields(raw))
         return this.#commitRaw(event)
       }
       case 'conflictProbe': {
@@ -460,10 +468,7 @@ export class Runner {
           })
           return outcome('ok')
         } catch (error) {
-          if (error instanceof StreamHeadDriftError) {
-            return outcome('drift')
-          }
-          throw error
+          return classify(error)
         }
       }
       case 'readLatest': {
@@ -507,6 +512,8 @@ export class Runner {
         }
       case 'declare':
         return this.#declare(step)
+      case 'enumerate':
+        return this.#enumerate()
       default:
         throw new Error(`a supported scenario has no ${op} step`)
     }
@@ -750,6 +757,36 @@ export class Runner {
     } catch (error) {
       return classify(error)
     }
+  }
+
+  // Walks the event log and the entity heads, as a rebuild does, and counts the events of the
+  // scenario's streams. An engine row of the scenario's (an outcome row, say) in either walk fails
+  // the step.
+  async #enumerate(): Promise<Outcome> {
+    const repository = this.#repository
+    if (!isEventLog(repository)) {
+      throw new Error('the repository does not enumerate its log')
+    }
+
+    let count = 0
+    for await (const batch of repository.streamAllEvents()) {
+      for (const event of batch) {
+        if (!event.entityId.includes(this.entityId)) {
+          continue
+        }
+        if (isReserved(event.entityId)) {
+          throw new Error(`enumeration yielded the engine row ${event.entityId}`)
+        }
+        count++
+      }
+    }
+    for (const entityId of (await repository.entityHeads()).keys()) {
+      if (entityId.includes(this.entityId) && isReserved(entityId)) {
+        throw new Error(`entity heads yielded the engine row ${entityId}`)
+      }
+    }
+
+    return outcome('ok', count)
   }
 
   // Applies one declaration to the store's feature manifest, as another writer would, and reports
@@ -1049,7 +1086,8 @@ function metadata(step: JsonValue): Partial<Metadata> {
  */
 export function transactionCommit(base: string, step: JsonValue): TransactionCommit {
   const streams = optionalList(step, 'streams').map((stream): Commit => {
-    const id = streamId(base, optionalString(stream, 'suffix') ?? '')
+    const prefix = optionalString(stream, 'entityPrefix') ?? ''
+    const id = prefix + streamId(base, optionalString(stream, 'suffix') ?? '')
     const first = int(field(stream, 'sequence'))
     const events = list(field(stream, 'events')).map((raw, index) =>
       rawEvent(id, first + BigInt(index), step, rawFields(raw)),

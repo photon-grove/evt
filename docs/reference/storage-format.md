@@ -2853,7 +2853,7 @@ The continuity query, the floor query, and the two fence queries of earlier draf
 The snapshot upsert keeps its sequence-chain check. `entity_heads` reads the marker first: once `stream-heads`
 is declared it reads this table, and until then it keeps the aggregate over events and snapshots,
 because `EnsureSchema` creates the table empty on a populated v0.8 database and a head-aware
-process would otherwise report no entities (Go and Rust alike). Steps 3 to 5 of the migration
+process would otherwise report no entities (Go, Rust and TypeScript alike). Steps 3 to 5 of the migration
 are one transaction under the exclusive feature advisory lock: the per-stream maximum of `sequence`
 and `event_sequence` over both tables (skipping a maximum of 0), inserted `ON CONFLICT DO NOTHING`.
 A verification query that finds no stream whose row is missing or unequal to the derived head,

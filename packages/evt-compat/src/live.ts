@@ -4,6 +4,7 @@
 //   live.js exclusive --backend dynamo|postgres
 //   live.js step   --backend dynamo|postgres --run RUN --index N --as go|rust [--only NAME]
 //   live.js verify --backend dynamo|postgres --run RUN
+//   live.js enumerate --backend dynamo|postgres --run RUN
 //
 // TypeScript joins the run as a stand-in. step executes step N of every scenario TypeScript
 // supports whose writer is the language --as names, and stamps that language's name into the
@@ -18,9 +19,11 @@
 // messages they publish, or the PostgreSQL event and snapshot rows, and the view rows commit-wide
 // projectors wrote.
 //
+// enumerate prints every event of the run the event log yields, unfiltered and narrowed to the
+// account type, as the Go and Rust drivers print them, so the script diffs the three.
+//
 // It runs against a local DynamoDB emulator, such as Moto, at AWS_ENDPOINT_URL, never real AWS,
 // or a local PostgreSQL server at DATABASE_URL, in the default tables the Go and Rust drivers use.
-// TypeScript has no event-log enumeration yet, so it doesn't join the enumeration check.
 
 // Each step needs the one before it, so the driver awaits in loops on purpose.
 /* oxlint-disable no-await-in-loop */
@@ -39,6 +42,7 @@ import {
   encodeMetadata,
   encodeSnapshot,
   compareUtf8,
+  isEventLog,
   parseJson,
 } from '@photon-grove/evt'
 import {
@@ -147,6 +151,10 @@ if (cli.command === 'scenarios') {
       case 'verify':
         await verify(checks, backend, cli.backend, cli.run)
         break
+      case 'enumerate':
+        await enumerate(backend, cli.run)
+        quiet = true
+        break
       default:
         throw new Error(`unknown command ${cli.command}`)
     }
@@ -162,7 +170,7 @@ if (cli.command === 'scenarios') {
 function parseArgs(argv: string[]): Args {
   const [command, ...flags] = argv
   if (command === undefined) {
-    throw new Error('missing command: scenarios | exclusive | step | verify')
+    throw new Error('missing command: scenarios | exclusive | step | verify | enumerate')
   }
 
   const parsed: Args = {command, backend: '', run: '', index: 0, as: '', only: ''}
@@ -575,6 +583,34 @@ function byKey<T extends {pk: string; sk: string}>(rows: T[]): T[] {
   rows.sort((a, b) => compareUtf8(a.pk, b.pk) || compareUtf8(a.sk, b.sk))
 
   return rows
+}
+
+// Every event of the run the log yields, once unfiltered and once narrowed to the account type, as
+// sorted "section entity sequence type" lines, which is what the Go and Rust drivers print.
+async function enumerate(backend: Backend, run: string): Promise<void> {
+  const repository = backend.repository
+  if (!isEventLog(repository)) {
+    throw new Error('the repository does not enumerate its log')
+  }
+
+  const lines: string[] = []
+  for (const [section, filter] of [
+    ['all', {}],
+    ['typed', {entityType: 'account'}],
+  ] as const) {
+    for await (const batch of repository.streamAllEvents(filter)) {
+      for (const event of batch) {
+        if (event.entityId.includes(run)) {
+          lines.push(`${section} ${event.entityId} ${event.sequence} ${event.type}`)
+        }
+      }
+    }
+  }
+  // Byte order, as Go's sort.Strings sorts.
+  lines.sort(compareUtf8)
+  for (const line of lines) {
+    console.log(line)
+  }
 }
 
 // A string attribute's text, or empty.

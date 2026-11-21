@@ -2,6 +2,7 @@
 // commit really applies, or is dropped, and either way the caller sees a result it can't trust.
 
 import {EvtError, IndeterminateError} from '../errors.js'
+import {type StreamFilter, isEventLog} from '../enumerate.js'
 import type {SerializedEvent, SerializedSnapshot} from '../event.js'
 import type {Outcome} from '../outcome.js'
 import type {CallOptions, Commit, OutcomeRepository, TransactionCommit} from '../repository.js'
@@ -20,6 +21,16 @@ export class FaultRepository implements OutcomeRepository {
     types: readonly string[],
     options?: CallOptions,
   ) => Promise<void>
+  /** The wrapped repository's enumeration, present only when it enumerates its log. */
+  declare readonly batchesByEntity?: boolean
+  declare readonly streamAllEvents?: (
+    filter?: StreamFilter,
+    options?: CallOptions,
+  ) => AsyncIterable<SerializedEvent[]>
+  declare readonly entityHeads?: (
+    entityType?: string,
+    options?: CallOptions,
+  ) => Promise<Map<string, bigint>>
   #fault: {apply: boolean; cause: unknown} | null = null
 
   constructor(inner: OutcomeRepository) {
@@ -32,6 +43,11 @@ export class FaultRepository implements OutcomeRepository {
     const declare = inner.declareHistoryDependent
     if (declare !== undefined) {
       this.declareHistoryDependent = (types, options) => declare.call(inner, types, options)
+    }
+    if (isEventLog(inner)) {
+      this.batchesByEntity = inner.batchesByEntity
+      this.streamAllEvents = (filter, options) => inner.streamAllEvents(filter, options)
+      this.entityHeads = (entityType, options) => inner.entityHeads(entityType, options)
     }
   }
 
