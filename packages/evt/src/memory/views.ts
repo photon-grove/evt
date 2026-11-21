@@ -14,7 +14,7 @@ import {
   checkViewRow,
   cursorKey,
   encodeViewCursor,
-  nulFree,
+  checkViewText,
   pageLimit,
   resolveViewKey,
   viewTtl,
@@ -105,7 +105,7 @@ export class MemViewRepository implements ViewRepository {
 
   async listViewsByPkPaged(pk: string, options: PageOptions = {}): Promise<ViewPage> {
     options.signal?.throwIfAborted()
-    nulFree(pk, 'pk')
+    checkViewText(pk, 'pk')
     const limit = pageLimit(options.limit)
     const after = cursorKey(options.cursor, 'pk', pk)?.get('sk')
 
@@ -130,7 +130,7 @@ export class MemViewRepository implements ViewRepository {
     options: PageOptions = {},
   ): Promise<ViewPage> {
     options.signal?.throwIfAborted()
-    nulFree(entityType, 'entity type')
+    checkViewText(entityType, 'entity type')
     const limit = pageLimit(options.limit)
     const after = cursorKey(options.cursor, 'entityType', entityType)
 

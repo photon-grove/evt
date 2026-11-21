@@ -117,11 +117,14 @@ nothing. PostgreSQL `text` cannot hold U+0000, so the same call has the same res
 (Go `conformance.RunViewRepositorySuite`, Rust `view_repository_cases`, TypeScript
 `viewRepositoryConformance` in `packages/evt-compat`).
 
-The view repository's other rules, the same in Rust and TypeScript and pinned for Go by
-`compat/fixtures/views.json`:
+TypeScript also refuses a lone surrogate there, which isn't UTF-8 and which Go and Rust strings
+can't hold. The view repository's other rules are the same in Rust and TypeScript;
+`compat/fixtures/views.json` pins Go's items, keys, queries and cursors, and where Go differs it
+says so:
 
-- An empty `sk` means `VIEW` on every read, write and delete. An empty `pk` is refused, and so is a
-  payload that isn't valid UTF-8 (an invalid-record error, since DynamoDB stores it as a string).
+- An empty `sk` means `VIEW` on every read, write and delete. An empty `pk` is refused (Go sends it
+  and DynamoDB refuses it), and so is a payload that isn't valid UTF-8 (an invalid-record error,
+  since DynamoDB stores it as a string).
 - A row's `ttl` is written whenever it isn't zero, a negative one too; a row without one is written
   without the attribute, so replacing a row drops its `ttl`. The in-memory repository keeps the
   `ttl` and never expires a row.
@@ -134,11 +137,13 @@ The view repository's other rules, the same in Rust and TypeScript and pinned fo
 - A cursor is padded base64url of the last key's string attributes as Go's JSON (sorted, escaped).
   Unpadded or standard-alphabet text, non-JSON, a non-string value, or a key without `pk` and `sk`
   is refused, and so is a cursor whose `pk` (partition listing) or `entityType` (entity-type
-  listing) isn't the listing's; Go forwards these to DynamoDB, which refuses them. DynamoDB returns
+  listing) isn't the listing's; Go forwards these to DynamoDB, which refuses them. An entity-type
+  cursor whose `pk` is the partition's passes this check, and DynamoDB refuses the request. DynamoDB returns
   a cursor whenever a bounded page was full; the in-memory repository only when a row follows.
-- A batch write checks every row before the first request, keeps a repeated key's last row, writes
-  chunks of 25, and sends what DynamoDB leaves unprocessed again, up to three attempts, after which
-  it fails as transient. A batch read de-duplicates, skips empty keys, and reads chunks of 100.
+- A batch write checks every row before the first request, keeps a repeated key's last row (Go
+  sends both, and DynamoDB refuses the chunk), writes chunks of 25, and sends what DynamoDB leaves
+  unprocessed again, up to three attempts, after which it fails as transient. A batch read
+  de-duplicates, skips empty keys, and reads chunks of 100.
 
 ## Serialization Formats
 

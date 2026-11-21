@@ -122,8 +122,8 @@ Point reads and partition listings are strongly consistent on DynamoDB, so a han
 own commit's rows; `{consistentRead: false}` halves the cost of a partition listing. Entity-type
 listings read the `entityType-index` index, so they can lag behind a commit. A page's `nextCursor`
 is Go's cursor byte for byte, so a Go, Rust or TypeScript process can continue another's listing.
-A cursor from another listing is refused, as are U+0000 anywhere in a row or a key, an empty `pk`,
-and a payload that isn't UTF-8.
+A cursor from another listing is refused, as are U+0000 or a lone surrogate anywhere in a row or a
+key, an empty `pk`, and a payload that isn't UTF-8.
 
 `ViewCodec<T>` writes a value as a row's payload with a payload codec, `json()` by default, and
 decodes it back; a row that doesn't decode throws a `ViewDecodeError` naming it, and the lenient

@@ -27,7 +27,7 @@ import {
   checkViewRow,
   cursorKey,
   encodeViewCursor,
-  nulFree,
+  checkViewText,
   pageLimit,
   resolveViewKey,
   viewTtl,
@@ -218,7 +218,7 @@ export class DynamoViewRepository implements ViewRepository {
 
   async listViewsByPkPaged(pk: string, options: PageOptions = {}): Promise<ViewPage> {
     options.signal?.throwIfAborted()
-    nulFree(pk, 'pk')
+    checkViewText(pk, 'pk')
     const query = viewQueryByPk(this.#table, pk, options)
     query.ConsistentRead = this.#consistentRead
 
@@ -234,7 +234,7 @@ export class DynamoViewRepository implements ViewRepository {
     options: PageOptions = {},
   ): Promise<ViewPage> {
     options.signal?.throwIfAborted()
-    nulFree(entityType, 'entity type')
+    checkViewText(entityType, 'entity type')
 
     return this.#page(viewQueryByEntityType(this.#table, entityType, options), options)
   }

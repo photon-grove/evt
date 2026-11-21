@@ -11,7 +11,7 @@ import {base64Decode, base64Encode} from './base64.js'
 import {EvtError, messageOf} from './errors.js'
 import {parseJson, stringifyJson} from './json.js'
 import type {CallOptions} from './repository.js'
-import {utf8Decode, utf8Encode} from './utf8.js'
+import {isHighSurrogate, isLowSurrogate, utf8Decode, utf8Encode} from './utf8.js'
 
 /** The sort key of a single-item view row: an empty `sk` means it, on every read and write. */
 export const DEFAULT_VIEW_SK = 'VIEW'
@@ -80,7 +80,7 @@ export interface PageOptions extends CallOptions {
  * U+0000 is refused with `invalidArgument` before any request: in a written row's keys, owner,
  * entity type or payload (a batch holding one writes nothing), and in a key or entity type a read,
  * delete or listing names. PostgreSQL `text` can't hold it, so every backend of every language
- * refuses it. An empty `pk` is refused with `invalidArgument`, and a payload that isn't valid
+ * refuses it. A lone surrogate, which isn't UTF-8, is refused the same way. An empty `pk` is refused with `invalidArgument`, and a payload that isn't valid
  * UTF-8 with `invalidRecord`.
  */
 export interface ViewRepository {
@@ -149,11 +149,11 @@ export function checkViewRow(row: ViewRow): string {
   }
 
   viewTtl(row)
-  nulFree(row.pk, 'pk')
-  nulFree(row.sk, 'sk')
-  nulFree(row.entityId, 'owner')
-  nulFree(row.entityType, 'entity type')
-  nulFree(payload, 'payload')
+  checkViewText(row.pk, 'pk')
+  checkViewText(row.sk, 'sk')
+  checkViewText(row.entityId, 'owner')
+  checkViewText(row.entityType, 'entity type')
+  checkViewText(payload, 'payload')
 
   return payload
 }
@@ -168,10 +168,25 @@ export function viewTtl(row: ViewRow): number {
   return ttl
 }
 
-/** Refuses U+0000 in a view row's text or in a key or entity type a read names. */
-export function nulFree(value: string, field: string): void {
+/**
+ * Refuses text in a view row, or in a key or entity type a read names, that no backend stores
+ * alike: U+0000, which PostgreSQL `text` can't hold, and a lone surrogate, which isn't UTF-8 (Go
+ * would write U+FFFD in its place, and two keys would then collide). Go and Rust strings can't
+ * hold a lone surrogate, so only TypeScript checks it.
+ */
+export function checkViewText(value: string, field: string): void {
   if (value.includes('\0')) {
     throw new EvtError('invalidArgument', `a view ${field} cannot contain U+0000`)
+  }
+
+  for (let i = 0; i < value.length; i++) {
+    const unit = value.charCodeAt(i)
+    if (isHighSurrogate(unit) && isLowSurrogate(value.charCodeAt(i + 1))) {
+      i++
+    } else if (isHighSurrogate(unit) || isLowSurrogate(unit)) {
+      const reason = `a view ${field} must be valid UTF-8: it holds a lone surrogate`
+      throw new EvtError('invalidArgument', reason)
+    }
   }
 }
 
@@ -183,8 +198,8 @@ export function resolveViewKey(pk: string, sk: string): string {
   if (pk === '') {
     throw new EvtError('invalidArgument', 'a view key needs a non-empty pk')
   }
-  nulFree(pk, 'pk')
-  nulFree(sk, 'sk')
+  checkViewText(pk, 'pk')
+  checkViewText(sk, 'sk')
 
   return sk === '' ? DEFAULT_VIEW_SK : sk
 }
@@ -196,7 +211,7 @@ export function resolveViewKey(pk: string, sk: string): string {
 export function batchKeys(pks: readonly string[], sk: string): {pks: string[]; sk: string} {
   const resolved = resolveViewKey('-', sk)
   for (const pk of pks) {
-    nulFree(pk, 'pk')
+    checkViewText(pk, 'pk')
   }
 
   return {pks: [...new Set(pks.filter((pk) => pk !== ''))], sk: resolved}

@@ -30,7 +30,7 @@ export async function viewRepositoryConformance(
     ['batchGetViews de-duplicates, skips empty and missing keys, and chunks', batchGet],
     ['a row with an empty pk or a non-UTF-8 payload is refused before any write', refusals],
     [
-      'U+0000 in a row or a key a read names is refused, and a batch holding it writes nothing',
+      'U+0000 or a lone surrogate in a row or a named key is refused; a batch holding one writes nothing',
       nul,
     ],
   ]
@@ -382,6 +382,22 @@ async function nul(repo: ViewRepository): Promise<void> {
   for (const [read, what] of reads) {
     await refuses(read(), 'invalidArgument', what)
   }
+
+  // A lone surrogate isn't UTF-8: Go would store U+FFFD in its place, and two keys would collide.
+  const lone = `${pk}\ud800`
+  const surrogates: [() => Promise<unknown>, string][] = [
+    [() => repo.putView(row(lone, 'VIEW', entityType, '{}')), 'a put with such a pk'],
+    [() => repo.putView(row(pk, 'a\udc00', entityType, '{}')), 'a put with such an sk'],
+    [() => repo.putView({...row(pk, 'VIEW', entityType, '{}'), entityId: '\ud800'}), 'an owner'],
+    [() => repo.putView(row(pk, 'VIEW', `${entityType}\udc00`, '{}')), 'an entity type'],
+    [() => repo.getViewAt(lone, 'VIEW'), 'a read of such a pk'],
+    [() => repo.listViewsByPkPaged(lone), 'a listing of such a pk'],
+    [() => repo.listViewsByEntityTypePaged(`${entityType}\ud800`), 'a listing of such a type'],
+  ]
+  for (const [call, what] of surrogates) {
+    await refuses(call(), 'invalidArgument', `lone surrogate: ${what}`)
+  }
+  equal(showAll(await repo.listViewsByPk(pk)), '[]', 'nothing was written')
 }
 
 async function refuses(promise: Promise<unknown>, code: string, what: string): Promise<void> {

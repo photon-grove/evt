@@ -292,7 +292,8 @@ const page = await views.listViewsByPkPaged('handles', {limit: 50})
 
 A page's cursor is padded base64url JSON of the last key, Go's byte for byte. Rust and TypeScript
 refuse a cursor that doesn't continue the same listing, which DynamoDB would refuse anyway, with an
-invalid-argument error before any request.
+invalid-argument error before any request. TypeScript also refuses a lone surrogate in a row or a
+key, which isn't UTF-8.
 
 The view repository refuses U+0000 in a written row's key, owner, entity type or payload (a
 `PutViews` batch holding one writes nothing), and in a key or entity type a read, delete or list
