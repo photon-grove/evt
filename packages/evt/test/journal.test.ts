@@ -5,7 +5,7 @@ import {describe, expect, test} from 'vitest'
 
 import {defineAggregate, defineEvents} from '../src/aggregate.ts'
 import {json} from '../src/codec.ts'
-import {EvtError, RebuildUnavailableError} from '../src/errors.ts'
+import {CommitTooLargeError, EvtError, RebuildUnavailableError} from '../src/errors.ts'
 import type {SerializedEvent} from '../src/event.ts'
 import {
   ChunkBuilder,
@@ -753,5 +753,24 @@ describe('compaction leases', () => {
     await expect(beginCompaction(memory, 'world:7', 'compactor', Number.MAX_VALUE)).rejects.toThrow(
       /a lease is one second to/,
     )
+  })
+})
+
+describe('the journal and the commit budget', () => {
+  test('a commit over the budget with its rows and counters declares nothing', async () => {
+    const memory = new MemRepository()
+    await memory.initialize()
+    const repository = new JournalRepository(memory, new Journal(['account'], () => ['world:7']))
+    // 49 events, 49 rows and a counter, with the two control checks: 101 actions.
+    const events = Array.from({length: 49}, (_, index) => {
+      const sequence = BigInt(index + 1)
+      return {...opened('a'), id: `a:${sequence}`, sequence}
+    })
+    await expect(repository.commit({entityId: 'a', events})).rejects.toBeInstanceOf(
+      CommitTooLargeError,
+    )
+    const manifest = controlFixtures(memory).manifest()
+    expect(manifest?.features.has('journal')).toBe(false)
+    expect(manifest?.historyDependent).toEqual([])
   })
 })
