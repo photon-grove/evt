@@ -107,8 +107,10 @@ export interface StoreOptions {
   /**
    * The commit-wide projectors, whose view operations every commit that writes events carries,
    * in this order. The repository must write views, as every one this package ships does (the
-   * DynamoDB one with a views table). Only current-state projectors run for now: one that names
-   * a `history` is refused.
+   * DynamoDB one with a views table, the PostgreSQL one with a view writer). A history-dependent
+   * projector's entity types are declared in the store's feature manifest once, before the first
+   * commit that runs it, so the repository must declare them too, as every one this package ships
+   * does.
    */
   commitProjectors?: readonly CommitProjector[] | undefined
 }
