@@ -11,7 +11,7 @@ import {EvtError, TransientError} from '../errors.js'
 import {checkScope} from '../journal/scope.js'
 import type {CallOptions} from '../repository.js'
 import type {PgQueryable} from './client.js'
-import {journalChannel, pgTables} from './schema.js'
+import {DEFAULT_EVENTS_TABLE, journalChannel, pgTables} from './schema.js'
 
 /** How long {@link JournalListener.next} waits before it returns a `poll` wake-up, by default. */
 export const DEFAULT_POLL_INTERVAL_MS = 30_000
@@ -118,7 +118,10 @@ export class JournalListener {
       throw new EvtError('invalidArgument', 'a journal listener needs a connect function')
     }
 
-    this.channel = journalChannel(pgTables(options.eventsTable))
+    // Only the events table names the channel: it's checked against a snapshots name it can't
+    // share, so any events table a repository accepts is accepted, whatever its snapshots table.
+    const events = options.eventsTable ?? DEFAULT_EVENTS_TABLE
+    this.channel = journalChannel(pgTables(events, `${events}_s`))
     this.#connect = options.connect
     this.#pollInterval = duration(options.pollIntervalMs, DEFAULT_POLL_INTERVAL_MS, 'poll interval')
     this.#connectTimeout = duration(

@@ -90,6 +90,11 @@ describe('JournalListener', () => {
   test('refuses an invalid events table, connect or interval at construction', () => {
     const connect = fresh
     expect(() => new JournalListener({connect, eventsTable: 'bad name'})).toThrow(EvtError)
+    expect(() => new JournalListener({connect, eventsTable: 'a__evt_b'})).toThrow(EvtError)
+    // An events table named like the default snapshots table is any repository's own choice.
+    expect(new JournalListener({connect, eventsTable: 'evt_snapshots'}).channel).toBe(
+      'evt_snapshots__evt_journal',
+    )
     expect(() => new JournalListener({connect, pollIntervalMs: 0})).toThrow(/poll interval/)
     expect(() => new JournalListener({connect, connectTimeoutMs: 1.5})).toThrow(/connect timeout/)
     expect(() => new JournalListener({connect, pollIntervalMs: 2 ** 31})).toThrow(/poll interval/)
