@@ -263,8 +263,8 @@ DynamoDB item, so the budget refuses the same commits on both backends. The repo
 `postgres-views` marker feature before its first commit, after which a Go writer, or a Rust or
 TypeScript repository without the views table, refuses the store instead of putting views somewhere
 else. The TypeScript repository applies the journal's expected-payload condition there too, though
-it doesn't journal on PostgreSQL yet. The [sync journal](../reference/storage-format.md#journal) works on PostgreSQL through the same table:
-wrap the repository in a `JournalRepository` and it journals, pages and compacts as it does on
+TypeScript has no journal yet. In Rust, the [sync journal](../reference/storage-format.md#journal)
+works on PostgreSQL through the same table: wrap the repository in a `JournalRepository` and it journals, pages and compacts as it does on
 DynamoDB. Each journaled commit runs `pg_notify` per scope it wrote, and a `JournalListener`
 (one dedicated connection) turns those into wake-ups: page the scope it names, and every scope on
 `Connected` and `Poll`, since a notification sent while the listener was disconnected is lost.
