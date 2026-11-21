@@ -5,6 +5,8 @@ export {
   type HeadFixtures,
   type ManifestDraft,
   MemRepository,
+  type MemRepositoryOptions,
+  type RebuildFixture,
   type RebuildState,
   type ViewRow,
   controlFixtures,

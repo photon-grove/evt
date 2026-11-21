@@ -1143,8 +1143,15 @@ DESC LIMIT n`. The in-memory backend walks its stream backwards.
 
 ### Rebuild Fence (ADR-0004 C10)
 
+- Every language runs the lifecycle on every backend: Go's `evt.RebuildFence` (through
+  `RebuildFenceProvider`), Rust's `Repository` methods, and TypeScript's `RebuildFence` methods on
+  each repository (`rebuildState`, `rebuildGeneration`, `beginRebuild`, `renewRebuild`,
+  `endRebuild`, `forceReleaseRebuild`, `writeRebuildViews`), with its errors the Go names plus
+  `Error` and the reader helpers `observeRebuildEpoch`, `verifyRebuildEpoch` and
+  `readAtRebuildEpoch`. TypeScript takes leases in milliseconds, rounded up to whole seconds.
 - The fence is two engine rows in the reserved `SYSTEM#` namespace (storage spec, Rebuild Fence): a
-  lock row (`SYSTEM#REBUILD`: `owner`, `leaseExpiresAt` in whole epoch seconds; after a
+  lock row (`SYSTEM#REBUILD`: `owner`, the fencing `generation`, `leaseExpiresAt` in whole epoch
+  seconds; after a
   force-release, only `forceReleased = true`) and a generation item
   (`SYSTEM#REBUILD#GENERATION`: `value`, and `forceReleased` after a force-release). On
   PostgreSQL they are `{events}__evt_rebuild_lock` and `{events}__evt_rebuild_generation`. Every

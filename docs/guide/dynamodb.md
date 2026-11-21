@@ -155,6 +155,11 @@ transaction that writes it can lose a race against the commits' checks (or anoth
 `Begin` retries from a fresh read up to eight times before returning the transient
 `*evt.RebuildConflictError`. Retry it.
 
+The TypeScript `DynamoRepository` sends the same requests (`beginRebuild`, `renewRebuild`,
+`endRebuild`, `forceReleaseRebuild`, `writeRebuildViews`), and its retryable
+`RebuildConflictError` means the same. Renewing is one `UpdateItem`, so a structural client must
+have `updateItem`, which the SDK's `DynamoDB` client does.
+
 ### Snapshots
 
 `snapshots.NewStore(repo, snapshotSize)` wraps the repository and writes a snapshot roughly every

@@ -86,7 +86,9 @@ transactions, so no acquire or release can slip between a commit's assertion and
 guarded view write selects the lock row `FOR UPDATE` and asserts the owner and an unexpired lease
 in the transaction that carries the view statements. So a takeover waits for it, and a worker that
 lost the lock aborts without writing. A database created before the fence has neither table, and
-commits pass until `EnsureSchema` creates them.
+commits pass until `EnsureSchema` creates them. The TypeScript `PgRepository` runs the same
+statements under the same locks (`beginRebuild`, `renewRebuild`, `endRebuild`,
+`forceReleaseRebuild`, `writeRebuildViews`).
 
 Outcome rows record the identity of their command in three columns of the outcomes table
 (`command_type`, `targets`, `principal`), which `EnsureSchema` adds to a table created before them.
