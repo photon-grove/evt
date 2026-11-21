@@ -553,12 +553,12 @@ async function pass(ms: number): Promise<void> {
   await vi.advanceTimersByTimeAsync(ms)
 }
 
-// A repository whose outcome reads after its first commit behave as `read` says.
 // A DynamoDB transaction conflict on a commit's outcome put.
 function conflict(): TransientError {
   return new TransientError('transaction conflict', {transactionConflict: true, outcomeRow: true})
 }
 
+// A repository whose outcome reads after its first commit behave as `read` says.
 function readingAfterCommit(
   inner: OutcomeRepository,
   commitError: unknown,

@@ -191,14 +191,17 @@ describe('DynamoRepository', () => {
   })
 
   test.each([
-    {name: 'on the outcome put', at: 4, outcomeRow: true},
-    {name: 'on the stream head', at: 2, outcomeRow: false},
+    {name: 'on the outcome put', at: [4], outcomeRow: true},
+    {name: 'on the stream head', at: [2], outcomeRow: false},
+    {name: 'on the head and the outcome put', at: [2, 4], outcomeRow: true},
   ])(
     'a transaction conflict $name says whether it was the outcome row',
     async ({at, outcomeRow}) => {
       // Controls, head, event, then the outcome put last.
       const codes = ['None', 'None', 'None', 'None', 'None']
-      codes[at] = 'TransactionConflict'
+      for (const index of at) {
+        codes[index] = 'TransactionConflict'
+      }
       const client = new Scripted(manifest(1n), cancelled(...codes))
       const outcome = {
         commandId: 'cmd',

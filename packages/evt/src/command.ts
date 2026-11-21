@@ -57,13 +57,13 @@ export const DEFAULT_RECOVERY_WAIT_MS = 10_000
 // between recovery reads: 50 ms, doubling to 1 s. Go and Rust use the same.
 const RECOVERY_GRACE_MS = 1000
 const RECOVERY_FIRST_DELAY_MS = 50
+const RECOVERY_MAX_DELAY_MS = 1000
 
 // How long settle polls the outcome row after a DynamoDB transaction conflict on the outcome put:
 // reads at 0, 50 and 150 ms, never past the recovery window. The winner's transaction was
 // committing when the loser was cancelled, and a winner that fails leaves no row, so the poll stays
 // short rather than waiting out the window.
 const OUTCOME_ROW_CONFLICT_WINDOW_MS = 150
-const RECOVERY_MAX_DELAY_MS = 1000
 
 // The longest recovery window a timer can bound with its grace period: runtimes fire a timer past
 // 2^31 - 1 ms at once.
@@ -331,8 +331,11 @@ export async function persistRejection(
  * - an indeterminate failure is recovered by polling the row for the recovery window: the same
  *   digest means the commit won, another is an {@link IdempotencyKeyReuseError}, and a row still
  *   absent (or unreadable) is a retryable {@link AmbiguousWriteError}, never "not applied";
- * - a conflict may be the loser of a race for the same command ID, so the row is read once: when
- *   it exists, it answers the command, and when not, the conflict stands;
+ * - a DynamoDB transaction conflict on the outcome put, which only another attempt of the same
+ *   command writes, polls the row briefly (up to 150 ms): when it appears, it answers the command,
+ *   and when not, the conflict stands;
+ * - any other conflict may be the loser of a race for the same command ID, so the row is read
+ *   once: when it exists, it answers the command, and when not, the conflict stands;
  * - anything else is thrown as is.
  *
  * The recovery reads ignore the caller's abort signal: a commit that may have applied is resolved
@@ -427,7 +430,7 @@ export async function settle(
 
 // A conflict whose winner may be another attempt of the same command: its row answers it. A
 // fence conflict included, since the winner wrote the stream the loser fenced, and a DynamoDB
-// transaction conflict, since the loser was cancelled while the winner held the outcome item.
+// transaction conflict on another item, since the loser was cancelled while the winner held it.
 function mayHaveLostTheRace(error: unknown): boolean {
   return isConflict(error) || (error instanceof TransientError && error.transactionConflict)
 }
@@ -474,8 +477,9 @@ type Polled =
 
 /**
  * Polls for the outcome row with exponential backoff until it appears or the window (the recovery
- * window unless a shorter one is given) has been slept through. The whole poll, reads included, gets the window plus the grace period, so
- * neither a read that never answers nor a run of slow ones holds recovery past it.
+ * window unless a shorter one is given) has been slept through. The whole poll, reads included,
+ * gets the window plus the grace period, so neither a read that never answers nor a run of slow
+ * ones holds recovery past it.
  */
 async function pollForRow(
   repository: OutcomeRepository,
