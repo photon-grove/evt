@@ -1,12 +1,16 @@
 // The TypeScript driver of the cross-language run (scripts/compat-integration.sh, ADR 0009):
 //
-//   live.js scenarios
-//   live.js step   --backend dynamo|postgres --run RUN --index N --as go|rust
+//   live.js scenarios --backend dynamo|postgres
+//   live.js exclusive --backend dynamo|postgres
+//   live.js step   --backend dynamo|postgres --run RUN --index N --as go|rust [--only NAME]
 //   live.js verify --backend dynamo|postgres --run RUN
 //
 // TypeScript joins the run as a stand-in. step executes step N of every scenario TypeScript
 // supports whose writer is the language --as names, and stamps that language's name into the
-// event's origin and commit ID, so the streams match the fixtures byte for byte. In such a pass
+// event's origin and commit ID, so the streams match the fixtures byte for byte. An exclusive
+// scenario holds store-wide state across its steps (a declared feature refuses every other
+// scenario's commits), so step skips it unless --only names it, which runs that scenario alone;
+// exclusive lists the exclusive scenarios TypeScript supports. In such a pass
 // the other language's driver writes its own steps of the same scenarios, limited to the list
 // scenarios prints (-scenarios or --scenarios). verify checks the streams of the supported
 // scenarios against the golden fixtures: the events and snapshot read through the repository, the
@@ -63,13 +67,16 @@ import {
   type Observed,
   Runner,
   SUPPORTED_SCENARIOS,
+  type MarkerDriver,
   checkScenario,
   checkStep,
   compareObserved,
   compareStream,
   expectedOutcome,
+  isExclusive,
   optionalList,
 } from './runner.js'
+import {dynamoControls, postgresControls} from './controls.js'
 import {POSTGRES_VIEW_TABLE, postgresViewDdl, postgresViewWriter} from './pgviews.js'
 import {viewPartitions} from './scenarios.js'
 
@@ -81,6 +88,7 @@ interface Args {
   run: string
   index: number
   as: string
+  only: string
 }
 
 /** A backend the run writes, and how to read a stream back as it stores it. */
@@ -88,6 +96,8 @@ interface Backend {
   readonly repository: Repository
   /** Appends an event to the log without maintaining the stream's head. */
   bypassHead(event: SerializedEvent): Promise<void>
+  /** Declares on the store's feature manifest, as another writer would. */
+  readonly marker: MarkerDriver
   observe(runner: Runner, id: string): Promise<Observed>
   /** Compares what the backend stores for a stream beyond what `observe` reads. */
   checkRows(checks: Checks, name: string, id: string, expected: JsonValue): Promise<void>
@@ -111,6 +121,12 @@ const cli = parseArgs(process.argv.slice(2))
 
 if (cli.command === 'scenarios') {
   console.log(scenarioNames(cli.backend).join(','))
+} else if (cli.command === 'exclusive') {
+  for (const scenario of await supportedScenarios(cli.backend)) {
+    if (isExclusive(scenario)) {
+      console.log(str(field(scenario, 'name')))
+    }
+  }
 } else {
   if (cli.run === '') {
     throw new Error('--run is required')
@@ -146,10 +162,10 @@ if (cli.command === 'scenarios') {
 function parseArgs(argv: string[]): Args {
   const [command, ...flags] = argv
   if (command === undefined) {
-    throw new Error('missing command: scenarios | step | verify')
+    throw new Error('missing command: scenarios | exclusive | step | verify')
   }
 
-  const parsed: Args = {command, backend: '', run: '', index: 0, as: ''}
+  const parsed: Args = {command, backend: '', run: '', index: 0, as: '', only: ''}
   for (let i = 0; i < flags.length; i += 2) {
     const flag = flags[i]
     const value = flags[i + 1]
@@ -166,6 +182,9 @@ function parseArgs(argv: string[]): Args {
         break
       case '--as':
         parsed.as = value
+        break
+      case '--only':
+        parsed.only = value
         break
       case '--index':
         if (!/^\d+$/.test(value)) {
@@ -226,6 +245,7 @@ function dynamoBackend(): Backend {
 
   return {
     repository,
+    marker: dynamoControls(client, table),
     // The event item alone, with none of the head update a commit carries, as Go's driver puts it.
     async bypassHead(event) {
       await client.putItem({
@@ -293,6 +313,7 @@ async function postgresBackend(): Promise<Backend> {
 
   return {
     repository,
+    marker: postgresControls(pool, repository.tables.events),
     // The event row alone, leaving the stream's head row as it was, as Go's driver inserts it.
     async bypassHead(event) {
       await pool.query(
@@ -472,6 +493,10 @@ async function runStep(checks: Checks, backend: Backend, args: Args): Promise<nu
   let executed = 0
   for (const scenario of await supportedScenarios(args.backend)) {
     const name = str(field(scenario, 'name'))
+    // The interleaved run skips exclusive scenarios; a run with --only executes that one alone.
+    if (isExclusive(scenario) !== (args.only !== '') || (args.only !== '' && name !== args.only)) {
+      continue
+    }
     const step = list(field(scenario, 'steps'))[args.index]
     if (step === undefined || str(field(step, 'by')) !== args.as) {
       continue
@@ -480,6 +505,7 @@ async function runStep(checks: Checks, backend: Backend, args: Args): Promise<nu
 
     const runner = new Runner(backend.repository, scenario, args.run, {
       bypassHead: (event) => backend.bypassHead(event),
+      marker: backend.marker,
     })
     const got = await runner.step(step)
     const want = expectedOutcome(field(step, 'expect'))

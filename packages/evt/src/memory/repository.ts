@@ -25,6 +25,8 @@ import {
   checkWritable,
   declaresStreamHeads,
   entityTypeSet,
+  missingHistoryDependent,
+  withHistoryDependent,
   withStreamHeads,
 } from '../features.js'
 import {int64Argument} from '../fields.js'
@@ -130,6 +132,20 @@ export class MemRepository implements OutcomeRepository, StoreInitializer {
   /** It writes commit-wide view operations, to its own rows. */
   writesViews(): boolean {
     return true
+  }
+
+  /**
+   * Adds the entity types to the feature manifest's historyDependent set in one declaration, so
+   * {@link compactBelow} refuses them. Types already declared are left alone, and a store that
+   * declares an unsupported feature is refused first.
+   */
+  async declareHistoryDependent(types: readonly string[], options?: CallOptions): Promise<void> {
+    options?.signal?.throwIfAborted()
+    checkSupported(this.#controls.manifest)
+    const missing = missingHistoryDependent(this.#controls.manifest, types)
+    if (missing.length > 0) {
+      this.#controls.manifest = withHistoryDependent(this.#controls.manifest, missing)
+    }
   }
 
   /** The view row at `pk` and `sk`, or null when there is none. */
