@@ -5,7 +5,7 @@
 
 import {EvtError, RebuildEpochChangedError, TransientError} from '../errors.js'
 import {JOURNAL_MARKER, type JournalMarker} from '../features.js'
-import type {CallOptions} from '../repository.js'
+import {type CallOptions, MAX_COMMIT_BYTES} from '../repository.js'
 import {utf8Length} from '../utf8.js'
 import type {ViewRow} from '../views.js'
 import {
@@ -45,7 +45,7 @@ import {
   type RawBuilt,
 } from './compaction.js'
 import {MAX_PAGE_ROWS} from './read.js'
-import type {JournalRow} from './row.js'
+import {type JournalRow, rowSize} from './row.js'
 import {checkScope, rowPartitionKey, rowSortKey} from './scope.js'
 
 /** A compaction store that can also check and declare the journal's features on its manifest. */
@@ -61,6 +61,11 @@ export const MAX_COMPACTION_OWNER_BYTES = 512
 const MAX_LEASE_ATTEMPTS = 8
 // The longest lease: a year, so its expiry stays a whole number of seconds every reader decodes.
 const MAX_LEASE_MS = 366 * 24 * 60 * 60 * 1000
+// The deleted items' bytes per transaction: the commit budget, less room for the lease and epoch
+// checks. A row's item is its payload plus its keys, owner and type, at most a few hundred bytes
+// more for any scope, which DELETE_ITEM_OVERHEAD covers.
+const DELETE_BATCH_BYTES = MAX_COMMIT_BYTES - 10_000
+const DELETE_ITEM_OVERHEAD = 1_200
 // Row deletes per transaction: the lease check takes the last action.
 const DELETE_BATCH = MAX_COMPACTION_WRITES - 1
 
@@ -546,14 +551,15 @@ export async function compactWithLease(
     report = result.report
     held = result.lease
   } catch (error) {
+    // Released without the caller's signal: a run it cancelled must still give the scope back.
     try {
-      await endCompaction(store, held, options)
+      await endCompaction(store, held)
     } catch {
       // The run's own failure is what the caller needs.
     }
     throw error
   }
-  await endCompaction(store, held, options)
+  await endCompaction(store, held)
 
   return report
 }
@@ -738,6 +744,35 @@ async function build(
   return {manifest, written}
 }
 
+// The rows' deletes in batches whose deleted items fit a transaction's aggregate size, with room
+// for the lease and epoch checks: DynamoDB counts a deleted item's size against its 4 MB limit, so
+// a page of rows near the largest row cap needs several transactions.
+function deleteBatches(scope: string, rows: readonly JournalRow[]): CompactionWrite[][] {
+  const batches: CompactionWrite[][] = []
+  let batch: CompactionWrite[] = []
+  let bytes = 0
+  for (const row of rows) {
+    const size = rowSize(scope, row.position, row.event) + DELETE_ITEM_OVERHEAD
+    if (batch.length > 0 && bytes + size > DELETE_BATCH_BYTES) {
+      batches.push(batch)
+      batch = []
+      bytes = 0
+    }
+    batch.push({
+      kind: 'delete',
+      pk: rowPartitionKey(scope),
+      sk: rowSortKey(row.position),
+      owner: row.owner,
+    })
+    bytes += size
+  }
+  if (batch.length > 0) {
+    batches.push(batch)
+  }
+
+  return batches
+}
+
 // Deletes every journal row at or below `through` that is there, a batch per transaction.
 async function deleteRows(run: Run, through: bigint): Promise<bigint> {
   const {scope} = run.lease
@@ -753,14 +788,9 @@ async function deleteRows(run: Run, through: bigint): Promise<bigint> {
       return deleted
     }
     after = last.position
-    await run.write(
-      rows.map((row) => ({
-        kind: 'delete',
-        pk: rowPartitionKey(scope),
-        sk: rowSortKey(row.position),
-        owner: row.owner,
-      })),
-    )
+    for (const batch of deleteBatches(scope, rows)) {
+      await run.write(batch)
+    }
     deleted += BigInt(rows.length)
     if (after >= through) {
       return deleted

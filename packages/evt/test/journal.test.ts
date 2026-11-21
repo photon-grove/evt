@@ -59,6 +59,7 @@ import {
   projectViews,
   putView,
 } from '../src/projection.ts'
+import {MAX_COMMIT_BYTES} from '../src/repository.ts'
 import {Store} from '../src/store.ts'
 import {utf8Length} from '../src/utf8.ts'
 
@@ -746,6 +747,57 @@ describe('compaction leases', () => {
       /the audit write failed/,
     )
     expect((await readLease(memory, 'world:7'))?.kind).toBe('released')
+  })
+
+  test('a run its caller aborts still releases its lease', async () => {
+    const memory = new MemRepository()
+    const repository = new JournalRepository(memory, new Journal(['account'], () => ['world:7']))
+    await repository.commit({entityId: 'a', events: [opened('a')]})
+
+    const controller = new AbortController()
+    const readRows = memory.readRows.bind(memory)
+    memory.readRows = (scope, after, limit, options) => {
+      controller.abort(new Error('cancelled'))
+      return readRows(scope, after, limit, options)
+    }
+    await expect(
+      compactWithLease(memory, 'world:7', 1n, 'compactor', 3_600_000, {signal: controller.signal}),
+    ).rejects.toThrow(/cancelled/)
+    expect((await readLease(memory, 'world:7'))?.kind).toBe('released')
+  })
+
+  test('deletes rows near the largest cap in batches that fit a transaction', async () => {
+    const memory = new MemRepository()
+    const repository = new JournalRepository(
+      memory,
+      new Journal(['account'], () => ['world:7'], {maxRowBytes: MAX_ROW_BYTES}),
+    )
+    // 30 rows of about 133,000 bytes each: some 4 MB, past one transaction's budget.
+    for (let index = 1; index <= 30; index++) {
+      const id = `a${index}`
+      const wide = {
+        ...opened(id),
+        payload: new TextEncoder().encode(`{"note":"${'x'.repeat(100_000)}"}`),
+      }
+      // Each commit takes the next position, so they go one at a time.
+      // oxlint-disable-next-line no-await-in-loop
+      await repository.commit({entityId: id, events: [wide]})
+    }
+
+    const batches: number[] = []
+    const write = memory.writeCompaction.bind(memory)
+    memory.writeCompaction = async (epoch, writes, options) => {
+      const deletes = writes.filter((each) => each.kind === 'delete').length
+      if (deletes > 0) {
+        batches.push(deletes)
+      }
+      return write(epoch, writes, options)
+    }
+    const report = await compactWithLease(memory, 'world:7', 30n, 'compactor', 60_000)
+    expect(report.rowsDeleted).toBe(30n)
+    expect(batches.length).toBeGreaterThan(1)
+    // Each batch's deleted rows stay under the commit budget.
+    expect(Math.max(...batches) * 134_500).toBeLessThan(MAX_COMMIT_BYTES)
   })
 
   test('refuses a lease whose expiry no reader could decode', async () => {
