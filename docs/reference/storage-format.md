@@ -428,12 +428,12 @@ snapshot stays.
 
 The languages report the other cancellations differently:
 
-| Cancellation                                         | Go                                    | Rust                            |
-| ---------------------------------------------------- | ------------------------------------- | ------------------------------- |
-| head, event, or snapshot condition                   | `dynamo.ErrSnapshotRaceCondition`     | `Error::Conflict`               |
-| projector operation condition                        | `*evt.ProjectorOperationError`, not retried (a legacy transaction group's `HandleError`) | `Error::ProjectorOperation`, not retried |
-| `TransactionConflict`                                | `dynamo.ErrTransactionConflict`, transient, not a conflict | `Error::Transient` (source `TransactionConflict`), not a conflict |
-| `ThrottlingError` or `ProvisionedThroughputExceeded` | classified as transient               | `Error::Transient`, retried     |
+| Cancellation                                         | Go                                    | Rust                            | TypeScript                      |
+| ---------------------------------------------------- | ------------------------------------- | ------------------------------- | ------------------------------- |
+| head, event, or snapshot condition                   | `dynamo.ErrSnapshotRaceCondition`     | `Error::Conflict`               | `ConflictError`                 |
+| projector operation condition                        | `*evt.ProjectorOperationError`, not retried (a legacy transaction group's `HandleError`) | `Error::ProjectorOperation`, not retried | `ProjectorOperationError`, not retried (a legacy projector group's SDK error) |
+| `TransactionConflict`                                | `dynamo.ErrTransactionConflict`, transient, not a conflict | `Error::Transient` (source `TransactionConflict`), not a conflict | `TransientError` with `transactionConflict` set, not a conflict |
+| `ThrottlingError` or `ProvisionedThroughputExceeded` | classified as transient               | `Error::Transient`, retried     | `TransientError`, retried       |
 
 In Rust, a commit that times out, loses its response, or fails with an internal server error is
 `Error::Backend`, not retried: the transaction may have been applied, and running the command again
@@ -1267,6 +1267,14 @@ error at statement or `COMMIT` time) is returned as is.
 
 DynamoDB's `TransactionInProgressException` is one more indeterminate result (the transaction is
 still running and may yet commit), recovered by the same polling.
+
+A DynamoDB commit never sets `ClientRequestToken`. The AWS SDKs fill in a fresh token per call
+and resend it on their own retries, so a retry that reaches DynamoDB while its first attempt is
+still running gets `TransactionInProgressException` (indeterminate, as above), and one whose
+first attempt applied gets success. Neither is reported as a `TransactionConflict` with itself. A
+token per command would be wrong: fence-aware retry resends a command ID with different items
+within the token's 10-minute window, which DynamoDB refuses with
+`IdempotentParameterMismatchException`. A custom client must fill in the token the same way.
 
 A concurrent attempt with the same command ID and the same digest that loses the race for the
 outcome row returns only the winner's stored outcome (its result or rejection, marked
