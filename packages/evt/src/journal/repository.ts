@@ -30,12 +30,15 @@ import {
   type CallOptions,
   type Commit,
   type CommitReceipt,
+  type NormalizedTransaction,
   type OutcomeRepository,
   type TransactionCommit,
+  checkBudget,
   commitAsTransaction,
   commitTransactionWithReceipt,
   commitWithReceipt,
   normalizeTransaction,
+  transactionSizes,
 } from '../repository.js'
 import {retryDelay, sleep} from '../retry.js'
 import {compareUtf8} from '../utf8.js'
@@ -508,7 +511,7 @@ class StagedCommit extends Staged<Commit> {
   }
 
   validate(): void {
-    commitAsTransaction(this.value)
+    checkStagedBudget(commitAsTransaction(this.value))
   }
 }
 
@@ -544,8 +547,14 @@ class StagedTransaction extends Staged<TransactionCommit> {
   }
 
   validate(): void {
-    normalizeTransaction(this.value)
+    checkStagedBudget(normalizeTransaction(this.value))
   }
+}
+
+// Refuses a staged attempt over the commit budget, rows and counters included, before the manifest
+// is touched: the backend checks it again with its own item sizes.
+function checkStagedBudget(transaction: NormalizedTransaction): void {
+  checkBudget(transactionSizes(transaction, () => undefined))
 }
 
 function copyCommit(commit: Commit): Commit {
