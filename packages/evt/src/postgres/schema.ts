@@ -128,6 +128,15 @@ export function viewsTable(tables: PgTables): string {
 }
 
 /**
+ * The `NOTIFY` channel a journaled commit wakes listeners on (ADR 0008): `evt_events` yields
+ * `evt_events__evt_journal`, the lower-case events table name with `__evt_journal`, which fits
+ * PostgreSQL's 63-byte identifier limit at the longest events table name. Rust's `journal_channel`.
+ */
+export function journalChannel(tables: PgTables): string {
+  return derived(tables.events, 'journal')
+}
+
+/**
  * The most UTF-8 bytes a view row's entity type, `pk` and `sk` may hold together in the views
  * table. A btree index entry holds at most 2,704 bytes, less than DynamoDB's 2,048-byte `pk` plus
  * 1,024-byte `sk`, so PostgreSQL refuses a longer key before writing.
