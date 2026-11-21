@@ -62,7 +62,13 @@ import {
   retryDelay,
   sleep,
 } from './retry.js'
-import {commitSnapshot, projectCommit, projectStreams, serializeEvents} from './staging.js'
+import {
+  commitSnapshot,
+  declareHistory,
+  projectCommit,
+  projectStreams,
+  serializeEvents,
+} from './staging.js'
 import type {CommitProjector, ProjectedView} from './projection.js'
 import {
   type ReadFailures,
@@ -156,6 +162,8 @@ export class Store {
   readonly #commitId: () => string
   readonly #outcomes: OutcomeConfig | null
   readonly #commitProjectors: readonly CommitProjector[]
+  // The entity types this store's history-dependent projectors read, once declared.
+  readonly #historyDeclared = new Set<string>()
 
   constructor(repository: Repository, options: StoreOptions = {}) {
     const interval = options.snapshotInterval ?? DEFAULT_SNAPSHOT_INTERVAL
@@ -269,6 +277,7 @@ export class Store {
       decision.events,
       metadata,
     )
+    await this.#declareHistory(options)
     await this.repository.commit({entityId, events, snapshot, projections, views}, options)
 
     return {kind: 'committed', state, events}
@@ -449,8 +458,14 @@ export class Store {
       metadata: (partial) => this.#metadata(partial),
       outcomes: this.#outcomes,
       commitProjectors: this.#commitProjectors,
+      declareHistory: (options) => this.#declareHistory(options),
       ...extra,
     })
+  }
+
+  // Declares the history-dependent projectors' entity types before a commit that runs them.
+  #declareHistory(options?: CallOptions): Promise<void> {
+    return declareHistory(this.#commitProjectors, this.repository, this.#historyDeclared, options)
   }
 
   /**
@@ -656,7 +671,12 @@ export class Store {
         config,
         commit.outcome!,
         commit.events,
-        () => repository.commit(commit, options),
+        async () => {
+          if (commit.events.length > 0) {
+            await this.#declareHistory(options)
+          }
+          await repository.commit(commit, options)
+        },
       )
       return {kind: 'done', outcome}
     } catch (error) {

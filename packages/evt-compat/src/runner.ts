@@ -13,6 +13,8 @@ import {
   type DigestInput,
   DuplicateViewKeyError,
   type EventOf,
+  type FeatureManifest,
+  HistoryDependentProjectionError,
   IdempotencyKeyReuseError,
   type JsonValue,
   type Metadata,
@@ -22,8 +24,10 @@ import {
   ProjectorOnlyCommitError,
   ProjectorOperationError,
   type ProjectedView,
+  RebuildInProgressError,
   type Repository,
   ReservedEntityIdError,
+  RetentionConflictError,
   type SerializedEvent,
   Store,
   type StoreOptions,
@@ -32,6 +36,7 @@ import {
   type Transaction,
   type TransactionCommit,
   type TransactionalRepository,
+  UnsupportedFeatureError,
   defaultDigest,
   deleteView,
   emptyMetadata,
@@ -77,6 +82,7 @@ export const SUPPORTED_SCENARIOS: readonly string[] = [
   'commit-wide-projector',
   'commit-too-large',
   'commit-grouping',
+  'feature-marker',
 ]
 
 /** The fixture run's name, which every run's identity digests use. */
@@ -99,6 +105,7 @@ const OUTCOME_KEYS = new Set([
   'operation',
   'mapped',
   'groups',
+  'delta',
 ])
 
 // The step keys this runner reads. A supported scenario that gains another fails loudly rather
@@ -134,6 +141,10 @@ const STEP_KEYS = new Set([
   'retryWrites',
   'interfere',
   'projectors',
+  'features',
+  'retention',
+  'historyDependent',
+  'retract',
 ])
 
 // The keys this runner reads of an executeTransaction step's writes and its interference.
@@ -143,21 +154,34 @@ const INTERFERE_KEYS = new Set(['suffix', 'event', 'times'])
 // The keys this runner reads of a transaction step's streams, their events and its fences.
 const STREAM_KEYS = new Set(['suffix', 'sequence', 'events', 'snapshot'])
 const EVENT_KEYS = new Set(['type', 'version', 'payload', 'pad'])
-const FENCE_KEYS = new Set(['suffix', 'head', 'callerStamped'])
+const FENCE_KEYS = new Set(['suffix', 'head', 'callerStamped', 'entityType'])
 
-// The scenario flags that need what TypeScript lacks so far.
-const LATER_FLAGS = ['exclusive']
+// The scenario keys this runner reads. An exclusive scenario holds store-wide state across its
+// steps, so a driver runs it alone, which the fixture run does with a store of its own.
+const SCENARIO_KEYS = new Set([
+  'name',
+  'description',
+  'snapshotInterval',
+  'steps',
+  'outcomes',
+  'projector',
+  'exclusive',
+])
 
 const encoder = new TextEncoder()
 const decoder = new TextDecoder()
 
-/** Throws when a scenario sets a flag this runner doesn't support. */
+/** Throws when a scenario sets a key this runner doesn't read. */
 export function checkScenario(scenario: JsonValue): void {
-  for (const flag of LATER_FLAGS) {
-    if (optionalBoolean(scenario, flag)) {
-      throw new Error(`the scenario sets ${flag}, which TypeScript doesn't support yet`)
-    }
+  if (!(scenario instanceof Map)) {
+    throw new Error('a scenario is not an object')
   }
+  checkKeys(scenario, SCENARIO_KEYS, `scenario ${str(field(scenario, 'name'))}`)
+}
+
+/** Whether the scenario holds store-wide state, so a driver runs it alone. */
+export function isExclusive(scenario: JsonValue): boolean {
+  return optionalBoolean(scenario, 'exclusive')
 }
 
 /** Throws when a step sets a key this runner doesn't read. */
@@ -217,6 +241,8 @@ export interface Outcome {
   mapped?: string
   /** A groupCommits step's commits, each its ID and its events. */
   groups?: string[]
+  /** How far a declare step moved the feature manifest's version. */
+  delta?: number
 }
 
 export function expectedOutcome(expect: JsonValue): Outcome {
@@ -251,6 +277,9 @@ export function expectedOutcome(expect: JsonValue): Outcome {
     ...(optionalList(expect, 'groups').length > 0 && {
       groups: optionalList(expect, 'groups').map(str),
     }),
+    ...(expect.has('delta') && num(field(expect, 'delta')) !== 0
+      ? {delta: num(field(expect, 'delta'))}
+      : {}),
   }
 }
 
@@ -351,6 +380,22 @@ export interface RunnerOptions {
    * appendRawBypassingHead step.
    */
   bypassHead?: ((event: SerializedEvent) => Promise<void>) | undefined
+  /** Reads and declares the store's feature manifest, as another writer would. Backs declare. */
+  marker?: MarkerDriver | undefined
+}
+
+/** A store's feature manifest as a declaring writer sees it. */
+export interface MarkerDriver {
+  manifest(): FeatureManifest | null | Promise<FeatureManifest | null>
+  /** Changes the manifest's declarable parts in one declaration that bumps its version by one. */
+  declare(change: (draft: ManifestDraft) => void): FeatureManifest | Promise<FeatureManifest>
+}
+
+/** A manifest's declarable parts, which a declaration changes in place. */
+export interface ManifestDraft {
+  features: Map<string, number>
+  historyDependent: string[]
+  retention: string[]
 }
 
 export class Runner {
@@ -359,6 +404,7 @@ export class Runner {
   readonly #outcomes: boolean
   readonly #options: StoreOptions
   readonly #bypassHead: RunnerOptions['bypassHead']
+  readonly #marker: RunnerOptions['marker']
   readonly #run: string
   readonly entityId: string
 
@@ -380,6 +426,7 @@ export class Runner {
     }
     this.#store = new Store(repository, this.#options)
     this.#bypassHead = options.bypassHead
+    this.#marker = options.marker
   }
 
   async step(step: JsonValue): Promise<Outcome> {
@@ -456,8 +503,10 @@ export class Runner {
           if (error instanceof Error && 'code' in error && error.code === 'compactionUncovered') {
             return outcome('uncovered')
           }
-          throw error
+          return classify(error)
         }
+      case 'declare':
+        return this.#declare(step)
       default:
         throw new Error(`a supported scenario has no ${op} step`)
     }
@@ -705,6 +754,53 @@ export class Runner {
 
   // Commits the step's streams and fences through the repository, as the Go and Rust drivers do,
   // and checks that a failed transaction left every stream it touches unchanged.
+  // Applies one declaration to the store's feature manifest, as another writer would, and reports
+  // how far it moved the version. The entity types name the scenario's stream with {id}.
+  async #declare(step: JsonValue): Promise<Outcome> {
+    const marker = this.#marker
+    if (marker === undefined) {
+      throw new Error('the backend has no feature marker driver')
+    }
+
+    const scoped = (name: string) =>
+      optionalList(step, name).map((entityType) =>
+        str(entityType).replaceAll('{id}', this.entityId),
+      )
+    const retention = scoped('retention')
+    const history = scoped('historyDependent')
+    const raw = step instanceof Map ? step.get('features') : undefined
+    const features =
+      raw instanceof Map ? Array.from(raw, ([name, format]) => [name, num(format)] as const) : []
+    const retract = optionalBoolean(step, 'retract')
+
+    const before = await marker.manifest()
+    const declared = await marker.declare((draft) => {
+      if (retract) {
+        for (const [name] of features) {
+          draft.features.delete(name)
+        }
+        draft.retention = draft.retention.filter((entityType) => !retention.includes(entityType))
+        draft.historyDependent = draft.historyDependent.filter(
+          (entityType) => !history.includes(entityType),
+        )
+
+        return
+      }
+
+      for (const [name, format] of features) {
+        draft.features.set(name, format)
+      }
+      draft.retention.push(
+        ...retention.filter((entityType) => !draft.retention.includes(entityType)),
+      )
+      draft.historyDependent.push(
+        ...history.filter((entityType) => !draft.historyDependent.includes(entityType)),
+      )
+    })
+
+    return {...outcome('ok'), delta: Number(declared.version - (before?.version ?? 0n))}
+  }
+
   async #transaction(step: JsonValue): Promise<Outcome> {
     const repository = this.#repository
     if (!isTransactional(repository)) {
@@ -883,6 +979,15 @@ function classify(error: unknown): Outcome {
   if (error instanceof ReservedEntityIdError) {
     return outcome('reserved')
   }
+  if (error instanceof UnsupportedFeatureError) {
+    return outcome('unsupported')
+  }
+  if (error instanceof RetentionConflictError) {
+    return outcome('retentionConflict')
+  }
+  if (error instanceof HistoryDependentProjectionError) {
+    return outcome('historyDependent')
+  }
   if (error instanceof ProjectorOperationError) {
     return {
       ...outcome('projector'),
@@ -900,6 +1005,9 @@ function classify(error: unknown): Outcome {
   }
   if (error instanceof StreamHeadDriftError) {
     return outcome('drift')
+  }
+  if (error instanceof RebuildInProgressError) {
+    return outcome('rebuildInProgress')
   }
   if (isConflict(error)) {
     return outcome('conflict')
@@ -963,7 +1071,8 @@ export function transactionCommit(base: string, step: JsonValue): TransactionCom
   })
   const fences = optionalList(step, 'fences').map((fence): ReadFence => ({
     entityId: streamId(base, optionalString(fence, 'suffix') ?? ''),
-    entityType: 'account',
+    // A fence names its stream's type when it isn't the account's, with {id} for the scenario's.
+    entityType: (optionalString(fence, 'entityType') ?? 'account').replaceAll('{id}', base),
     head: int(field(fence, 'head')),
     provenance: optionalBoolean(fence, 'callerStamped') ? 'caller' : 'engine',
   }))
