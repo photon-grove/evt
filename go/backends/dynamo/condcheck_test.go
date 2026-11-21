@@ -292,6 +292,50 @@ func Test_classifyCommitFailure_ATransactionConflictIsTransientNotAConflict(t *t
 	require.True(t, policy.IsTransient(err))
 }
 
+// The outcome put sits after the control checks, the transaction groups' operations, the view
+// operations and the stream items, and a TransactionConflict reason on it (and only there) marks
+// the error as a collision on the outcome row, which only another attempt of the command writes.
+func Test_classifyCommitFailure_ATransactionConflictOnTheOutcomePutSaysSo(t *testing.T) {
+	repo := &Repository{}
+	transactItems := make([]types.TransactWriteItem, 2)
+	layout := commitLayout{views: make([]evt.ProjectedView, 1), outcomeIndex: 3, hasOutcome: true, outcomeID: "c-1"}
+	outcome := controlItems + len(transactItems) + len(layout.views) + layout.outcomeIndex
+
+	conflictOn := func(items ...int) error {
+		reasons := make([]types.CancellationReason, outcome+1)
+		for i := range reasons {
+			reasons[i] = types.CancellationReason{Code: aws.String("None")}
+		}
+
+		for _, item := range items {
+			reasons[item] = types.CancellationReason{Code: aws.String("TransactionConflict")}
+		}
+
+		return &types.TransactionCanceledException{CancellationReasons: reasons}
+	}
+
+	for _, tc := range []struct {
+		items      []int
+		hasOutcome bool
+		want       bool
+	}{
+		{items: []int{outcome}, hasOutcome: true, want: true},
+		{items: []int{1, outcome}, hasOutcome: true, want: true},
+		{items: []int{1}, hasOutcome: true, want: false},
+		{items: []int{outcome - 1}, hasOutcome: true, want: false},
+		{items: []int{outcome}, hasOutcome: false, want: false},
+	} {
+		layout.hasOutcome = tc.hasOutcome
+		err := repo.classifyCommitFailure(context.Background(), nil, transactItems, layout, conflictOn(tc.items...))
+		require.ErrorIs(t, err, ErrTransactionConflict)
+		require.True(t, policy.IsTransient(err))
+
+		var collision interface{ CollidedOnOutcomeRow() bool }
+		require.ErrorAs(t, err, &collision)
+		require.Equal(t, tc.want, collision.CollidedOnOutcomeRow(), "items %v, outcome %v", tc.items, tc.hasOutcome)
+	}
+}
+
 func Test_theSnapshotRaceConditionIsAnOptimisticConflict(t *testing.T) {
 	require.ErrorIs(t, ErrSnapshotRaceCondition, evt.ErrOptimisticConflict)
 	require.NotErrorIs(t, ErrSnapshotRaceCondition, ErrTransactionConflict, "each sentinel keeps its own identity")

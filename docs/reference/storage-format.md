@@ -1291,7 +1291,10 @@ never past the recovery window). A conflict on any other item, and every other c
 row once, so contention between different commands pays nothing extra. A row found is replayed;
 absent, the attempt keeps its transient error, and the next attempt's pre-read (or a resend of the
 command ID) replays the winner. Go reports the collision through `CollidedOnOutcomeRow()` on the
-backend's error, Rust through `TransactionConflict::on_outcome_row`.
+backend's error, Rust through `TransactionConflict::on_outcome_row`. TypeScript reads the row once
+on every conflict for now. The poll runs only when DynamoDB reports the reason on the outcome put
+itself; a loser whose cancellation names only an item the two attempts share (a control check or
+a stream head) reads the row once.
 
 Stored rows are validated. A row read back must have a known `status`, a non-empty `digest`, a
 `rejection` (one complete JSON document whose `details` is an object or `null`, with trailing
