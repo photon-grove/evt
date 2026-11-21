@@ -11,6 +11,7 @@ import {
   ViewsNotConfiguredError,
 } from '../src/errors.ts'
 import {type SerializedEvent, eventId} from '../src/event.ts'
+import {JOURNAL_MARKER} from '../src/features.ts'
 import {emptyMetadata} from '../src/metadata.ts'
 import {
   type ProjectedView,
@@ -937,5 +938,86 @@ describe('PgRepository views table', () => {
     expect(() => new PgRepository(client, {viewsTable: true, viewWriter: writer})).toThrow(
       /views table or through a view writer, not both/,
     )
+  })
+})
+
+describe('PgRepository journal', () => {
+  test('reads the counters of several scopes in one statement, in the order given', async () => {
+    const {client, log, values} = tableStore({
+      respond: (text) =>
+        text.includes('sk = $1 AND pk IN (SELECT jsonb_array_elements_text($2::jsonb))')
+          ? {
+              rows: [
+                {
+                  pk: 'journal-counter#b',
+                  sk: 'COUNTER',
+                  entity_id: 'SYSTEM#JOURNAL',
+                  entity_type: 'journal-counter',
+                  payload: '{"scope":"b","position":7}',
+                  ttl: '0',
+                },
+              ],
+            }
+          : undefined,
+    })
+    const repo = new PgRepository(client, {viewsTable: true})
+    expect(await repo.readCounters(['a', 'b'])).toEqual([0n, 7n])
+    expect(log).toHaveLength(1)
+    expect(values[0]).toEqual(['COUNTER', '["journal-counter#a","journal-counter#b"]'])
+    expect(await repo.readCounters([])).toEqual([])
+    expect(log).toHaveLength(1)
+  })
+
+  test('reads the last position and rows of a scope, ordered by sort key', async () => {
+    const {client, log, values} = tableStore({
+      respond: (text) =>
+        text.startsWith('SELECT sk FROM') ? {rows: [{sk: '00000000000000000012'}]} : undefined,
+    })
+    const repo = new PgRepository(client, {viewsTable: true})
+    expect(await repo.readLastPosition('s')).toBe(12n)
+    expect(await repo.readRows('s', 3n, 5)).toEqual([])
+    expect(log).toEqual([
+      'SELECT sk FROM evt_events__evt_views WHERE pk = $1 ORDER BY sk DESC LIMIT 1',
+      'SELECT pk, sk, entity_id, entity_type, payload, ttl::text AS ttl FROM ' +
+        'evt_events__evt_views WHERE pk = $1 AND sk > $2 ORDER BY sk LIMIT $3::bigint',
+    ])
+    expect(values[1]).toEqual(['journal#s', '00000000000000000003', '5'])
+  })
+
+  test('reads a compaction row by its scope and sort key', async () => {
+    const {client, log, values} = tableStore()
+    const repo = new PgRepository(client, {viewsTable: true})
+    expect(await repo.readCompactionRow('s', 'LEASE')).toBeNull()
+    expect(log).toEqual([
+      'SELECT pk, sk, entity_id, entity_type, payload, ttl::text AS ttl FROM ' +
+        'evt_events__evt_views WHERE pk = $1 AND sk = $2',
+    ])
+    expect(values[0]).toEqual(['journal-compaction#s', 'LEASE'])
+  })
+
+  test('refuses every journal read without the views table, before any query', async () => {
+    const {client, log} = fake()
+    const repo = new PgRepository(client, {viewWriter: writer})
+    const errors = await Promise.all(
+      [
+        repo.readCounter('s'),
+        repo.readCounters(['s']),
+        repo.readLastPosition('s'),
+        repo.readRows('s', 0n, 1),
+        repo.readCompactionRow('s', 'LEASE'),
+      ].map(rejection),
+    )
+    for (const error of errors) {
+      expect(error).toBeInstanceOf(ViewsNotConfiguredError)
+    }
+    expect(log).toEqual([])
+  })
+
+  test('declares the journal only for a journal writer', async () => {
+    const {client, log} = tableStore()
+    const repo = new PgRepository(client, {viewsTable: true})
+    const error = await rejection(repo[JOURNAL_MARKER].declareJournal(['ledger']))
+    expect(error).toBeInstanceOf(UnsupportedFeatureError)
+    expect(log).toEqual([])
   })
 })

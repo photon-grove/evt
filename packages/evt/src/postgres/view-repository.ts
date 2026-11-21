@@ -32,8 +32,8 @@ import type {PgClient} from './client.js'
 import {MAX_VIEW_INDEX_KEY_BYTES, MAX_VIEW_PAGE_ROWS, type PgTables, viewsTable} from './schema.js'
 import {type Row, query, text, transaction} from './session.js'
 
-// The columns every read selects, each as text, in `rowFrom`'s names.
-const COLUMNS = 'pk, sk, entity_id, entity_type, payload, ttl::text AS ttl'
+/** The columns every views-table read selects, each as text, in {@link viewRowFrom}'s names. */
+export const VIEW_COLUMNS = 'pk, sk, entity_id, entity_type, payload, ttl::text AS ttl'
 
 // How many expired rows `purgeExpired` deletes per statement.
 const PURGE_BATCH = 1000
@@ -116,11 +116,11 @@ export class PgViewRepository implements ViewRepository {
 
     const rows = await query(
       this.#client,
-      `SELECT ${COLUMNS} FROM ${this.#table} WHERE pk = $1 AND sk = $2`,
+      `SELECT ${VIEW_COLUMNS} FROM ${this.#table} WHERE pk = $1 AND sk = $2`,
       [pk, resolved],
     )
 
-    return rows[0] === undefined ? null : rowFrom(rows[0])
+    return rows[0] === undefined ? null : viewRowFrom(rows[0])
   }
 
   async putView(row: ViewRow, options?: CallOptions): Promise<void> {
@@ -190,12 +190,12 @@ export class PgViewRepository implements ViewRepository {
     await this.#ensureEncoding(options)
     const rows = await query(
       this.#client,
-      `SELECT ${COLUMNS} FROM ${this.#table} ` +
+      `SELECT ${VIEW_COLUMNS} FROM ${this.#table} ` +
         'WHERE sk = $1 AND pk IN (SELECT jsonb_array_elements_text($2::jsonb))',
       [keys.sk, JSON.stringify(keys.pks)],
     )
 
-    return rows.map(rowFrom)
+    return rows.map(viewRowFrom)
   }
 
   async listViewsByPk(pk: string, options?: CallOptions): Promise<ViewRow[]> {
@@ -211,11 +211,15 @@ export class PgViewRepository implements ViewRepository {
     const table = this.#table
 
     return after === null
-      ? this.#page(`SELECT ${COLUMNS} FROM ${table} WHERE pk = $1 ORDER BY sk LIMIT $2`, [pk], {
-          options,
-        })
+      ? this.#page(
+          `SELECT ${VIEW_COLUMNS} FROM ${table} WHERE pk = $1 ORDER BY sk LIMIT $2`,
+          [pk],
+          {
+            options,
+          },
+        )
       : this.#page(
-          `SELECT ${COLUMNS} FROM ${table} WHERE pk = $1 AND sk > $2 ORDER BY sk LIMIT $3`,
+          `SELECT ${VIEW_COLUMNS} FROM ${table} WHERE pk = $1 AND sk > $2 ORDER BY sk LIMIT $3`,
           [pk, after.get('sk')!],
           {options},
         )
@@ -236,12 +240,12 @@ export class PgViewRepository implements ViewRepository {
 
     return after === null
       ? this.#page(
-          `SELECT ${COLUMNS} FROM ${table} WHERE entity_type = $1 ORDER BY pk, sk LIMIT $2`,
+          `SELECT ${VIEW_COLUMNS} FROM ${table} WHERE entity_type = $1 ORDER BY pk, sk LIMIT $2`,
           [entityType],
           {options, entityType: true},
         )
       : this.#page(
-          `SELECT ${COLUMNS} FROM ${table} WHERE entity_type = $1 AND (pk, sk) > ($2, $3) ` +
+          `SELECT ${VIEW_COLUMNS} FROM ${table} WHERE entity_type = $1 AND (pk, sk) > ($2, $3) ` +
             'ORDER BY pk, sk LIMIT $4',
           [entityType, after.get('pk')!, after.get('sk')!],
           {options, entityType: true},
@@ -257,7 +261,7 @@ export class PgViewRepository implements ViewRepository {
   ): Promise<ViewPage> {
     const size = pageLimit(options.limit) ?? MAX_VIEW_PAGE_ROWS
     await this.#ensureEncoding(options)
-    const views = (await query(this.#client, sql, [...values, size.toString()])).map(rowFrom)
+    const views = (await query(this.#client, sql, [...values, size.toString()])).map(viewRowFrom)
 
     const last = views.at(-1)
     if (last === undefined || views.length < size) {
@@ -327,8 +331,8 @@ function upsertSql(table: string): string {
   )
 }
 
-// Decodes one row of COLUMNS. A ttl past the safe integers is refused rather than rounded.
-function rowFrom(row: Row): ViewRow {
+/** Decodes one row of {@link VIEW_COLUMNS}. A ttl past the safe integers is refused, not rounded. */
+export function viewRowFrom(row: Row): ViewRow {
   const ttl = Number(text(row, 'ttl'))
   if (!Number.isSafeInteger(ttl)) {
     throw new EvtError(

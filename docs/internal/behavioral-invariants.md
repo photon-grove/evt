@@ -820,11 +820,19 @@ transaction as the events. The byte-level rules are in the
   fails the condition (`appliesExpectedPayload()` / `applies_expected_payload()` is true). Through a
   view writer it is refused with `invalidViewOperation` / `InvalidViewOperation` before any write.
 - TypeScript doesn't write rebuild views on PostgreSQL yet; Rust does on the views table.
+- The journal (ADR 0008, X4) lives in the views table, with the DynamoDB items' keys, owners and
+  payload bytes, so Rust and TypeScript read and continue each other's journal. Its reads are each
+  one statement outside a transaction (the counters of every scope in one), so a gap is never a row
+  still in flight. Without the views table every journal read fails with `ViewsNotConfigured`, and
+  a journaled commit is refused (`expectedPayloadUnsupported` / the counter's compare-and-set is
+  not applied) before the marker is touched. The journal's declarations read the manifest first
+  without a lock and take the exclusive lock only when they write. TypeScript sends no wake-ups
+  yet, and refuses to declare `journal-compaction` until compaction is ported to PostgreSQL.
 
 ## Journal (X1, Rust-first)
 
 Rust (`photon-evt` with the `journal` cargo feature), and TypeScript (`@photon-grove/evt/journal`)
-on its in-memory and DynamoDB repositories, which holds every rule below except the rebuild's,
+on its in-memory, DynamoDB and PostgreSQL (views table) repositories, which holds every rule below except the rebuild's,
 whose lifecycle it doesn't have yet: its projector's seal is a module-private set of the engine's
 own projectors, and a journal writer is a handle the journal added to a module-private set. Until
 it ports compaction, a TypeScript journal writer refuses a store that declares

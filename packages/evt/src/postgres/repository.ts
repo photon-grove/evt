@@ -29,17 +29,30 @@ import type {EventLog, StreamFilter} from '../enumerate.js'
 import type {SerializedEvent, SerializedSnapshot} from '../event.js'
 import {
   type FeatureManifest,
+  JOURNAL_COMPACTION_FEATURE,
+  JOURNAL_COMPACTION_VERSION,
+  JOURNAL_MARKER,
+  type JournalDeclared,
+  type JournalMarker,
   POSTGRES_VIEWS_FEATURE,
   POSTGRES_VIEWS_VERSION,
+  checkJournalWriter,
   checkSupported,
   checkWritable,
+  declaredAnything,
   declaresStreamHeads,
   decodeManifest,
+  isJournalWriter,
+  journalDeclaration,
   missingHistoryDependent,
   withHistoryDependent,
+  withJournal,
   withStreamHeads,
+  withoutJournal,
 } from '../features.js'
 import {int64Argument} from '../fields.js'
+import type {JournalStore} from '../journal/read.js'
+import type {JournalRow} from '../journal/row.js'
 import {decodeMetadata, emptyMetadata, encodeMetadata} from '../metadata.js'
 import {type Outcome, checkCommandId} from '../outcome.js'
 import {type ProjectedView, REASON_CONDITION_FAILED} from '../projection.js'
@@ -60,7 +73,9 @@ import {
   transactionSizes,
 } from '../repository.js'
 import {compareUtf8, utf8Length} from '../utf8.js'
+import type {ViewRow} from '../views.js'
 import type {PgClient, PgResult} from './client.js'
+import {readCompactionRow, readCounters, readLastPosition, readRows} from './journal.js'
 import {manifestWrite} from './marker.js'
 import {insertOutcomeSql, outcomeFromRow, outcomeRow, selectOutcomeSql} from './outcome.js'
 import {
@@ -156,7 +171,7 @@ const UNIQUE_VIOLATION = '23505'
  * it validated. Every commit and snapshot write reads the manifest again under a shared lock that
  * no declaration can take while the write is open, and validates it again when it changed.
  */
-export class PgRepository implements OutcomeRepository, StoreInitializer, EventLog {
+export class PgRepository implements OutcomeRepository, StoreInitializer, EventLog, JournalStore {
   readonly #client: PgClient
   readonly #tables: PgTables
   readonly #viewWriter: ViewWriter | undefined
@@ -248,7 +263,7 @@ export class PgRepository implements OutcomeRepository, StoreInitializer, EventL
       return await this.#transaction(options, false, async (run) => {
         await run(ENGINE_LOCK_EXCLUSIVE, [featuresLockKey(this.#tables)])
         const manifest = await this.#readManifest(run)
-        checkSupported(manifest)
+        checkSupported(manifest, isJournalWriter(this))
         if (declaresStreamHeads(manifest)) {
           return false
         }
@@ -282,7 +297,7 @@ export class PgRepository implements OutcomeRepository, StoreInitializer, EventL
       await this.#transaction(options, false, async (run) => {
         await run(ENGINE_LOCK_EXCLUSIVE, [featuresLockKey(this.#tables)])
         const manifest = await this.#readManifest(run)
-        checkSupported(manifest)
+        checkSupported(manifest, isJournalWriter(this))
         const missing = missingHistoryDependent(manifest, types)
         if (missing.length > 0) {
           await this.#writeManifest(run, manifest, withHistoryDependent(manifest, missing))
@@ -705,7 +720,7 @@ export class PgRepository implements OutcomeRepository, StoreInitializer, EventL
       await run(ENGINE_LOCK_SHARED, [featuresLockKey(this.#tables)])
       const manifest = await this.#readManifest(run)
       this.#refuseForeignViews(manifest)
-      checkWritable(manifest)
+      checkWritable(manifest, isJournalWriter(this))
 
       const rows = await run(
         'SELECT entity_type, event_sequence::text AS event_sequence ' +
@@ -733,6 +748,153 @@ export class PgRepository implements OutcomeRepository, StoreInitializer, EventL
     })
   }
 
+  /**
+   * A scope's journal counter, from the views table: 0 when it has none. A repository without
+   * `viewsTable: true` holds no journal, and refuses with a {@link ViewsNotConfiguredError}.
+   */
+  async readCounter(scope: string, options?: CallOptions): Promise<bigint> {
+    const [counter] = await this.readCounters([scope], options)
+
+    return counter!
+  }
+
+  /** Several scopes' journal counters, in the order given, in one statement. */
+  async readCounters(scopes: readonly string[], options?: CallOptions): Promise<bigint[]> {
+    options?.signal?.throwIfAborted()
+
+    return readCounters(this.#client, this.#journalTable(), scopes, options)
+  }
+
+  /** The highest position with a journal row in the scope: 0 when it has none. */
+  async readLastPosition(scope: string, options?: CallOptions): Promise<bigint> {
+    options?.signal?.throwIfAborted()
+
+    return readLastPosition(this.#client, this.#journalTable(), scope, options)
+  }
+
+  /** Up to `limit` journal rows of the scope above `after`, ascending, in one statement. */
+  async readRows(
+    scope: string,
+    after: bigint,
+    limit: number,
+    options?: CallOptions,
+  ): Promise<JournalRow[]> {
+    options?.signal?.throwIfAborted()
+
+    return readRows(this.#client, this.#journalTable(), scope, after, limit, options)
+  }
+
+  /** A row of the scope's journal compaction partition at sort key `sk`, or null. */
+  async readCompactionRow(
+    scope: string,
+    sk: string,
+    options?: CallOptions,
+  ): Promise<ViewRow | null> {
+    options?.signal?.throwIfAborted()
+
+    return readCompactionRow(this.#client, this.#journalTable(), scope, sk, options)
+  }
+
+  /** The journal's declarations on this store's manifest. Internal. */
+  readonly [JOURNAL_MARKER]: JournalMarker & CompactionMarker = {
+    declareJournal: async (types, options) => {
+      options?.signal?.throwIfAborted()
+      checkJournalWriter(this)
+      this.#journalTable()
+      // Validated as a commit validates it: a fresh store is initialized, and a populated one
+      // that doesn't declare stream-heads is refused, before anything is declared.
+      await this.#ensureStreamHeads(options)
+      // The feature, then the history, a declaration each, as Rust declares them.
+      const feature = await this.#declareJournal(types, true, options)
+      const history = await this.#declareJournal(types, false, options)
+
+      return {journal: feature.journal, history: history.history}
+    },
+    retractJournal: async (declared, options) => {
+      checkJournalWriter(this)
+      if (!declaredAnything(declared)) {
+        return
+      }
+
+      try {
+        await this.#transaction(options, false, async (run) => {
+          await run(ENGINE_LOCK_EXCLUSIVE, [featuresLockKey(this.#tables)])
+          const manifest = await this.#readManifest(run)
+          checkSupported(manifest, isJournalWriter(this))
+          if (manifest !== null) {
+            await this.#writeManifest(run, manifest, withoutJournal(manifest, declared))
+          }
+        })
+      } finally {
+        // A declaration moved the version: the next write reads it again.
+        this.#validated = null
+      }
+    },
+    // Compaction is the journal's own, so any handle checks and declares it.
+    checkCompactionMarker: async (options) => {
+      options?.signal?.throwIfAborted()
+      const manifest = await this.#readManifest((statement, values) =>
+        this.#read(statement, values),
+      )
+      checkSupported(manifest, true)
+    },
+    // Until journal compaction is ported to PostgreSQL, nothing declares it here: a writer that
+    // doesn't model it would read compacted rows as a gap, so it refuses a store that declares it.
+    declareCompaction: async (options) => {
+      options?.signal?.throwIfAborted()
+      throw new UnsupportedFeatureError([
+        {name: JOURNAL_COMPACTION_FEATURE, version: JOURNAL_COMPACTION_VERSION},
+      ])
+    },
+  }
+
+  // Declares the journal feature (`feature`) or the entity types history-dependent, and resolves
+  // to what it wrote. The manifest is read first without a lock, so a store that declares it all
+  // takes no exclusive lock, which would wait for every open commit.
+  async #declareJournal(
+    types: readonly string[],
+    feature: boolean,
+    options: CallOptions | undefined,
+  ): Promise<JournalDeclared> {
+    const part = (manifest: FeatureManifest | null): JournalDeclared => {
+      checkSupported(manifest, isJournalWriter(this))
+      const wanted = journalDeclaration(manifest, types)
+
+      return feature
+        ? {journal: wanted.journal, history: []}
+        : {journal: false, history: wanted.history}
+    }
+    const observed = await this.#readManifest((statement, values) => this.#read(statement, values))
+    if (!declaredAnything(part(observed))) {
+      return {journal: false, history: []}
+    }
+
+    try {
+      return await this.#transaction(options, false, async (run) => {
+        await run(ENGINE_LOCK_EXCLUSIVE, [featuresLockKey(this.#tables)])
+        const manifest = await this.#readManifest(run)
+        const declared = part(manifest)
+        if (declaredAnything(declared)) {
+          await this.#writeManifest(run, manifest, withJournal(manifest, declared))
+        }
+
+        return declared
+      })
+    } finally {
+      // A declaration moved the version: the next write reads it again.
+      this.#validated = null
+    }
+  }
+
+  // The views table the journal lives in: the journal is written only through it.
+  #journalTable(): string {
+    if (!this.#viewsTable) {
+      throw new ViewsNotConfiguredError(POSTGRES_BACKEND)
+    }
+
+    return viewsTable(this.#tables)
+  }
+
   // Makes sure the store is ready for this writer's first write: it declares stream-heads. A
   // writer initializes a store whose manifest lacks it, which refuses one that holds data. It runs
   // before the write's transaction, which holds the shared lock a declaration would wait for.
@@ -741,11 +903,9 @@ export class PgRepository implements OutcomeRepository, StoreInitializer, EventL
       return
     }
 
-    const manifest = await this.#readManifest((statement, values) =>
-      this.#read(statement, values),
-    )
+    const manifest = await this.#readManifest((statement, values) => this.#read(statement, values))
     this.#refuseForeignViews(manifest)
-    checkSupported(manifest)
+    checkSupported(manifest, isJournalWriter(this))
     if (!declaresStreamHeads(manifest)) {
       await this.initialize(options)
     }
@@ -778,7 +938,7 @@ export class PgRepository implements OutcomeRepository, StoreInitializer, EventL
         const manifest = await this.#readManifest(run)
         // A version of postgres-views other than this package's is unsupported, like any feature
         // this package doesn't model, and nothing is declared on such a store.
-        checkSupported(manifest)
+        checkSupported(manifest, isJournalWriter(this))
         if (!manifest?.features.has(POSTGRES_VIEWS_FEATURE)) {
           await this.#writeManifest(run, manifest, withPostgresViews(manifest))
         }
@@ -820,7 +980,7 @@ export class PgRepository implements OutcomeRepository, StoreInitializer, EventL
     }
 
     this.#validated = null
-    checkWritable(manifest)
+    checkWritable(manifest, isJournalWriter(this))
     this.#validated = manifest!.version
 
     return manifest!
@@ -1116,6 +1276,13 @@ function withPostgresViews(manifest: FeatureManifest | null): FeatureManifest {
     historyDependent: manifest?.historyDependent ?? [],
     retention: manifest?.retention ?? [],
   }
+}
+
+// The journal compaction hooks of the journal's marker capability. They come with journal
+// compaction's port in the journal module, which will declare them on JournalMarker itself.
+interface CompactionMarker {
+  checkCompactionMarker(options?: CallOptions): Promise<void>
+  declareCompaction(options?: CallOptions): Promise<void>
 }
 
 // A stored head of 0 is an absent head.

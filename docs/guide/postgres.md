@@ -262,13 +262,27 @@ repository's owner rules, so you write no SQL, and counts each one in the commit
 DynamoDB item, so the budget refuses the same commits on both backends. The repository declares the
 `postgres-views` marker feature before its first commit, after which a Go writer, or a Rust or
 TypeScript repository without the views table, refuses the store instead of putting views somewhere
-else. The TypeScript repository applies the journal's expected-payload condition there too, though
-TypeScript has no journal yet. In Rust, the [sync journal](../reference/storage-format.md#journal)
-works on PostgreSQL through the same table: wrap the repository in a `JournalRepository` and it journals, pages and compacts as it does on
-DynamoDB. Each journaled commit runs `pg_notify` per scope it wrote, and a `JournalListener`
-(one dedicated connection) turns those into wake-ups: page the scope it names, and every scope on
+else. The [sync journal](../reference/storage-format.md#journal) works on PostgreSQL through the same
+table: wrap the repository in a `JournalRepository` and it journals, pages and (in Rust) compacts as
+it does on DynamoDB, with the same rows, so a Rust and a TypeScript writer share one journal:
+
+```ts
+import {Journal, JournalRepository, page} from '@photon-grove/evt/journal'
+
+const repository = new PgRepository(pool, {viewsTable: true})
+const journal = new Journal(['account'], (event) => [`account:${event.entityId}`])
+const store = new Store(new JournalRepository(repository, journal))
+const next = await page(repository, 'account:acct-1', 0n, 100)
+```
+
+A repository without the views table holds no journal: its journal reads fail with
+`ViewsNotConfigured`, and a journaled commit through it is refused before anything is declared.
+
+In Rust, each journaled commit runs `pg_notify` per scope it wrote, and a `JournalListener` (one
+dedicated connection) turns those into wake-ups: page the scope it names, and every scope on
 `Connected` and `Poll`, since a notification sent while the listener was disconnected is lost.
-`with_wakeups(false)` turns the notifications off for a deployment that only polls.
+`with_wakeups(false)` turns the notifications off for a deployment that only polls. TypeScript
+commits don't notify yet, so a listener sees them only on its `Connected` and `Poll` backstop.
 
 ## Local development
 

@@ -19,6 +19,7 @@ import {
   UnsupportedFeatureError,
   ViewKeyTooLongError,
   type ViewOperation,
+  ViewsNotConfiguredError,
   type ViewRow,
   emptyMetadata,
   encodeMetadata,
@@ -26,6 +27,8 @@ import {
   eventId,
   putView,
 } from '@photon-grove/evt'
+import {Journal, JournalRepository} from '@photon-grove/evt/journal'
+import {JOURNAL_MARKER} from '@photon-grove/evt/testing'
 import {type PgClient, PgRepository, type ViewWriter} from '@photon-grove/evt/postgres'
 
 import {
@@ -36,6 +39,7 @@ import {
 } from './conformance.js'
 import {postgresControls} from './controls.js'
 import {Checks} from './harness.js'
+import {journalConformance, journalStoreCases} from './journal-conformance.js'
 import {postgresViewDdl, postgresViewWriter} from './pgviews.js'
 import {viewRepositoryConformance} from './view-conformance.js'
 
@@ -75,6 +79,7 @@ try {
 
   await postgresCases()
   await viewsTableCases()
+  await journalCases()
 } finally {
   for (const events of logs) {
     await pool.query(`DROP TABLE IF EXISTS ${tables(events).join(', ')}`)
@@ -556,6 +561,88 @@ async function viewsTableCases(): Promise<void> {
       const manifest = await controls(repo).manifest()
       ensure(manifest?.features.get(POSTGRES_VIEWS_FEATURE) === 1, 'declared again')
       ensure((await repo.events('a')).length === 2, 'the retry committed')
+    },
+  )
+}
+
+// The journal (ADR 0005) on the views table (ADR 0008), as Rust's postgres_journal_conforms runs
+// it: the shared journal cases over a log of their own, the fresh-store cases, and a repository
+// without the views table, which holds no journal.
+async function journalCases(): Promise<void> {
+  const repo = await tableLog()
+  const reader = repo.viewRepository()
+  await journalConformance(checks, {
+    repo,
+    manifest: async () => controls(repo).manifest(),
+    views: {
+      getViewAt: (pk, sk) => reader.getViewAt(pk, sk),
+      putView: (row) => reader.putView(row),
+      deleteView: (pk, sk) => reader.deleteView(pk, sk),
+      listViewsByPk: (pk) => reader.listViewsByPk(pk),
+    },
+    handle: () => new PgRepository(pool, {...repoTables(repo), viewsTable: true}),
+  })
+  await journalStoreCases(checks, async () => {
+    const fresh = await tableLog()
+
+    return {repo: fresh, manifest: async () => controls(fresh).manifest()}
+  })
+
+  await checks.case(
+    'postgres journal: compaction rows are read from the views table, and compaction is refused',
+    async () => {
+      const log = await tableLog()
+      const views = log.viewRepository()
+      ensure((await log.readCompactionRow('s', 'LEASE')) === null, 'no row yet')
+      const lease = {
+        pk: 'journal-compaction#s',
+        sk: 'LEASE',
+        entityId: 'SYSTEM#JOURNAL',
+        entityType: 'journal-compaction',
+        payload: new TextEncoder().encode('{"owner":"o"}'),
+      }
+      await views.putView(lease)
+      const read = await log.readCompactionRow('s', 'LEASE')
+      ensure(decode(read?.payload) === '{"owner":"o"}', `the row: ${decode(read?.payload)}`)
+      ensure((await log.readCompactionRow('t', 'LEASE')) === null, 'another scope has none')
+
+      // Any handle checks the marker for compaction. Nothing declares compaction until it is
+      // ported to PostgreSQL, and a store that declares it is refused.
+      const marker = log[JOURNAL_MARKER]
+      await marker.checkCompactionMarker()
+      await refuses(marker.declareCompaction(), UnsupportedFeatureError, 'declaring compaction')
+      await controls(log).declare((draft) => draft.features.set('journal-compaction', 1))
+      await refuses(marker.checkCompactionMarker(), UnsupportedFeatureError, 'a compacted store')
+    },
+  )
+
+  await checks.case(
+    'postgres journal: a repository without the views table holds no journal',
+    async () => {
+      const plain = await freshLog()
+      for (const [what, read] of [
+        ['readCounter', () => plain.readCounter('s')],
+        ['readCounters', () => plain.readCounters(['s'])],
+        ['readLastPosition', () => plain.readLastPosition('s')],
+        ['readRows', () => plain.readRows('s', 0n, 10)],
+        ['readCompactionRow', () => plain.readCompactionRow('s', 'LEASE')],
+      ] as const) {
+        await refuses(read(), ViewsNotConfiguredError, what)
+      }
+
+      // A journaled commit through it is refused before anything is declared or written.
+      const journaled = new JournalRepository(
+        plain,
+        new Journal(['ledger'], (event) => [`ledger:${event.entityId}`]),
+      )
+      await refusesWith(
+        journaled.commit({entityId: 'a', events: [ledgerEvent('a', 1)]}),
+        'expectedPayloadUnsupported',
+        'expected-payload',
+        'a journaled commit',
+      )
+      ensure((await controls(plain).manifest()) === null, 'nothing was declared')
+      ensure((await plain.events('a')).length === 0, 'nothing was written')
     },
   )
 }
