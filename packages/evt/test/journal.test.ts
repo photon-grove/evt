@@ -31,7 +31,8 @@ import {
   rowSortKey,
   setAllocations,
 } from '../src/journal/scope.ts'
-import {MemRepository} from '../src/memory/repository.ts'
+import {JOURNAL_MARKER} from '../src/features.ts'
+import {MemRepository, controlFixtures} from '../src/memory/repository.ts'
 import {emptyMetadata} from '../src/metadata.ts'
 import {
   type CommitProjector,
@@ -493,5 +494,47 @@ describe('a store over the journal', () => {
   test("refuses the journal's projector as an application projector", async () => {
     const store = new Store(new MemRepository(), {commitProjectors: [journalProjector(journal)]})
     await expect(store.execute(account, 'a', 'one')).rejects.toThrow(/engine metadata/)
+  })
+})
+
+// The first event of an account stream.
+function opened(entityId: string): SerializedEvent {
+  return {...ledger(`${entityId}:1`), entityId, entityType: 'account', sequence: 1n}
+}
+
+describe('journal acceptance', () => {
+  const journal = new Journal(['account'], (stored) => [`account:${stored.entityId}`])
+
+  test('only the handle a journal wraps declares or retracts it', async () => {
+    const memory = new MemRepository()
+    await expect(memory[JOURNAL_MARKER].declareJournal(['account'])).rejects.toThrow(
+      /unsupported features \(journal@1\)/,
+    )
+    await expect(
+      memory[JOURNAL_MARKER].retractJournal({journal: true, history: ['account']}),
+    ).rejects.toThrow(/journal@1/)
+  })
+
+  test('a journal writer still refuses a store that declares journal compaction', async () => {
+    const memory = new MemRepository()
+    const repository = new JournalRepository(memory, journal)
+    await repository.commit({entityId: 'a', events: [opened('a')]})
+    controlFixtures(memory).declare((draft) => draft.features.set('journal-compaction', 1))
+    await expect(repository.commit({entityId: 'b', events: [opened('b')]})).rejects.toThrow(
+      /journal-compaction@1/,
+    )
+  })
+
+  test('an allocation that escapes a lone surrogate is refused', () => {
+    for (const value of [
+      String.raw`[{"scope":"a\ud800","position":1}]`,
+      String.raw`[{"scope":"a\udc00","position":1}]`,
+    ]) {
+      const metadata = {...emptyMetadata(), extensions: new Map([[ALLOCATION_KEY, value]])}
+      expect(code(() => allocations(metadata))).toBe('invalidJournal')
+    }
+    const pair = String.raw`[{"scope":"a😀","position":1}]`
+    const metadata = {...emptyMetadata(), extensions: new Map([[ALLOCATION_KEY, pair]])}
+    expect(allocations(metadata)).toEqual([{scope: 'a\u{1F600}', position: 1n}])
   })
 })

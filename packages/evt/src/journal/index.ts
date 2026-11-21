@@ -3,12 +3,10 @@
 // "Journal" section, and compat/fixtures/journal.json, which Rust generates, pins them.
 
 export {
-  type Allocated,
   Journal,
   type JournalOptions,
   JournalRowTooLargeError,
   type ScopeResolver,
-  allocate,
 } from './config.js'
 export {PROJECTOR_NAME, PositionTaken, journalProjector} from './projector.js'
 export {
@@ -20,11 +18,7 @@ export {
   JOURNAL_COMPACTION_FEATURE,
   JOURNAL_COMPACTION_VERSION,
   JOURNAL_FEATURE,
-  JOURNAL_MARKER,
   JOURNAL_VERSION,
-  JOURNAL_WRITER_TARGET,
-  type JournalDeclared,
-  type JournalMarker,
 } from '../features.js'
 export {
   type Gap,
@@ -41,7 +35,6 @@ export {
   MAX_ROW_BYTES,
   counterPayload,
   counterView,
-  decodeRowPayload,
   encodeRow,
   journalRowFromView,
   readCounter,

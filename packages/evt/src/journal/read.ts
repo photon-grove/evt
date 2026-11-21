@@ -3,7 +3,7 @@
 import {EvtError} from '../errors.js'
 import type {CallOptions} from '../repository.js'
 import type {JournalRow} from './row.js'
-import {checkScope} from './scope.js'
+import {MAX_POSITION, checkScope} from './scope.js'
 
 /** The most rows {@link page} returns at once. */
 export const MAX_PAGE_ROWS = 1000
@@ -101,8 +101,8 @@ export async function page(
       `a journal page holds 1 to ${MAX_PAGE_ROWS} rows; got ${limit}`,
     )
   }
-  if (after < 0n) {
-    throw new EvtError('invalidArgument', `a journal page reads after a position of 0 or more`)
+  if (after < 0n || after > MAX_POSITION) {
+    throw new EvtError('invalidArgument', `a journal page reads after a position 0 to 2^64 - 1`)
   }
 
   const counter = await store.readCounter(scope, options)

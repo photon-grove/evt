@@ -30,12 +30,8 @@ import {
 import {
   ALLOCATION_KEY,
   JOURNAL_FEATURE,
-  JOURNAL_MARKER,
   JOURNAL_VERSION,
-  JOURNAL_WRITER_TARGET,
   type JournalBackend,
-  type JournalDeclared,
-  type JournalMarker,
   type JournalPage,
   JournalRepository,
   type JournalRow,
@@ -52,6 +48,13 @@ import {
   rowSize,
   rowSortKey,
 } from '@photon-grove/evt/journal'
+
+import {
+  JOURNAL_MARKER,
+  JOURNAL_WRITER_TARGET,
+  type JournalDeclared,
+  type JournalMarker,
+} from '@photon-grove/evt/testing'
 
 import {type Checks, canonical} from './harness.js'
 

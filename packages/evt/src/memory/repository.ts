@@ -25,6 +25,7 @@ import {
   checkWritable,
   declaresStreamHeads,
   JOURNAL_MARKER,
+  checkJournalWriter,
   type JournalMarker,
   declaredAnything,
   isJournalWriter,
@@ -468,19 +469,29 @@ export class MemRepository implements OutcomeRepository, StoreInitializer {
   readonly [JOURNAL_MARKER]: JournalMarker = {
     declareJournal: async (types, options) => {
       options?.signal?.throwIfAborted()
+      checkJournalWriter(this)
       // A store that holds data without stream-heads is refused by the commit, which takes the
       // declaration back.
       const {manifest} = this.#controls
-      checkSupported(manifest, true)
+      checkSupported(manifest, isJournalWriter(this))
       const declared = journalDeclaration(manifest, types)
-      if (declaredAnything(declared)) {
-        this.#controls.manifest = withJournal(manifest, declared)
+      // The feature, then the history, a declaration each.
+      if (declared.journal) {
+        this.#controls.manifest = withJournal(this.#controls.manifest, {journal: true, history: []})
+      }
+      if (declared.history.length > 0) {
+        this.#controls.manifest = withJournal(this.#controls.manifest, {
+          journal: false,
+          history: declared.history,
+        })
       }
 
       return declared
     },
     retractJournal: async (declared, options) => {
+      checkJournalWriter(this)
       options?.signal?.throwIfAborted()
+      checkSupported(this.#controls.manifest, isJournalWriter(this))
       if (declaredAnything(declared)) {
         this.#controls.manifest = withoutJournal(this.#controls.manifest, declared)
       }

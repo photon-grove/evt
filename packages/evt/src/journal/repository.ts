@@ -47,6 +47,7 @@ import {
   COUNTER_ENTITY_TYPE,
   COUNTER_OWNER,
   COUNTER_SORT_KEY,
+  checkScope,
   counterPartitionKey,
   setAllocations,
 } from './scope.js'
@@ -141,15 +142,15 @@ export class JournalRepository<R extends JournalBackend = JournalBackend>
   }
 
   readCounter(scope: string, options?: CallOptions): Promise<bigint> {
-    return this.inner.readCounter(scope, options)
+    return this.inner.readCounter(checkScope(scope), options)
   }
 
   readCounters(scopes: readonly string[], options?: CallOptions): Promise<bigint[]> {
-    return this.inner.readCounters(scopes, options)
+    return this.inner.readCounters(scopes.map(checkScope), options)
   }
 
   readLastPosition(scope: string, options?: CallOptions): Promise<bigint> {
-    return this.inner.readLastPosition(scope, options)
+    return this.inner.readLastPosition(checkScope(scope), options)
   }
 
   readRows(
@@ -158,7 +159,7 @@ export class JournalRepository<R extends JournalBackend = JournalBackend>
     limit: number,
     options?: CallOptions,
   ): Promise<JournalRow[]> {
-    return this.inner.readRows(scope, after, limit, options)
+    return this.inner.readRows(checkScope(scope), after, limit, options)
   }
 
   async commit(commit: Commit, options?: CallOptions): Promise<void> {

@@ -35,6 +35,7 @@ import {
   checkSupported,
   declaresStreamHeads,
   JOURNAL_MARKER,
+  checkJournalWriter,
   type JournalDeclared,
   type JournalMarker,
   declaredAnything,
@@ -579,36 +580,22 @@ export class DynamoRepository implements OutcomeRepository, StoreInitializer {
   readonly [JOURNAL_MARKER]: JournalMarker = {
     declareJournal: (types, options) => {
       options?.signal?.throwIfAborted()
+      checkJournalWriter(this)
       const request = requestOptions(options)
 
       return this.#exclusive(async () => {
         // Validated as a commit validates it: an uninitialized store is refused before anything is
         // declared, or, initializing lazily, declared.
         await this.#validate(true, request)
-        let declared: JournalDeclared = {journal: false, history: []}
-        const result = await this.#declare((draft) => {
-          // Another writer may have declared a feature this package doesn't model since.
-          const stored = {...draft, version: 0n}
-          checkSupported(stored, true)
-          declared = journalDeclaration(stored, types)
-          if (!declaredAnything(declared)) {
-            return false
-          }
-          const next = withJournal(stored, declared)
-          draft.features = new Map(next.features)
-          draft.historyDependent = [...next.historyDependent]
+        // The feature, then the history, a declaration each.
+        const feature = await this.#declareJournal(types, true, request)
+        const history = await this.#declareJournal(types, false, request)
 
-          return true
-        }, request)
-        if (result.wrote) {
-          // The declaration moved the version: the next write reads it again.
-          this.#validated = null
-        }
-
-        return result.wrote ? declared : {journal: false, history: []}
+        return {journal: feature.journal, history: history.history}
       })
     },
     retractJournal: async (declared, options) => {
+      checkJournalWriter(this)
       if (!declaredAnything(declared)) {
         return
       }
@@ -616,6 +603,7 @@ export class DynamoRepository implements OutcomeRepository, StoreInitializer {
       await this.#exclusive(async () => {
         try {
           await this.#declare((draft) => {
+            checkSupported({...draft, version: 0n}, isJournalWriter(this))
             const next = withoutJournal({...draft, version: 0n}, declared)
             draft.features = new Map(next.features)
             draft.historyDependent = [...next.historyDependent]
@@ -627,6 +615,40 @@ export class DynamoRepository implements OutcomeRepository, StoreInitializer {
         }
       })
     },
+  }
+
+  // Declares the journal feature (`feature`) or the entity types history-dependent, and resolves
+  // to what it wrote. Only a journal writer declares. The caller holds #lock.
+  async #declareJournal(
+    types: readonly string[],
+    feature: boolean,
+    request: RequestOptions,
+  ): Promise<JournalDeclared> {
+    let declared: JournalDeclared = {journal: false, history: []}
+    const result = await this.#declare((draft) => {
+      // Another writer may have declared a feature this package doesn't model since.
+      const stored = {...draft, version: 0n}
+      checkSupported(stored, isJournalWriter(this))
+      const wanted = journalDeclaration(stored, types)
+      declared = feature
+        ? {journal: wanted.journal, history: []}
+        : {journal: false, history: wanted.history}
+      if (!declaredAnything(declared)) {
+        return false
+      }
+      const next = withJournal(stored, declared)
+      draft.features = new Map(next.features)
+      draft.historyDependent = [...next.historyDependent]
+
+      return true
+    }, request)
+    if (!result.wrote) {
+      return {journal: false, history: []}
+    }
+    // The declaration moved the version: the next write reads it again.
+    this.#validated = null
+
+    return declared
   }
 
   // The views table the journal reads, which a journal needs.

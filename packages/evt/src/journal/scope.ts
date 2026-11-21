@@ -133,6 +133,10 @@ export function allocations(metadata: Metadata): Allocation[] {
     return []
   }
 
+  // An escaped lone surrogate would parse as U+FFFD, which Rust refuses: refuse it too.
+  if (LONE_SURROGATE_ESCAPE.test(text)) {
+    throw invalidJournal(`the ${ALLOCATION_KEY} metadata escapes a lone surrogate`)
+  }
   let parsed: JsonValue
   try {
     parsed = parseJson(text, {duplicateKeys: 'refuse'})
@@ -204,6 +208,11 @@ export function u64(value: JsonValue): bigint | null {
 export function invalidJournal(message: string): EvtError {
   return new EvtError('invalidJournal', `invalid journal: ${message}`)
 }
+
+// A \u escape (after an even run of backslashes, so not an escaped backslash) of a high surrogate
+// not followed by one of a low surrogate, or of a low surrogate not preceded by one of a high one.
+const LONE_SURROGATE_ESCAPE =
+  /(?<!\\)(?:\\\\)*\\u[dD][89abAB][0-9a-fA-F]{2}(?!\\u[dD][c-fC-F][0-9a-fA-F]{2})|(?<!\\)(?:\\\\)*(?<!\\u[dD][89abAB][0-9a-fA-F]{2})\\u[dD][c-fC-F][0-9a-fA-F]{2}/
 
 function hasLoneSurrogate(text: string): boolean {
   for (let i = 0; i < text.length; i++) {

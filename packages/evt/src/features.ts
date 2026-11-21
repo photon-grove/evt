@@ -44,11 +44,10 @@ export const JOURNAL_COMPACTION_FEATURE = 'journal-compaction'
 /** The stored-format version of {@link JOURNAL_COMPACTION_FEATURE} this package writes. */
 export const JOURNAL_COMPACTION_VERSION = 1
 
-// The pairs a journal writer accepts besides the supported ones.
-const journalPairs = new Map([
-  [JOURNAL_FEATURE, JOURNAL_VERSION],
-  [JOURNAL_COMPACTION_FEATURE, JOURNAL_COMPACTION_VERSION],
-])
+// The pairs a journal writer accepts besides the supported ones. Not journal compaction yet: a
+// writer that doesn't model it would read compacted rows as a gap, and could allocate below the
+// floor.
+const journalPairs = new Map([[JOURNAL_FEATURE, JOURNAL_VERSION]])
 
 // The repository handles a journal repository wraps (ADR 0005, #178). Every writer of a journal
 // table must commit through the journal, or its events are missing from their scopes with no gap
@@ -63,8 +62,8 @@ const journalWriters = new WeakSet<object>()
 export const JOURNAL_WRITER_TARGET: unique symbol = Symbol('evt.journalWriterTarget')
 
 /**
- * Makes a repository handle a journal writer: it accepts a store that declares the journal or
- * journal compaction, which every other handle refuses. A wrapper's acceptance passes down to the
+ * Makes a repository handle a journal writer: it accepts a store that declares the journal, which
+ * every other handle refuses. A wrapper's acceptance passes down to the
  * repository it wraps. Internal: the journal's repository calls it.
  */
 export function acceptJournal(repository: object): void {
@@ -78,6 +77,13 @@ export function acceptJournal(repository: object): void {
 /** Whether a repository handle is a journal writer. */
 export function isJournalWriter(repository: object): boolean {
   return journalWriters.has(repository)
+}
+
+/** Refuses a handle that isn't a journal writer: only a journal declares or retracts it. */
+export function checkJournalWriter(repository: object): void {
+  if (!journalWriters.has(repository)) {
+    throw new UnsupportedFeatureError([{name: JOURNAL_FEATURE, version: JOURNAL_VERSION}])
+  }
 }
 
 /** The parsed marker row. A store with no marker row has no manifest. */
@@ -182,10 +188,11 @@ export const JOURNAL_MARKER: unique symbol = Symbol('evt.journalMarker')
 export interface JournalMarker {
   /**
    * Validates the store as a commit would (an uninitialized store is refused, or, initializing
-   * lazily, declared, before anything else), then declares the journal feature and the entity
-   * types history-dependent in one declaration, and resolves to what it wrote: nothing when the
-   * manifest declares it all. A manifest that declares the journal at another version is refused
-   * with an `UnsupportedFeatureError`.
+   * lazily, declared, before anything else), then declares the journal feature and then the entity
+   * types history-dependent, a declaration each, as Rust does, and resolves to what it wrote:
+   * nothing when the manifest declares it all. A manifest that declares the journal at another
+   * version is refused with an `UnsupportedFeatureError`, and so is a handle that isn't a journal
+   * writer.
    */
   declareJournal(types: readonly string[], options?: CallOptions): Promise<JournalDeclared>
   /** Takes back what a declaration wrote, in one declaration. Best effort: the caller ignores failures. */

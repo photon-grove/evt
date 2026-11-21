@@ -29,6 +29,8 @@ import {
 } from '@photon-grove/evt/dynamodb'
 
 import {type HeadFixtures, conformance, markerConformance} from './conformance.js'
+import {Journal, JournalRepository} from '@photon-grove/evt/journal'
+
 import {dynamoControls} from './controls.js'
 import {Checks, canonical} from './harness.js'
 import {journalConformance, journalStoreCases} from './journal-conformance.js'
@@ -434,6 +436,23 @@ async function journal(tables: string[]): Promise<void> {
     },
     handle: () => new DynamoRepository(client, table, {viewsTable}),
   })
+  await checks.case(
+    'dynamodb journal: a strict writer refuses an uninitialized store before declaring',
+    async () => {
+      const fresh = await freshTable(tables)
+      const strict = new DynamoRepository(client, fresh, {viewsTable})
+      const journaled = new JournalRepository(
+        strict,
+        new Journal(['ledger'], (event) => [`ledger:${event.entityId}`]),
+      )
+      await refuses(
+        journaled.commit({entityId: 'a', events: [ledgerEvent('a', 1)]}),
+        StoreNotInitializedError,
+        'a journaled commit',
+      )
+      ensure((await manifestOf(fresh)) === null, 'the refusal declared nothing')
+    },
+  )
   await journalStoreCases(checks, async () => {
     const fresh = await freshTable(tables)
 

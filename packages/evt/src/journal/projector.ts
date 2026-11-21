@@ -42,29 +42,32 @@ export class PositionTaken extends Error {
  * stream can own one, so the journal's repository writes them.
  */
 export function journalProjector(journal: Journal): CommitProjector {
-  return engineProjector({
-    name: PROJECTOR_NAME,
-    history: journal.entityTypes,
-    project(commit: CommitView): ViewOperation[] {
-      const operations: ViewOperation[] = []
-      for (const stream of commit.streams) {
-        for (const event of stream.events) {
-          for (const {scope, position} of allocations(event.metadata)) {
-            operations.push(
-              putView(
-                rowPartitionKey(scope),
-                rowSortKey(position),
-                event.entityId,
-                ROW_ENTITY_TYPE,
-                encodeRow(scope, position, event),
-                {condition: 'absent', conflict: new PositionTaken(scope, position)},
-              ),
-            )
+  // Frozen, so nothing can swap its project function and keep the engine's standing.
+  return engineProjector(
+    Object.freeze({
+      name: PROJECTOR_NAME,
+      history: journal.entityTypes,
+      project(commit: CommitView): ViewOperation[] {
+        const operations: ViewOperation[] = []
+        for (const stream of commit.streams) {
+          for (const event of stream.events) {
+            for (const {scope, position} of allocations(event.metadata)) {
+              operations.push(
+                putView(
+                  rowPartitionKey(scope),
+                  rowSortKey(position),
+                  event.entityId,
+                  ROW_ENTITY_TYPE,
+                  encodeRow(scope, position, event),
+                  {condition: 'absent', conflict: new PositionTaken(scope, position)},
+                ),
+              )
+            }
           }
         }
-      }
 
-      return operations
-    },
-  })
+        return operations
+      },
+    }),
+  )
 }
