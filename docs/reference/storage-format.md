@@ -1218,9 +1218,11 @@ compacted away is not detected (see the upgrade limitation under Loading and Dup
 A command executed with outcomes enabled always has its row. The window check precedes
 recording any outcome: an accepted one, a rejection (including the engine's stale-fence
 rejection): a command whose ID a read stream already carries has run, so it is a duplicate and no
-terminal outcome is written for it. A multi-stream command performs the outcome read first, before
-any stream is read, fenced, or appended to, and a transaction whose read returned a stored outcome
-is finished.
+terminal outcome is written for it. Before it reports the duplicate, the engine reads the outcome
+row again: another attempt of the same command may have committed between the outcome read and
+the load, and its row answers the command (the stored outcome, or `IdempotencyKeyReuse`). A
+multi-stream command performs the outcome read first, before any stream is read, fenced, or
+appended to, and a transaction whose read returned a stored outcome is finished.
 
 Outcome-only commits and their checks. An accepted no-op, a persisted rejection that carries
 no events, and an outcome-only command write no event, snapshot, or head update. Their transaction is the
