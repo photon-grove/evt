@@ -50,7 +50,12 @@ export function dynamoControls(client: DynamoDB, table: string): ControlFixtures
     async setRebuild(state: RebuildState) {
       await client.putItem({
         TableName: table,
-        Item: {...key('SYSTEM#REBUILD#GENERATION', 0n), value: {N: state.generation.toString()}},
+        Item: {
+          ...key('SYSTEM#REBUILD#GENERATION', 0n),
+          value: {N: state.generation.toString()},
+          // A force-release flags the generation, as the lifecycle's own force-release does.
+          ...(state.lock === 'forceReleased' && {forceReleased: {BOOL: true}}),
+        },
       })
 
       const lock = key('SYSTEM#REBUILD', 0n)

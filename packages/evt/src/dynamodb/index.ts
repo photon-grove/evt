@@ -32,6 +32,7 @@ export {
   type QueryInput,
   type RequestOptions,
   type ScanInput,
+  type UpdateItemInput,
   type TransactItem,
   type UpdateAction,
 } from './client.js'
@@ -44,6 +45,19 @@ export {
   outcomeItemSize,
   outcomeKey,
 } from './outcome.js'
+export {
+  beginRebuildItems,
+  endRebuildItems,
+  forceReleaseRebuildItems,
+  generationFromItem,
+  generationItem,
+  lockFromItem,
+  lockItem,
+  rebuildGenerationKey,
+  rebuildGuardCheck,
+  rebuildLockKey,
+  renewRebuildUpdate,
+} from './rebuild.js'
 export {DynamoRepository, type DynamoRepositoryOptions} from './repository.js'
 export {DYNAMODB_BACKEND, transactItemSize, viewProjector} from './views.js'
 export {

@@ -60,6 +60,12 @@ export interface PutItemInput extends Expressions {
   Item: Item
 }
 
+export interface UpdateItemInput extends Expressions {
+  TableName: string
+  Key: Item
+  UpdateExpression: string
+}
+
 export interface QueryInput {
   TableName: string
   KeyConditionExpression: string
@@ -95,6 +101,11 @@ export interface DynamoClient {
     options?: RequestOptions,
   ): Promise<{Item?: Record<string, unknown> | undefined}>
   putItem(input: PutItemInput, options?: RequestOptions): Promise<unknown>
+  /**
+   * Renewing a rebuild lease is one `UpdateItem`. A client without it can do everything else, and
+   * renewing on it fails with `invalidArgument`.
+   */
+  updateItem?(input: UpdateItemInput, options?: RequestOptions): Promise<unknown>
   query(input: QueryInput, options?: RequestOptions): Promise<Page>
   scan(input: ScanInput, options?: RequestOptions): Promise<Page>
   transactWriteItems(

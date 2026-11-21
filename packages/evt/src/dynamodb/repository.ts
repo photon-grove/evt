@@ -18,8 +18,11 @@ import {
   HistoryDependentProjectionError,
   IndeterminateError,
   OutcomeConflictError,
+  RebuildBeginIndeterminateError,
+  RebuildConflictError,
   RebuildInProgressError,
-  RebuildUnavailableError,
+  RebuildLeaseLostError,
+  RebuildStateInvalidError,
   SequenceGapError,
   StoreNotInitializedError,
   StreamHeadDriftError,
@@ -67,6 +70,21 @@ import {
   rowSortKey,
 } from '../journal/scope.js'
 import {type Outcome, checkCommandId} from '../outcome.js'
+import {type ProjectedView, REASON_CONDITION_FAILED} from '../projection.js'
+import {
+  MAX_REBUILD_BEGIN_ATTEMPTS,
+  type RebuildBeginPlan,
+  type RebuildFence,
+  type RebuildGeneration,
+  type RebuildLease,
+  type RebuildState,
+  checkRebuildOwner,
+  checkRebuildViewBatch,
+  fenceNow,
+  observeRebuildEpoch,
+  planRebuildBegin,
+  rebuildLeaseSeconds,
+} from '../rebuild-fence.js'
 import {
   type CallOptions,
   type Commit,
@@ -97,6 +115,17 @@ import {
 } from './item.js'
 import {FEATURES_PK, manifestFromItem, markerItem} from './marker.js'
 import {OUTCOME_SORT_KEY, outcomeFromItem, outcomeKey} from './outcome.js'
+import {
+  beginRebuildItems,
+  endRebuildItems,
+  forceReleaseRebuildItems,
+  generationFromItem,
+  lockFromItem,
+  rebuildGenerationKey,
+  rebuildGuardCheck,
+  rebuildLockKey,
+  renewRebuildUpdate,
+} from './rebuild.js'
 import type {ViewRow} from '../views.js'
 import {viewKey, viewRowFromItem, viewRowItem} from './view-repository.js'
 import {DYNAMODB_BACKEND, transactItemSize} from './views.js'
@@ -136,8 +165,8 @@ export interface DynamoRepositoryOptions {
    */
   retention?: Readonly<Record<string, number>> | ReadonlyMap<string, number>
   /**
-   * The clock that stamps `ttl`s and decides which have passed, in Unix milliseconds as
-   * `Date.now` gives them, never seconds. `Date.now` by default.
+   * The clock that stamps `ttl`s and decides which have passed, and that rebuild leases expire by,
+   * in Unix milliseconds as `Date.now` gives them, never seconds. `Date.now` by default.
    */
   clock?: () => number
   /**
@@ -178,7 +207,9 @@ const MAX_SNAPSHOT_GUARD_RETRIES = 4
  * declares a feature, the next write fails, validates the manifest again, and either refuses an
  * unsupported feature or fails once with a retryable {@link FeatureManifestChangedError}.
  */
-export class DynamoRepository implements OutcomeRepository, StoreInitializer, EventLog {
+export class DynamoRepository
+  implements OutcomeRepository, StoreInitializer, EventLog, RebuildFence
+{
   readonly #client: DynamoClient
   readonly #table: string
   readonly #lazy: boolean
@@ -279,6 +310,193 @@ export class DynamoRepository implements OutcomeRepository, StoreInitializer, Ev
         this.#validated = null
       }
     })
+  }
+
+  async rebuildGeneration(options?: CallOptions): Promise<RebuildGeneration> {
+    options?.signal?.throwIfAborted()
+
+    return generationFromItem(await this.#controlItem(rebuildGenerationKey(), options))
+  }
+
+  /** The generation, then the lock: two strongly consistent reads, as Go's and Rust's are. */
+  async rebuildState(options?: CallOptions): Promise<RebuildState> {
+    const generation = await this.rebuildGeneration(options)
+    const lock = lockFromItem(await this.#controlItem(rebuildLockKey(), options))
+
+    return {generation, lock}
+  }
+
+  async beginRebuild(owner: string, leaseMs: number, options?: CallOptions): Promise<RebuildLease> {
+    options?.signal?.throwIfAborted()
+    checkRebuildOwner(owner)
+    const seconds = rebuildLeaseSeconds(leaseMs)
+
+    // Each attempt reads what the one before it lost to.
+    let invalid: RebuildStateInvalidError | null = null
+    for (let attempt = 1; attempt <= MAX_REBUILD_BEGIN_ATTEMPTS; attempt++) {
+      const state = await this.rebuildState(options)
+      const now = fenceNow(this.#clock)
+      let plan: RebuildBeginPlan
+      try {
+        plan = planRebuildBegin(state, now)
+      } catch (error) {
+        // The two reads may straddle another rebuild's transition: read again.
+        if (error instanceof RebuildStateInvalidError) {
+          invalid = error
+          continue
+        }
+        throw error
+      }
+      invalid = null
+
+      const lease = {
+        owner,
+        generation: state.generation.value + plan.increment,
+        leaseExpiresAt: now + seconds,
+      }
+      try {
+        await this.#client.transactWriteItems(
+          {TransactItems: beginRebuildItems(this.#table, plan, lease, now)},
+          requestOptions(options),
+        )
+
+        return lease
+      } catch (error) {
+        const codes = cancellationCodes(error)
+        if (
+          codes?.some((code) => code === 'ConditionalCheckFailed' || code === 'TransactionConflict')
+        ) {
+          continue
+        }
+        if (codes === null && !throttled(error) && resultUnknown(error)) {
+          throw new RebuildBeginIndeterminateError(lease, state.generation.value, error)
+        }
+        throw fenceError(error, codes)
+      }
+    }
+
+    throw invalid ?? new RebuildConflictError(MAX_REBUILD_BEGIN_ATTEMPTS)
+  }
+
+  async renewRebuild(
+    lease: RebuildLease,
+    leaseMs: number,
+    options?: CallOptions,
+  ): Promise<RebuildLease> {
+    options?.signal?.throwIfAborted()
+    checkRebuildOwner(lease.owner)
+    const seconds = rebuildLeaseSeconds(leaseMs)
+    const update = this.#client.updateItem
+    if (update === undefined) {
+      throw new EvtError('invalidArgument', 'the DynamoDB client has no updateItem to renew with')
+    }
+
+    const expiresAt = fenceNow(this.#clock) + seconds
+    try {
+      await update.call(
+        this.#client,
+        renewRebuildUpdate(this.#table, lease, expiresAt),
+        requestOptions(options),
+      )
+    } catch (error) {
+      if (isConditionalCheckFailed(error)) {
+        throw new RebuildLeaseLostError(lease.owner)
+      }
+      throw fenceError(error, null)
+    }
+
+    return {...lease, leaseExpiresAt: expiresAt}
+  }
+
+  async endRebuild(lease: RebuildLease, options?: CallOptions): Promise<RebuildGeneration> {
+    options?.signal?.throwIfAborted()
+    checkRebuildOwner(lease.owner)
+    await this.#fenceTransaction(endRebuildItems(this.#table, lease), lease.owner, options)
+
+    return {value: lease.generation + 1n, forceReleased: false}
+  }
+
+  async forceReleaseRebuild(owner: string, options?: CallOptions): Promise<RebuildGeneration> {
+    options?.signal?.throwIfAborted()
+    checkRebuildOwner(owner)
+    const seen = await this.rebuildGeneration(options)
+    if (seen.value % 2n === 0n) {
+      throw new RebuildLeaseLostError(owner)
+    }
+    await this.#fenceTransaction(
+      forceReleaseRebuildItems(this.#table, owner, seen.value),
+      owner,
+      options,
+    )
+
+    return {value: seen.value + 2n, forceReleased: true}
+  }
+
+  /**
+   * Writes the batch to the views table in one transaction whose last action guards the lease. A
+   * lost or expired lease outranks every view's failure.
+   */
+  async writeRebuildViews(
+    lease: RebuildLease,
+    views: readonly ProjectedView[],
+    options?: CallOptions,
+  ): Promise<void> {
+    options?.signal?.throwIfAborted()
+    checkRebuildOwner(lease.owner)
+    checkRebuildViewBatch(views)
+    const actions = viewActions(views, this.#viewsTable)
+    const guard = rebuildGuardCheck(this.#table, lease, fenceNow(this.#clock))
+    try {
+      await this.#client.transactWriteItems(
+        {TransactItems: [...actions.map(({action}) => action), guard]},
+        requestOptions(options),
+      )
+    } catch (error) {
+      const codes = cancellationCodes(error)
+      if (codes !== null) {
+        if (codes[actions.length] === 'ConditionalCheckFailed') {
+          throw new RebuildLeaseLostError(lease.owner)
+        }
+        for (const [index, {view}] of actions.entries()) {
+          const code = codes[index]
+          if (code === REASON_CONDITION_FAILED) {
+            throw new ProjectorOperationError(view, code)
+          }
+          if (code !== undefined && VIEW_REFUSALS.has(code)) {
+            throw new ProjectorOperationError(view, code, error)
+          }
+        }
+      }
+      throw fenceError(error, codes)
+    }
+  }
+
+  // A control row of the fence, read strongly consistent whatever the repository's reads are.
+  async #controlItem(key: Item, options?: CallOptions): Promise<Item | null> {
+    const output = await this.#client.getItem(
+      {TableName: this.#table, Key: key, ConsistentRead: true},
+      requestOptions(options),
+    )
+    const item = output.Item as Item | undefined
+
+    return item && Object.keys(item).length > 0 ? item : null
+  }
+
+  // Ends or force-releases a lease: any failed condition means the caller no longer holds it.
+  async #fenceTransaction(
+    items: TransactItem[],
+    owner: string,
+    options?: CallOptions,
+  ): Promise<void> {
+    try {
+      await this.#client.transactWriteItems({TransactItems: items}, requestOptions(options))
+    } catch (error) {
+      const codes = cancellationCodes(error)
+      if (codes?.includes('ConditionalCheckFailed')) {
+        throw new RebuildLeaseLostError(owner)
+      }
+      throw fenceError(error, codes)
+    }
   }
 
   /** A Scan page holds any mix of entities, in no order. */
@@ -806,31 +1024,10 @@ export class DynamoRepository implements OutcomeRepository, StoreInitializer, Ev
    * The settled rebuild generation, read strongly consistently from the events table: even, 0
    * with no generation item. An odd one is a `RebuildUnavailableError`.
    */
-  async observeRebuildEpoch(options?: CallOptions): Promise<bigint> {
-    options?.signal?.throwIfAborted()
-    const output = await this.#client.getItem(
-      {TableName: this.#table, Key: controlKey(REBUILD_GENERATION_PK), ConsistentRead: true},
-      requestOptions(options),
-    )
-    const item = output.Item as Item | undefined
-    if (item === undefined || Object.keys(item).length === 0) {
-      return 0n
-    }
-    const value = item['value']
-    if (value === undefined || !('N' in value) || !/^-?\d+$/.test(value.N)) {
-      throw new EvtError('invalidRecord', 'rebuild generation: value is not a number')
-    }
-    const flag = item['forceReleased']
-    if (flag !== undefined && !('BOOL' in flag)) {
-      throw new EvtError('invalidRecord', 'rebuild generation: forceReleased is not a boolean')
-    }
-    const generation = BigInt(value.N)
-    if (generation % 2n !== 0n) {
-      throw new RebuildUnavailableError(generation, flag !== undefined && flag.BOOL === true)
-    }
-
-    return generation
+  observeRebuildEpoch(options?: CallOptions): Promise<bigint> {
+    return observeRebuildEpoch(this, options)
   }
+
 
   // The check of a compaction write that the rebuild generation is still `epoch`'s.
   #epochCheck(epoch: bigint): TransactItem {
@@ -1731,6 +1928,31 @@ function resultUnknown(error: unknown): boolean {
 
   // A 2xx whose body couldn't be read carries its real status: the transaction may have applied.
   return typeof status !== 'number' || status < 400 || status >= 500
+}
+
+// The SDK errors of a throttled request: a refusal that didn't apply, which a retry may pass.
+const THROTTLED_NAMES = new Set([
+  'ThrottlingException',
+  'ProvisionedThroughputExceededException',
+  'RequestLimitExceeded',
+])
+
+function throttled(error: unknown): boolean {
+  const name = typeof error === 'object' && error !== null ? (error as {name?: unknown}).name : null
+
+  return typeof name === 'string' && THROTTLED_NAMES.has(name)
+}
+
+// A fence request's failure that isn't the lease's: transient when DynamoDB throttled it or a
+// transaction conflicted, as Go and Rust classify it, and otherwise the error itself.
+function fenceError(error: unknown, codes: string[] | null): unknown {
+  const transient =
+    throttled(error) ||
+    (codes?.some((code) => code === 'TransactionConflict' || THROTTLED.has(code)) ?? false)
+
+  return transient
+    ? new TransientError('the rebuild fence request was throttled or conflicted', {cause: error})
+    : error
 }
 
 function isConditionalCheckFailed(error: unknown): boolean {

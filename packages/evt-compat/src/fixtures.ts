@@ -9,6 +9,7 @@ import {
   headVectors,
   markerVectors,
   postgresSchemaVectors,
+  rebuildFenceVectors,
 } from './marker.js'
 import {outcomeVectors} from './outcomes.js'
 import {scenarioChecks} from './scenarios.js'
@@ -28,6 +29,7 @@ await codecVectors(checks)
 await markerVectors(checks)
 await headVectors(checks)
 await commitVectors(checks)
+await rebuildFenceVectors(checks)
 await commitViewVectors(checks)
 await postgresSchemaVectors(checks)
 await outcomeVectors(checks)

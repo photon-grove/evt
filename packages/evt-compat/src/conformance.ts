@@ -29,6 +29,11 @@ import {
   ProjectorOperationError,
   type ProjectedView,
   RebuildInProgressError,
+  type RebuildFence,
+  RebuildLeaseLostError,
+  RebuildLockHeldError,
+  RebuildUnavailableError,
+  ViewsNotConfiguredError,
   type ReadFence,
   type Repository,
   ReservedEntityIdError,
@@ -60,7 +65,9 @@ import {
   json,
   isConflict,
   isEventLog,
+  isRebuildFence,
   isReserved,
+  observeRebuildEpoch,
   putView,
   isRetryable,
 } from '@photon-grove/evt'
@@ -2197,6 +2204,12 @@ export async function markerConformance(
       () => controlRanking(repo, controls),
     ],
   ]
+  if (isRebuildFence(repo)) {
+    cases.push([
+      "a rebuild's lease fences commits and its own writes until it ends or is force-released",
+      () => rebuildLifecycle(repo, controls),
+    ])
+  }
 
   try {
     for (const [name, check] of cases) {
@@ -2418,6 +2431,103 @@ async function historyDeclaration(
   ensure(!(await controls.manifest())!.historyDependent.includes(`${ns}-y`), 'nothing declared')
 
   await controls.declare(streamHeadsOnly)
+}
+
+async function rebuildLifecycle(
+  repo: Repository & StoreInitializer & RebuildFence,
+  controls: ControlFixtures,
+): Promise<void> {
+  await controls.setRebuild({generation: 0n, lock: null})
+  const ns = namespace()
+  const stream = new Stream(ns, 'a')
+  await settled(() => stream.commit(repo, stream.events(1, 1)))
+  const owner = `${ns}-rebuild`
+  ensureEqual(await observeRebuildEpoch(repo), 0n, 'the epoch before any rebuild')
+
+  // Taking the lock moves the generation to odd and refuses commits and a second taker.
+  const lease = await repo.beginRebuild(owner, 60_000)
+  ensureEqual(lease.generation, 1n, "the lease's fencing generation")
+  ensureEqual((await repo.rebuildState()).lock?.owner, owner, 'the lock names its owner')
+  await expectError(
+    stream.commit(repo, stream.events(2, 2)),
+    'a commit during the rebuild',
+    (error) => error instanceof RebuildInProgressError,
+  )
+  await expectError(
+    repo.beginRebuild(`${ns}-other`, 60_000),
+    'a second rebuild',
+    (error) => error instanceof RebuildLockHeldError && error.owner === owner,
+  )
+  await expectError(
+    observeRebuildEpoch(repo),
+    'reading derived state during the rebuild',
+    (error) => error instanceof RebuildUnavailableError && error.generation === 1n,
+  )
+
+  // The holder renews and writes; a stale lease can do neither.
+  const renewed = await repo.renewRebuild(lease, 120_000)
+  ensure(renewed.leaseExpiresAt >= lease.leaseExpiresAt, 'a renewal extends the lease')
+  const staleLease = {...lease, generation: lease.generation + 2n}
+  await expectError(
+    repo.renewRebuild(staleLease, 60_000),
+    'renewing a stale lease',
+    (error) => error instanceof RebuildLeaseLostError,
+  )
+  // A repository with nowhere to write views refuses a guarded write before it checks the lease.
+  {
+    const row = (sk: string) => [
+      {
+        projector: 'rebuild',
+        projectorIndex: 0,
+        operation: 0,
+        op: putView(`${ns}-rebuilt`, sk, stream.id, stream.entityType, '{"n":1}'),
+      },
+    ]
+    const configured = await repo.writeRebuildViews(renewed, row('one')).then(
+      () => true,
+      (error: unknown) => {
+        if (error instanceof ViewsNotConfiguredError) {
+          return false
+        }
+        throw error
+      },
+    )
+    if (configured) {
+      await expectError(
+        repo.writeRebuildViews(staleLease, row('two')),
+        'a guarded write under a stale lease',
+        (error) => error instanceof RebuildLeaseLostError,
+      )
+    }
+  }
+
+  // Ending it settles the generation, and commits pass again.
+  ensureEqual(await repo.endRebuild(renewed), {value: 2n, forceReleased: false}, 'the end')
+  await expectError(
+    repo.endRebuild(renewed),
+    'ending it twice',
+    (error) => error instanceof RebuildLeaseLostError,
+  )
+  ensureEqual(await observeRebuildEpoch(repo), 2n, 'the settled epoch')
+  await settled(() => stream.commit(repo, stream.events(2, 2)))
+
+  // A force-release ends the lease and leaves the generation odd, so commits stay refused until
+  // a rebuild begins from it and ends.
+  await repo.beginRebuild(owner, 60_000)
+  ensureEqual(
+    await repo.forceReleaseRebuild(owner),
+    {value: 5n, forceReleased: true},
+    'the force-release',
+  )
+  await expectError(
+    stream.commit(repo, stream.events(3, 3)),
+    'a commit after a force-release',
+    (error) => error instanceof RebuildInProgressError,
+  )
+  const settler = await repo.beginRebuild(`${ns}-settle`, 60_000)
+  ensureEqual(settler.generation, 7n, 'a rebuild begins from the force-released generation')
+  ensureEqual(await repo.endRebuild(settler), {value: 8n, forceReleased: false}, 'and settles it')
+  await settled(() => stream.commit(repo, stream.events(3, 3)))
 }
 
 async function retentionSet(

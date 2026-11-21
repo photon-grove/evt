@@ -24,7 +24,12 @@ import {
   ProjectorOnlyCommitError,
   ProjectorOperationError,
   type ProjectedView,
+  type RebuildFence,
+  type RebuildLease,
   RebuildInProgressError,
+  RebuildLeaseLostError,
+  RebuildLockHeldError,
+  RebuildUnavailableError,
   type Repository,
   ReservedEntityIdError,
   RetentionConflictError,
@@ -45,6 +50,7 @@ import {
   encodeEvent,
   isEventLog,
   isReserved,
+  observeRebuildEpoch,
   encodeSnapshot,
   eventId,
   groupCommits,
@@ -88,6 +94,7 @@ export const SUPPORTED_SCENARIOS: readonly string[] = [
   'commit-grouping',
   'feature-marker',
   'reserved-namespaces',
+  'rebuild-fence',
 ]
 
 /** The fixture run's name, which every run's identity digests use. */
@@ -111,6 +118,8 @@ const OUTCOME_KEYS = new Set([
   'mapped',
   'groups',
   'delta',
+  'forceReleased',
+  'rows',
 ])
 
 // The step keys this runner reads. A supported scenario that gains another fails loudly rather
@@ -151,6 +160,10 @@ const STEP_KEYS = new Set([
   'historyDependent',
   'retract',
   'entityPrefix',
+  'action',
+  'owner',
+  'leaseSeconds',
+  'seconds',
 ])
 
 // The keys this runner reads of an executeTransaction step's writes and its interference.
@@ -247,8 +260,12 @@ export interface Outcome {
   mapped?: string
   /** A groupCommits step's commits, each its ID and its events. */
   groups?: string[]
-  /** How far a declare step moved the feature manifest's version. */
+  /** How far a declare or rebuild step moved the feature manifest's version or the generation. */
   delta?: number
+  /** A rebuild step left the generation flagged force-released. */
+  forceReleased?: true
+  /** The rows a rebuild's writeViews step left in the scenario's rebuild partition. */
+  rows?: number
 }
 
 export function expectedOutcome(expect: JsonValue): Outcome {
@@ -285,6 +302,11 @@ export function expectedOutcome(expect: JsonValue): Outcome {
     }),
     ...(expect.has('delta') && num(field(expect, 'delta')) !== 0
       ? {delta: num(field(expect, 'delta'))}
+      : {}),
+    ...(expect.has('forceReleased') &&
+      field(expect, 'forceReleased') === true && {forceReleased: true as const}),
+    ...(expect.has('rows') && num(field(expect, 'rows')) !== 0
+      ? {rows: num(field(expect, 'rows'))}
       : {}),
   }
 }
@@ -388,6 +410,17 @@ export interface RunnerOptions {
   bypassHead?: ((event: SerializedEvent) => Promise<void>) | undefined
   /** Reads and declares the store's feature manifest, as another writer would. Backs declare. */
   marker?: MarkerDriver | undefined
+  /** The store's rebuild fence, and how time passes and rows are counted. Backs rebuild. */
+  rebuild?: RebuildDriver | undefined
+}
+
+/** What a rebuild step needs: the fence, a clock to wait on, and the view rows of a partition. */
+export interface RebuildDriver {
+  readonly fence: RebuildFence
+  /** Lets `seconds` pass: an injected clock moves, a live run sleeps. */
+  wait(seconds: number): Promise<void>
+  /** How many view rows the partition `pk` holds. */
+  rows(pk: string): Promise<number>
 }
 
 /** A store's feature manifest as a declaring writer sees it. */
@@ -411,6 +444,7 @@ export class Runner {
   readonly #options: StoreOptions
   readonly #bypassHead: RunnerOptions['bypassHead']
   readonly #marker: RunnerOptions['marker']
+  readonly #rebuild: RunnerOptions['rebuild']
   readonly #run: string
   readonly entityId: string
 
@@ -433,6 +467,7 @@ export class Runner {
     this.#store = new Store(repository, this.#options)
     this.#bypassHead = options.bypassHead
     this.#marker = options.marker
+    this.#rebuild = options.rebuild
   }
 
   async step(step: JsonValue): Promise<Outcome> {
@@ -518,6 +553,8 @@ export class Runner {
         }
       case 'declare':
         return this.#declare(step)
+      case 'rebuild':
+        return this.#rebuildStep(step)
       case 'enumerate':
         return this.#enumerate()
       default:
@@ -771,6 +808,84 @@ export class Runner {
       }
     } catch (error) {
       return classify(error)
+    }
+  }
+
+  // One step of the rebuild fence's lifecycle. The owner is scoped to the scenario's stream, and a
+  // step that presents a lease rebuilds it from the store, as a separate process would: the lock's
+  // fencing generation when it names the owner, else 0. The outcome reports how far the generation
+  // moved, whether it's force-released, and a write's rows.
+  async #rebuildStep(step: JsonValue): Promise<Outcome> {
+    const driver = this.#rebuild
+    if (driver === undefined) {
+      throw new Error('the backend has no rebuild fence driver')
+    }
+
+    const {fence} = driver
+    const owner = `${this.entityId}-${optionalString(step, 'owner') ?? ''}`
+    const action = str(field(step, 'action'))
+    const leaseMs = () => num(field(step, 'leaseSeconds')) * 1000
+    const held = async (): Promise<RebuildLease> => {
+      const {lock} = await fence.rebuildState()
+      return {owner, generation: lock?.owner === owner ? lock.generation : 0n, leaseExpiresAt: 0}
+    }
+    const partition = `rebuild-${this.entityId}`
+
+    const before = await fence.rebuildGeneration()
+    let result = 'ok'
+    try {
+      switch (action) {
+        case 'begin':
+          await fence.beginRebuild(owner, leaseMs())
+          break
+        case 'renew':
+          await fence.renewRebuild(await held(), leaseMs())
+          break
+        case 'end':
+          await fence.endRebuild(await held())
+          break
+        case 'forceRelease':
+          await fence.forceReleaseRebuild(owner)
+          break
+        case 'generation':
+          await observeRebuildEpoch(fence)
+          result = 'settled'
+          break
+        case 'wait':
+          await driver.wait(num(field(step, 'seconds')))
+          break
+        case 'writeViews':
+          await fence.writeRebuildViews(await held(), [
+            {
+              projector: 'rebuild',
+              projectorIndex: 0,
+              operation: 0,
+              op: putView(partition, owner, owner, 'rebuild', `{"owner":${JSON.stringify(owner)}}`),
+            },
+          ])
+          break
+        default:
+          throw new Error(`unknown rebuild action ${action}`)
+      }
+    } catch (error) {
+      if (error instanceof RebuildLockHeldError) {
+        result = 'held'
+      } else if (error instanceof RebuildLeaseLostError) {
+        result = 'leaseLost'
+      } else if (error instanceof RebuildUnavailableError) {
+        result = 'unavailable'
+      } else {
+        throw error
+      }
+    }
+    const after = await fence.rebuildGeneration()
+    const rows = action === 'writeViews' ? await driver.rows(partition) : 0
+
+    return {
+      ...outcome(result),
+      ...(after.value !== before.value && {delta: Number(after.value - before.value)}),
+      ...(after.forceReleased && {forceReleased: true as const}),
+      ...(rows !== 0 && {rows}),
     }
   }
 

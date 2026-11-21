@@ -6,6 +6,7 @@ export {
   type ManifestDraft,
   MemRepository,
   type MemRepositoryOptions,
+  type RebuildFixture,
   type RebuildState,
   type ViewFixtures,
   type ViewRow,

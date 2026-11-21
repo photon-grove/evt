@@ -35,6 +35,16 @@ err = fence.WriteViews(ctx, lease, batch) // *evt.RebuildLeaseLostError: stop, y
 _, err = fence.End(ctx, lease)
 ```
 
+In TypeScript every repository is the fence itself (`isRebuildFence`), with leases in
+milliseconds:
+
+```ts
+const lease = await repository.beginRebuild('rebuild-2026-10', 5 * 60_000)
+const renewed = await repository.renewRebuild(lease, 5 * 60_000)
+await repository.writeRebuildViews(renewed, batch) // RebuildLeaseLostError: stop, you were replaced
+await repository.endRebuild(renewed)
+```
+
 And here it is wrapped around `RebuildProjections`, with the failure path:
 
 ```go

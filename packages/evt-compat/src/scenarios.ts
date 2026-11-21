@@ -70,6 +70,9 @@ const REFUSED_BEFORE_WRITE = new Set([
 // The views table the recorded actions name, which the fixture labels "views" whatever it is.
 const VIEWS_TABLE = 'views'
 
+// The fixture run's clock, as the Go generator sets it, in milliseconds.
+const REBUILD_FENCE_NOW = 1_790_000_000_000
+
 // The marker version a fresh store's transactions check, and the table the fixture's actions
 // leave out.
 const MARKER_VERSION = 1n
@@ -106,12 +109,23 @@ async function runScenario(
     checks.equal(`${name}: no ${key} expected`, optionalList(expected, key).length, 0)
   }
 
-  const repository = new MemRepository()
+  // One injected clock for every step, whichever language writes it: a wait moves it.
+  let now = REBUILD_FENCE_NOW
+  const repository = new MemRepository({clock: () => now})
   const recorder = new Recorder(repository)
   const controls = controlFixtures(repository)
   const runner = new Runner(recorder, scenario, FIXTURE_RUN, {
     bypassHead: async (event) => headFixtures(repository).appendBypassingHead(event),
     marker: controls,
+    rebuild: {
+      fence: repository,
+      async wait(seconds) {
+        now += seconds * 1000
+      },
+      async rows(pk) {
+        return repository.views().filter((row) => row.pk === pk).length
+      },
+    },
   })
   const outcomes = scenario instanceof Map && scenario.get('outcomes') === true
 
@@ -207,6 +221,11 @@ export function viewRows(repository: MemRepository, scenario: JsonValue, base: s
 }
 
 /** The view partitions a scenario writes, by bytes: its steps' views' and the ledger's. */
+// Whether a step is a rebuild's guarded write.
+function rebuildWrites(step: JsonValue): boolean {
+  return str(field(step, 'op')) === 'rebuild' && optionalString(step, 'action') === 'writeViews'
+}
+
 export function viewPartitions(scenario: JsonValue, base: string): string[] {
   const partitions = new Set<string>()
   for (const step of list(field(scenario, 'steps'))) {
@@ -218,6 +237,11 @@ export function viewPartitions(scenario: JsonValue, base: string): string[] {
   }
   if (scenario instanceof Map && scenario.get('projector') === true) {
     partitions.add(LEDGER_PK)
+  }
+  // A rebuild's guarded writes go to the scenario's rebuild partition.
+  const steps = list(field(scenario, 'steps'))
+  if (steps.some(rebuildWrites)) {
+    partitions.add(`rebuild-${base}`)
   }
 
   const sorted = [...partitions]
