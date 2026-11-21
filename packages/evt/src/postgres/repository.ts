@@ -25,6 +25,7 @@ import {
   UnsupportedFeatureError,
   ViewsNotConfiguredError,
 } from '../errors.js'
+import type {EventLog, StreamFilter} from '../enumerate.js'
 import type {SerializedEvent, SerializedSnapshot} from '../event.js'
 import {
   type FeatureManifest,
@@ -136,6 +137,9 @@ const EVENT_COLUMNS =
   'event_id, sequence::text AS sequence, event_type, version::text AS version, entity_id, ' +
   "entity_type, encode(payload, 'hex') AS payload, metadata::text AS metadata"
 
+// The rows each page of an enumeration reads.
+const ENUMERATION_PAGE_SIZE = 500
+
 // A unique violation, which the outcome insert raises when another writer recorded the outcome.
 const UNIQUE_VIOLATION = '23505'
 
@@ -152,7 +156,7 @@ const UNIQUE_VIOLATION = '23505'
  * it validated. Every commit and snapshot write reads the manifest again under a shared lock that
  * no declaration can take while the write is open, and validates it again when it changed.
  */
-export class PgRepository implements OutcomeRepository, StoreInitializer {
+export class PgRepository implements OutcomeRepository, StoreInitializer, EventLog {
   readonly #client: PgClient
   readonly #tables: PgTables
   readonly #viewWriter: ViewWriter | undefined
@@ -193,6 +197,15 @@ export class PgRepository implements OutcomeRepository, StoreInitializer {
    */
   writesViews(): boolean {
     return true
+  }
+
+  /**
+   * Whether it applies a view put's engine-only expected payload (the journal's counter): with the
+   * views table, whose statements evt builds, as Rust's does. A view writer can't express it, so
+   * a commit that carries one through a writer is refused before any write.
+   */
+  appliesExpectedPayload(): boolean {
+    return this.#viewsTable
   }
 
   /**
@@ -520,6 +533,80 @@ export class PgRepository implements OutcomeRepository, StoreInitializer {
 
     const eventSequence = stream.events.at(-1)!.sequence
     await this.#upsertSnapshot(run, {...snapshot, entityId, eventSequence})
+  }
+
+  /** Each entity's events come whole, in one batch. */
+  readonly batchesByEntity = true
+
+  /**
+   * The event log, one batch per entity, entities ascending by `entity_id` in the database's
+   * collation and events by sequence. It reads a page of rows at a time, each page continuing
+   * from the last row of the one before, so memory holds a page and the entity being collected,
+   * and each page sees the log as its own statement does. The reserved namespaces are skipped.
+   */
+  async *streamAllEvents(
+    filter?: StreamFilter,
+    options?: CallOptions,
+  ): AsyncGenerator<SerializedEvent[]> {
+    const {events} = this.#tables
+    const entityType = filter?.entityType ?? null
+    let batch: SerializedEvent[] = []
+    let after: [string, string] | null = null
+    for (;;) {
+      options?.signal?.throwIfAborted()
+      const rows = await this.#read(
+        `SELECT ${EVENT_COLUMNS} FROM ${events} WHERE entity_id NOT LIKE 'SYSTEM#%' ` +
+          "AND entity_id NOT LIKE 'command-outcome#%' AND ($1::text IS NULL OR entity_type = $1) " +
+          `AND ($2::text IS NULL OR (entity_id, ${events}.sequence) > ($2, $3::bigint)) ` +
+          `ORDER BY entity_id ASC, ${events}.sequence ASC LIMIT ${ENUMERATION_PAGE_SIZE}`,
+        [entityType, after?.[0] ?? null, after?.[1] ?? null],
+      )
+      for (const row of rows) {
+        const event = eventFromRow(row)
+        if (batch.length > 0 && batch[0]!.entityId !== event.entityId) {
+          yield batch
+          batch = []
+        }
+        batch.push(event)
+      }
+      if (rows.length < ENUMERATION_PAGE_SIZE) {
+        break
+      }
+      const last = batch.at(-1)!
+      after = [last.entityId, last.sequence.toString()]
+    }
+    if (batch.length > 0) {
+      yield batch
+    }
+  }
+
+  /**
+   * Each entity's head. A store that declares stream-heads reads it from the heads table, and one
+   * that doesn't yet, whose heads table may be empty, from the events and snapshots, as Rust does.
+   */
+  async entityHeads(entityType?: string, options?: CallOptions): Promise<Map<string, bigint>> {
+    options?.signal?.throwIfAborted()
+    const {events, snapshots} = this.#tables
+    const manifest = await this.#readManifest((statement, values) => this.#read(statement, values))
+    const reserved = "entity_id NOT LIKE 'SYSTEM#%' AND entity_id NOT LIKE 'command-outcome#%'"
+    const sql = declaresStreamHeads(manifest)
+      ? `SELECT entity_id, head::text AS head FROM ${streamHeadsTable(this.#tables)} ` +
+        `WHERE ($1::text IS NULL OR entity_type = $1) AND ${reserved}`
+      : 'SELECT entity_id, MAX(head)::text AS head FROM (' +
+        `SELECT entity_id, ${events}.sequence AS head, entity_type FROM ${events} UNION ALL ` +
+        `SELECT entity_id, event_sequence AS head, entity_type FROM ${snapshots}` +
+        `) sources WHERE ($1::text IS NULL OR entity_type = $1) AND ${reserved} ` +
+        'GROUP BY entity_id'
+    const rows = await this.#read(sql, [entityType ?? null])
+    const heads = new Map<string, bigint>()
+    for (const row of rows) {
+      const head = BigInt(text(row, 'head'))
+      if (head > 0n) {
+        heads.set(text(row, 'entity_id'), head)
+      }
+    }
+
+    return heads
   }
 
   async events(entityId: string, options?: CallOptions): Promise<SerializedEvent[]> {

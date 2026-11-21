@@ -28,6 +28,7 @@ import {
   ProjectorOperationError,
   ViewsNotConfiguredError,
 } from '../errors.js'
+import type {EventLog, StreamFilter} from '../enumerate.js'
 import type {SerializedEvent, SerializedSnapshot} from '../event.js'
 import {
   type FeatureManifest,
@@ -177,7 +178,7 @@ const MAX_SNAPSHOT_GUARD_RETRIES = 4
  * declares a feature, the next write fails, validates the manifest again, and either refuses an
  * unsupported feature or fails once with a retryable {@link FeatureManifestChangedError}.
  */
-export class DynamoRepository implements OutcomeRepository, StoreInitializer {
+export class DynamoRepository implements OutcomeRepository, StoreInitializer, EventLog {
   readonly #client: DynamoClient
   readonly #table: string
   readonly #lazy: boolean
@@ -278,6 +279,57 @@ export class DynamoRepository implements OutcomeRepository, StoreInitializer {
         this.#validated = null
       }
     })
+  }
+
+  /** A Scan page holds any mix of entities, in no order. */
+  readonly batchesByEntity = false
+
+  /**
+   * The event log, one batch per Scan page of events, in the table's order and not grouped by
+   * entity: an entity's events can span pages. Rows below `sk = 1` (snapshots and head items)
+   * and the reserved namespaces are skipped, and pages the filter empties out aren't yielded.
+   * Reads are strongly consistent unless the repository says otherwise.
+   */
+  async *streamAllEvents(
+    filter?: StreamFilter,
+    options?: CallOptions,
+  ): AsyncGenerator<SerializedEvent[]> {
+    options?.signal?.throwIfAborted()
+    const request = requestOptions(options)
+    for await (const items of this.#enumerate(undefined, filter?.entityType, request)) {
+      const events = items.filter((item) => (sortKey(item) ?? 0n) >= 1n).map(eventFromItem)
+      if (events.length > 0) {
+        yield events
+      }
+    }
+  }
+
+  /**
+   * Each entity's head, folded from a key-only Scan of the whole log: the larger of its highest
+   * event sort key and its snapshot's `eventSeq`. Head items are derived from the log, not part of
+   * it, so they don't count.
+   */
+  async entityHeads(entityType?: string, options?: CallOptions): Promise<Map<string, bigint>> {
+    options?.signal?.throwIfAborted()
+    const request = requestOptions(options)
+    const heads = new Map<string, bigint>()
+    for await (const items of this.#enumerate('pk, sk, eventSeq', entityType, request)) {
+      for (const item of items) {
+        const pk = item['pk']
+        const sk = sortKey(item)
+        if (pk === undefined || !('S' in pk) || sk === undefined || sk < 0n) {
+          continue
+        }
+
+        const seq = item['eventSeq']
+        const head = sk > 0n ? sk : seq !== undefined && 'N' in seq ? BigInt(seq.N) : 0n
+        if (head > (heads.get(pk.S) ?? 0n)) {
+          heads.set(pk.S, head)
+        }
+      }
+    }
+
+    return heads
   }
 
   async commit(commit: Commit, options?: CallOptions): Promise<void> {
@@ -1429,6 +1481,39 @@ export class DynamoRepository implements OutcomeRepository, StoreInitializer {
     }
 
     return false
+  }
+
+  // The pages of a Scan of the log outside the reserved namespaces, narrowed to an entity type.
+  async *#enumerate(
+    projection: string | undefined,
+    entityType: string | undefined,
+    request: RequestOptions,
+  ): AsyncGenerator<Item[]> {
+    const values: Item = {':system': {S: 'SYSTEM#'}, ':outcome': {S: 'command-outcome#'}}
+    let filter = 'NOT begins_with(pk, :system) AND NOT begins_with(pk, :outcome)'
+    if (entityType !== undefined) {
+      filter += ' AND entityType = :et'
+      values[':et'] = {S: entityType}
+    }
+
+    let start: Item | undefined
+    do {
+      // Checked between pages too, so a client that ignores the signal still stops.
+      request.abortSignal?.throwIfAborted()
+      const page: Page = await this.#client.scan(
+        {
+          TableName: this.#table,
+          ConsistentRead: this.#consistentRead,
+          FilterExpression: filter,
+          ExpressionAttributeValues: values,
+          ...(projection !== undefined && {ProjectionExpression: projection}),
+          ...(start && {ExclusiveStartKey: start}),
+        },
+        request,
+      )
+      yield ((page.Items ?? []) as Item[]).filter((item) => !reservedItem(item))
+      start = page.LastEvaluatedKey as Item | undefined
+    } while (start !== undefined)
   }
 
   async *#scan(projection: string, request: RequestOptions): AsyncGenerator<Item[]> {

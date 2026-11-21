@@ -134,7 +134,8 @@ export interface Repository {
    * compare-and-set): the row must exist, be the owner's, and hold exactly those bytes, or the
    * commit fails with a `ProjectorOperationError`. Absent means it doesn't, and the journal refuses
    * to commit through it, so a backend that ignored the condition cannot write a counter
-   * unconditionally. `MemRepository` and `DynamoRepository` return true. A wrapper must forward it.
+   * unconditionally. `MemRepository` and `DynamoRepository` return true, and `PgRepository` does
+   * with its views table. A wrapper must forward it.
    */
   appliesExpectedPayload?(): boolean
 

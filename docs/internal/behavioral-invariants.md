@@ -815,8 +815,11 @@ transaction as the events. The byte-level rules are in the
   writer without the views table (Go's, and Rust's or TypeScript's with a view writer or none)
   refuses a store that declares it on commits, snapshot writes and compaction, so a store's views
   never split across two tables. Initialization still succeeds on such a store.
-- TypeScript doesn't apply the expected-payload condition or write rebuild views on PostgreSQL yet;
-  Rust does both on the views table.
+- With the views table, and only with it, the engine's expected payload (the journal's counter) is a
+  compare-and-set: `UPDATE ... WHERE pk, sk, entity_id = owner AND payload = expected`, and no row
+  fails the condition (`appliesExpectedPayload()` / `applies_expected_payload()` is true). Through a
+  view writer it is refused with `invalidViewOperation` / `InvalidViewOperation` before any write.
+- TypeScript doesn't write rebuild views on PostgreSQL yet; Rust does on the views table.
 
 ## Journal (X1, Rust-first)
 
@@ -1069,7 +1072,8 @@ DESC LIMIT n`. The in-memory backend walks its stream backwards.
   `CompactBelow` (which writes no new rows but is refused all the same). TypeScript throws a
   `ReservedEntityIdError` from `commit`, `putSnapshot` and `compactBelow`.
 - Enumeration (`StreamAllEvents`/`StreamEntities`), entity heads (`StreamEntityHeads`), and rebuild
-  scans (`StreamEntitiesFromSnapshots`) skip every reserved partition. `ReservedNamespacePrefixes()` returns a copy; callers cannot
+  scans (`StreamEntitiesFromSnapshots`) skip every reserved partition (TypeScript:
+  `streamAllEvents`, `entityHeads`, `Store.streamEntities` and `Store.streamEntitiesFromSnapshots`). `ReservedNamespacePrefixes()` returns a copy; callers cannot
   change the authoritative namespace checks.
 - Entity IDs were never restricted before, so a pre-existing stream such as `SYSTEM#account` would
   disappear from enumeration after upgrading. Explicit event and snapshot reads by ID still

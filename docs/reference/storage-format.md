@@ -2854,7 +2854,7 @@ The continuity query, the floor query, and the two fence queries of earlier draf
 The snapshot upsert keeps its sequence-chain check. `entity_heads` reads the marker first: once `stream-heads`
 is declared it reads this table, and until then it keeps the aggregate over events and snapshots,
 because `EnsureSchema` creates the table empty on a populated v0.8 database and a head-aware
-process would otherwise report no entities (Go and Rust alike). Steps 3 to 5 of the migration
+process would otherwise report no entities (Go, Rust and TypeScript alike). Steps 3 to 5 of the migration
 are one transaction under the exclusive feature advisory lock: the per-stream maximum of `sequence`
 and `event_sequence` over both tables (skipping a maximum of 0), inserted `ON CONFLICT DO NOTHING`.
 A verification query that finds no stream whose row is missing or unequal to the derived head,
@@ -2987,8 +2987,8 @@ operation's owner is a stream: the engine's check (`InvalidViewOperation`) runs 
 pipeline, which the journal's counter operations do not go through. A counter write is a
 compare-and-set on the counter the commit read: `attribute_not_exists(pk)` when it read none,
 otherwise `entityID = :owner AND payload = :expected`, binding the exact payload it read (an
-engine-only view condition, crate-private, so projectors cannot set it. PostgreSQL refuses it
-until the [PostgreSQL views table](#postgresql-views-table) lands).
+engine-only view condition, crate-private, so projectors cannot set it. PostgreSQL applies it only
+with the [PostgreSQL views table](#postgresql-views-table), and refuses it through a view writer).
 A commit allocates a scope's positions from the counter it read, so the rows it writes are the
 positions above it. If any is taken, or the counter moved, the commit fails whole.
 The rows' `absent` conditions alone are not enough once [compaction](#journal-compaction) deletes
@@ -3716,9 +3716,9 @@ TypeScript. Implemented in Rust: the table and its DDL, the view repository (`Pg
 the commit target (`with_views_table()`) with the expected-payload condition, and the
 `postgres-views` marker feature. The conformance suites of commit-wide views, the expected payload,
 the view repository and the rebuild run on it. TypeScript implements the same table, view
-repository (`PgViewRepository`), commit target (`viewsTable: true`) and marker feature, without the
-expected-payload condition or rebuild view writes, which it doesn't model yet; its view repository
-and commit-wide view cases run on it. TypeScript differs only where storage can't see it: an
+repository (`PgViewRepository`), commit target (`viewsTable: true`) with the expected-payload
+condition, and marker feature, without rebuild view writes, which it doesn't model yet; its view
+repository, commit-wide view and expected-payload cases run on it. TypeScript differs only where storage can't see it: an
 encoding other than `UTF8` is `invalidArgument` (Rust `InvalidConfig`), its commit statements end in
 `RETURNING 1` where their row count decides the condition, and its batch read is one statement over
 all the keys.

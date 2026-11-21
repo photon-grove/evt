@@ -56,13 +56,12 @@ scenarios it supports, and `step --as go|rust` executes that language's steps of
 and stamps that language's name, so the streams match the fixtures unchanged. Each of its two
 passes has its own run ID and takes only those scenarios: the other language's driver writes its
 own steps of them, limited by `step -scenarios` (Go) or `--scenarios` (Rust), and Go, Rust and
-TypeScript verify them, then Go and Rust compare their enumerations. TypeScript verifies what each
+TypeScript verify them, then Go, Rust and TypeScript compare their enumerations (`enumerate`). TypeScript verifies what each
 backend stores, as Go does: the DynamoDB items and the SNS messages they publish, or the PostgreSQL
 event, snapshot and head rows, and the view rows. Its passes also run the exclusive scenarios it
 supports, after the interleaved ones, with it standing in. The other scenarios would only repeat the Go and Rust pass, and Moto
 copies a table for every action of a transaction, so a fuller table slows every pass: the
-TypeScript passes run first, while the tables are smallest. TypeScript doesn't join the
-enumeration check yet. Its driver refuses any `AWS_ENDPOINT_URL` or `DATABASE_URL` whose host
+TypeScript passes run first, while the tables are smallest. Its driver refuses any `AWS_ENDPOINT_URL` or `DATABASE_URL` whose host
 isn't a loopback address or a `.localhost` name, so a compose service name won't do.
 
 The live runs need the local stacks from [CONTRIBUTING.md](../CONTRIBUTING.md#integration-tests). Moon

@@ -80,6 +80,10 @@ export interface BuiltView {
  */
 export function buildViews(views: readonly ProjectedView[], writer: ViewWriter): BuiltView[] {
   return views.map((view) => {
+    const expected = view.op.expectedPayload
+    if (expected !== null && expected !== undefined) {
+      throw invalidView(view, 'a view writer cannot apply an expected payload')
+    }
     const statement = writer(view.op)
     if (typeof statement?.sql !== 'string' || statement.sql.trim() === '') {
       throw invalidView(view, 'the view writer returned an empty statement')
@@ -113,15 +117,21 @@ export function viewsTableStatements(table: string, views: readonly ProjectedVie
 
 function viewsTableStatement(table: string, view: ProjectedView): ViewStatement {
   const {op} = view
+  const expectedBytes = op.expectedPayload ?? null
   let payload: string
+  let expected: string | null = null
   try {
     payload = utf8Decode(op.payload, 'view payload')
+    if (expectedBytes !== null) {
+      expected = utf8Decode(expectedBytes, 'expected view payload')
+    }
     for (const [field, value] of [
       ['pk', op.pk],
       ['sk', op.sk],
       ['owner', op.owner],
       ['entity type', op.entityType],
       ['payload', payload],
+      ['expected payload', expected ?? ''],
     ] as const) {
       checkViewText(value, field)
     }
@@ -144,6 +154,17 @@ function viewsTableStatement(table: string, view: ProjectedView): ViewStatement 
   const row = [...key, op.entityType, payload]
   const columns = '(pk, sk, entity_id, entity_type, payload, ttl)'
   if (op.kind === 'put') {
+    // The engine's compare-and-set (the journal's counter): replace exactly the owner's row the
+    // commit read. No row means the row moved, was another owner's, or is gone.
+    if (expected !== null) {
+      return {
+        sql:
+          `UPDATE ${table} SET entity_type = $4, payload = $5, ttl = 0 ` +
+          'WHERE pk = $1 AND sk = $2 AND entity_id = $3 AND payload = $6 RETURNING 1',
+        args: [...row, expected],
+        returning: true,
+      }
+    }
     switch (op.condition) {
       // A plain insert: a violation of the key is the failed condition.
       case 'absent':
