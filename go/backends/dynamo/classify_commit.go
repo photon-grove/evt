@@ -43,6 +43,15 @@ func cancellationCodes(err error) []string {
 	return codes
 }
 
+// codeAt is the cancellation reason code of the item at index, or "" when there is none.
+func codeAt(codes []string, index int) string {
+	if index < 0 || index >= len(codes) {
+		return ""
+	}
+
+	return codes[index]
+}
+
 // conditionFailed reports whether the item at index failed its condition.
 func conditionFailed(codes []string, index int) bool {
 	return index >= 0 && index < len(codes) && codes[index] == "ConditionalCheckFailed"

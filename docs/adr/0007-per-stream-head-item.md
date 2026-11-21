@@ -226,7 +226,9 @@ unchanged: two writers of one stream still conflict (head condition, as the even
 and a fencing reader still conflict, and two readers that only fence the same stream conflict only
 while their transactions overlap, as they did on the slot and companion. Both fences of a pair
 used to be hot items, so the number of hot items per popular reference stream halves. `TransactionConflict`
-stays classified as a retryable conflict. There is no new hot partition: the head item is in the
+stays classified as a retryable conflict. (Superseded by
+[#288](https://github.com/photon-grove/evt/pull/288): a `TransactionConflict` is now transient,
+never a conflict.) There is no new hot partition: the head item is in the
 stream's own partition.
 
 One subtlety. A stream the commit fences and one it writes are different streams, so one transaction

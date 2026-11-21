@@ -421,7 +421,11 @@ error before any write and is never split.
   that stalls past the recovery window `Error::Transient` / `TransientError` (a backend's
   `Transient` stays retryable, a definitive `Backend` error is returned). An ordinary conflict
   of an outcome-bearing commit also re-reads the row once, so a lost race with the same command
-  returns the winner's outcome
+  returns the winner's outcome. A DynamoDB `TransactionConflict` on the outcome put (only another
+  attempt of the same command writes it, and it is still committing) polls the row instead, for
+  150 ms with the recovery backoff and never past the recovery window (Go and Rust; TypeScript
+  reads once for now); one on any other item reads it once. Absent, the transient error stands
+  and is never recorded
 - Only a genuinely indeterminate failure of an outcome-bearing commit is recovered — a timeout or
   cancelled context, a dispatch or connection failure, a truncated response, a 5xx or server fault,
   a connection dropped during PostgreSQL's `COMMIT` (Go `*AmbiguousWriteError`, Rust
@@ -444,6 +448,12 @@ error before any write and is never split.
   context detached from the caller's cancellation, for every indeterminate failure (including
   DynamoDB's `TransactionInProgressException`): a row that appears is resolved, and one still
   absent when the window ends is a retryable ambiguous write, never "not applied"
+- A DynamoDB commit never sets `ClientRequestToken`: the SDK fills in a fresh token per call and
+  resends it on its own retries, so an SDK retry that meets its own first attempt is
+  `TransactionInProgressException` (indeterminate) or success, never a `TransactionConflict`. A
+  per-command token would make a fence-aware retry, which resends the command ID with different
+  items, fail with `IdempotentParameterMismatchException` (indeterminate, so it would end as an
+  ambiguous write instead of running)
 - A concurrent same-ID, same-digest loser returns only the winner's stored outcome, never its own
   handler error or local decision
 - Outcome rows read from storage are validated (known status, digest, rejection/code consistency,

@@ -42,7 +42,7 @@ same streams today, and the TypeScript package is held to the same fixtures as i
 | --- | --- | --- |
 | **Rust** · [`photon-evt`](crates/evt/README.md) | `cargo add photon-evt` | Shipping, with the most features: the core, fenced rebuilds, the sync journal, and [`photon-evt-lambda`](crates/evt-lambda/README.md) for DynamoDB Streams |
 | **Go** · [`github.com/photon-grove/evt/go`](go/README.md) | `go get github.com/photon-grove/evt/go` | Shipping: the original module, with the core, fenced rebuilds and the `evt-doctor` CLI. The journal is Rust-only for now |
-| **TypeScript** · [`@photon-grove/evt`](packages/evt/README.md) | `npm install @photon-grove/evt` | Being ported in phases. The core, command outcomes, fence-aware retry and the in-memory backend are in. Multi-stream transactions, read fences and the DynamoDB and PostgreSQL backends are landing, and commit-wide projectors, rebuilds, views and the journal come after |
+| **TypeScript** · [`@photon-grove/evt`](packages/evt/README.md) | `npm install @photon-grove/evt` | Being ported in phases. The core, command outcomes, fence-aware retry and the in-memory backend are in. Multi-stream transactions, read fences and the DynamoDB and PostgreSQL backends are landing, and commit-wide projectors, rebuilds, views and the journal come after. The Lambda helpers are ported as [`@photon-grove/evt-lambda`](packages/evt-lambda/README.md), not yet on npm |
 
 The [feature matrix](docs/reference/feature-matrix.md) tracks every capability in each language,
 and a PR that changes one updates its row, so it describes the code on `main` rather than plans.
@@ -360,6 +360,7 @@ matrix.
 | [`crates/`](crates/) | `photon-evt`, `photon-evt-lambda`, and `evt-compat`, the cross-language test harness |
 | [`go/`](go/) | The Go module `github.com/photon-grove/evt/go`, tagged `go/vX.Y.Z` because Go requires that prefix for a module in a subdirectory |
 | [`packages/evt`](packages/evt/) | The TypeScript package `@photon-grove/evt`, with its fixture runner in `packages/evt-compat` |
+| [`packages/evt-lambda`](packages/evt-lambda/) | `@photon-grove/evt-lambda`, the TypeScript port of `photon-evt-lambda` |
 | [`compat/`](compat/) | Shared scenarios and golden fixtures that hold every language to the same bytes |
 | [`docs/`](docs/) | The guide, the reference, and the architecture decision records |
 | [`website/`](website/), [`packages/react-flow-diagrams`](packages/react-flow-diagrams/) | The docs site and the diagram package it uses |
