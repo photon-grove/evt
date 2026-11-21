@@ -16,6 +16,7 @@ import {
   CompactionUncoveredError,
   ConflictError,
   EvtError,
+  type CommitProjector,
   type FeatureManifest,
   FeatureManifestChangedError,
   FenceConflictError,
@@ -26,6 +27,7 @@ import {
   OutcomeConflictError,
   type OutcomeRepository,
   ProjectorOnlyCommitError,
+  ProjectionRebuild,
   ProjectorOperationError,
   type ProjectedView,
   RebuildInProgressError,
@@ -154,6 +156,12 @@ export async function conformance(
         () => entityHeads(repo),
       ],
     )
+  }
+  if (isRebuildFence(repo) && isEventLog(repo) && repo.writesViews?.() === true) {
+    cases.push([
+      'a projection rebuild writes the rows its projectors derive from the log, and settles',
+      () => projectionRebuild(repo),
+    ])
   }
   if (repo.appliesExpectedPayload?.() === true) {
     cases.push([
@@ -910,6 +918,93 @@ async function views(repo: Repository): Promise<void> {
     'views without an event',
     (error) => error instanceof ProjectorOnlyCommitError,
   )
+}
+
+// A small rebuild end to end: a current-state projector over every registered stream, one of them
+// compacted and seeded from its snapshot, and a history projector replaying another type. It takes
+// the store-wide rebuild lock, so it runs only where no other suite writes at the same time, and
+// leaves the fence settled.
+async function projectionRebuild(repo: Repository & EventLog & RebuildFence): Promise<void> {
+  const ns = namespace()
+  const [a, b, c] = [new Stream(ns, 'a'), new Stream(ns, 'b'), new Stream(ns, 'c', 'order')]
+  await a.commit(repo, a.events(1, 2), a.newSnapshot(1, '{"total":3}'))
+  await a.commit(repo, a.events(3, 3))
+  ensureEqual(await repo.compactBelow(a.id, 2n), 2, 'the compaction below the snapshot')
+  await b.commit(repo, b.events(1, 1))
+  await c.commit(repo, c.events(1, 2))
+
+  const totals = `${ns}-totals`
+  const history = `${ns}-history`
+  const current: CommitProjector = {
+    name: 'totals',
+    project: (commit) =>
+      commit.streams.map((stream) =>
+        putView(totals, stream.entityId, stream.entityId, stream.entityType, stream.state),
+      ),
+  }
+  const replayed: CommitProjector = {
+    name: 'history',
+    history: [c.entityType],
+    project: (commit) =>
+      commit.streams.map((stream) =>
+        putView(
+          history,
+          stream.entityId,
+          stream.entityId,
+          stream.entityType,
+          `{"events":${stream.events.length},"state":${new TextDecoder().decode(stream.state)}}`,
+        ),
+      ),
+  }
+
+  const before = await repo.rebuildGeneration()
+  ensure(before.value % 2n === 0n, 'the fence is settled before the rebuild')
+  const report = await new ProjectionRebuild(repo, {
+    projectors: [current, replayed],
+    aggregates: [ledger(ns), {aggregate: ledger(ns), entityType: c.entityType}],
+  }).run(`${ns}-rebuild`, 60_000)
+  ensureEqual(
+    report,
+    {entities: 3, commits: 2, puts: 4, deletes: 0, batches: 1, events: 2},
+    'the rebuild report',
+  )
+  ensureEqual(
+    await repo.rebuildGeneration(),
+    {value: before.value + 2n, forceReleased: false},
+    'the rebuild settled the generation',
+  )
+
+  // The in-memory repository reads its rows back.
+  const reader = repo as Partial<{view(pk: string, sk: string): {payload: Uint8Array} | null}>
+  if (typeof reader.view === 'function') {
+    const rows: [string, string, string][] = [
+      [totals, a.id, '{"total":6}'],
+      [totals, b.id, '{"total":1}'],
+      [totals, c.id, '{"total":3}'],
+      [history, c.id, '{"events":1,"state":{"total":3}}'],
+    ]
+    for (const [pk, sk, payload] of rows) {
+      const row = reader.view(pk, sk)
+      ensureEqual(row && new TextDecoder().decode(row.payload), payload, `the row ${pk}/${sk}`)
+    }
+  }
+
+  // On every backend the rows exist as their streams': another stream's write to one is refused,
+  // and the owner's own commit passes, since the fence is settled.
+  await expectError(
+    repo.commit({
+      entityId: b.id,
+      events: [b.event(2, 1)],
+      views: [handle(putView(totals, a.id, b.id, b.entityType, '{}'))],
+    }),
+    'an overwrite of a rebuilt row by another stream',
+    (error) => error instanceof ProjectorOperationError,
+  )
+  await repo.commit({
+    entityId: a.id,
+    events: [a.event(4, 4)],
+    views: [handle(putView(totals, a.id, a.id, a.entityType, '{"total":10}'))],
+  })
 }
 
 // Every batch the log yields, narrowed to the namespace's streams, checking that no batch is empty

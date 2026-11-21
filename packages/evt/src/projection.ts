@@ -10,6 +10,7 @@ import {
   EvtError,
   ProjectorError,
   ReservedViewKeyError,
+  SharedViewKeyError,
   ViewKeyTooLongError,
 } from './errors.js'
 import type {SerializedEvent} from './event.js'
@@ -255,8 +256,23 @@ export function projectViews(
     return []
   }
 
+  return projectWith(
+    projectors.map((projector, index) => ({index, projector})),
+    view,
+  )
+}
+
+/**
+ * Runs the given projectors, each with its index among the store's (or the rebuild's), over a
+ * commit view whether or not it carries events, with the checks of {@link projectViews}. Internal:
+ * a rebuild runs its current-state projectors over a view with a stream's state and no events.
+ */
+export function projectWith(
+  entries: readonly {readonly index: number; readonly projector: CommitProjector}[],
+  view: CommitView,
+): ProjectedView[] {
   const projected: ProjectedView[] = []
-  projectors.forEach((projector, projectorIndex) => {
+  for (const {index: projectorIndex, projector} of entries) {
     const history = projector.history ?? []
     const engine = isEngineProjector(projector)
     let operations: readonly ViewOperation[]
@@ -277,11 +293,46 @@ export function projectViews(
       }
       projected.push(item)
     })
-  })
+  }
 
   checkViews(projected)
 
   return projected
+}
+
+/**
+ * The rows a replay's operations leave: the last operation on each key, a put or a delete, keyed
+ * by `pk` then `sk` bytes. Conditions are never evaluated: a replay applies what the live commits
+ * wrote. Internal to the rebuild.
+ */
+export class ViewReplay {
+  readonly #last = new Map<string, ProjectedView>()
+
+  /**
+   * Applies one operation, or throws a {@link SharedViewKeyError} when another owner already
+   * wrote its row: the final row would then depend on an order the log doesn't keep.
+   */
+  apply(item: ProjectedView): void {
+    const {pk, sk, owner} = item.op
+    // A key no projector can make, since checkViews refuses the separator in both parts.
+    const key = `${pk}\0${sk}`
+    const first = this.#last.get(key)
+    if (first !== undefined && first.op.owner !== owner) {
+      throw new SharedViewKeyError(pk, sk, first.op.owner, owner)
+    }
+    this.#last.set(key, item)
+  }
+
+  /**
+   * The last operation on every key the replay touched, ascending by `pk` then `sk` bytes: a key
+   * whose last operation deleted it keeps the delete.
+   */
+  intoLast(): ProjectedView[] {
+    const items = [...this.#last.values()]
+    items.sort((a, b) => compareUtf8(a.op.pk, b.op.pk) || compareUtf8(a.op.sk, b.op.sk))
+
+    return items
+  }
 }
 
 /**

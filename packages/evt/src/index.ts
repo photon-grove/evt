@@ -47,8 +47,10 @@ export {
   type RebuildLease,
   type RebuildLock,
   type RebuildState,
+  acquiredFromSettled,
   checkRebuildOwner,
   checkRebuildViewBatch,
+  holdsRebuildBegun,
   holdsRebuildLock,
   isRebuildFence,
   observeRebuildEpoch,
@@ -57,6 +59,15 @@ export {
   rebuildLeaseSeconds,
   verifyRebuildEpoch,
 } from './rebuild-fence.js'
+export {
+  ProjectionRebuild,
+  type ProjectionRebuildOptions,
+  type RebuildAggregate,
+  type RebuildPlan,
+  type RebuildProgress,
+  type RebuildReport,
+  type RebuildRun,
+} from './rebuild.js'
 export {
   CommitTooLargeError,
   CompactionUncoveredError,
@@ -84,6 +95,7 @@ export {
   RebuildBeginIndeterminateError,
   RebuildConflictError,
   RebuildEpochChangedError,
+  RebuildFailure,
   RebuildInProgressError,
   RebuildLeaseLostError,
   RebuildLockHeldError,
@@ -94,6 +106,7 @@ export {
   ReservedViewKeyError,
   RetentionConflictError,
   SequenceGapError,
+  SharedViewKeyError,
   SnapshotError,
   StoreNotInitializedError,
   StreamHeadDriftError,

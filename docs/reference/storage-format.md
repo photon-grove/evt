@@ -699,13 +699,13 @@ projectors are recorded in the feature manifest's `historyDependent` set
   them (below), and their rebuild replays every commit grouped by `commitId`.
 
 State entry point (v0.9). *Not implemented in this release.* The design below is the target
-for the rebuild ports. No interface or entry point for it exists in either language, and nothing
+for the rebuild ports. No interface or entry point for it exists in any language, and nothing
 in the commit path uses it. Until it lands, Go rebuilds no durable view table of commit-wide
 projectors: its in-memory replay of history-dependent projectors (`GroupCommits` and
 `ReplayViews`) reproduces their rows, and a current-state projector's rows only with the caller
-supplying each commit's post-commit state. Rust's `ProjectionRebuild` rebuilds the views table of
-both kinds under the rebuild lock (see "The Rust projection rebuild" below), standing in for the
-state entry point with one view per stream. The target: every commit-wide projector
+supplying each commit's post-commit state. Rust's and TypeScript's `ProjectionRebuild` rebuild the
+views table of both kinds under the rebuild lock (see "The projection rebuild" below), standing in
+for the state entry point with one view per stream. The target: every commit-wide projector
 implements a second entry point alongside the per-commit one: the state entry point, called with a lookup by stream ID over
 the final state of every aggregate in scope and returning the projector's complete current row
 set. "Final state" is what a load at the head returns: the snapshot plus the events after it,
@@ -728,7 +728,8 @@ from several aggregates is not a function of any one of their snapshots) which i
 point takes the complete state.) Compaction never invalidates such a rebuild, and `CompactBelow`
 never refuses these entity types.
 
-The Rust projection rebuild (v0.9, `photon_evt::ProjectionRebuild`). It takes the rebuild lock
+The projection rebuild (v0.9, Rust's `photon_evt::ProjectionRebuild` and TypeScript's
+`ProjectionRebuild`, which leaves out Rust's diff mode and journal). It takes the rebuild lock
 ([Rebuild fence](#rebuild-fence)) for the whole run, so no commit lands and readers under the
 epoch check are fenced while it reads the log. It writes through the guarded writer in batches of
 at most 99 operations, renews the lease as it goes, and releases the lock at the end, which
@@ -738,7 +739,7 @@ write (`SharedViewKey`), a key planned twice (`DuplicateViewKey`), and an operat
 any batch (`CommitTooLarge`); batches hold at most 99 operations within the commit byte budget.
 Each operation is written without its condition or mapped error (a replay applies what the live
 commits wrote), so a rebuild runs over existing rows and is idempotent. By default it does not
-wipe: rows no projector produces any more stay until the caller deletes them. In diff mode
+wipe: rows no projector produces any more stay until the caller deletes them. In Rust's diff mode
 (`diff`) the run owns the rows of the row types it is given (the stored `entityType`, plus the
 journal's row and counter types when it rebuilds the journal). After planning it lists them, and
 writes a put only for a planned row that is missing or differs in owner, type, payload or TTL, a
@@ -751,7 +752,7 @@ of its key: the type listing may lag (DynamoDB's `entityType-index` is eventuall
 Every planned put must be of an owned type (`InvalidConfig` before any write), and nothing else
 may write an owned type, since the run deletes what it does not plan. It needs strongly consistent reads
 of the log, or a commit that landed just before the lock was taken can be missed. Given the
-journal's configuration (`with_journal`), the same run also rebuilds the [journal](#journal): it
+journal's configuration (`with_journal`, Rust only), the same run also rebuilds the [journal](#journal): it
 reads every event of the journal's entity types under the lock (each type read once, shared with
 the history replay), derives the rows and counters as the journal's rebuild does, checks their keys
 against the view rows (`SharedViewKey`, `DuplicateViewKey`), and writes them in the same guarded
@@ -789,11 +790,11 @@ sequence (the same pinned order as the commit's transaction), form one `CommitVi
 projector runs once per group, exactly as it did at commit time, with the state each stream had
 after that commit. The groups are applied in an order every stream agrees with: a commit that
 wrote a stream's sequence 3 precedes the commit that wrote its sequence 4, for every stream (Go
-`GroupCommits`, Rust `group_commits`. Commits that no stream relates come in the order of their
+`GroupCommits`, Rust `group_commits`, TypeScript `groupCommits`. Commits that no stream relates come in the order of their
 first event's stream ID bytes and sequence, which carries no meaning). Events whose commits cannot
 be ordered that way (a cycle) are not a log this engine wrote and fail with `CommitOrder`. The
 replay applies each operation to the rows, and refuses with `SharedViewKey` (Go
-`ReplayViews`, Rust `replay_views`) when two operations of different owner streams touch one row,
+`ReplayViews`, Rust `replay_views`, the TypeScript `ProjectionRebuild`'s replay) when two operations of different owner streams touch one row,
 because the final row would then depend on an order the log does not keep. Conditions are not
 evaluated in a replay: it applies what the live commits wrote. Nothing may have deleted the
 history, so compaction is forbidden for the entity types in the manifest's `historyDependent`
@@ -2176,7 +2177,7 @@ for the length of the write transaction, so a takeover (which must `UPDATE` or `
 row) blocks until the write transaction commits: the old worker either asserts the old owner
 and commits first, or waits and then fails the assertion against the new owner and aborts. A
 plain predicate read would hold no lock and leave exactly that window. A failed check aborts the
-rebuild worker in both languages. Nothing is ever written by a worker that no longer holds the
+rebuild worker in every language. Nothing is ever written by a worker that no longer holds the
 lock.
 
 The rows live in the reserved `SYSTEM#` namespace, skipped by enumeration, heads, and rebuild
@@ -2268,11 +2269,12 @@ reading the state, generation first: the lock holds the lease (same owner and fe
 the begin applied; or the generation has moved from `observed` without it, so the begin does not
 hold the lock and can never apply, because its condition named `observed` and the generation only
 grows; or the generation is still `observed` and the begin may still land. Go's
-`RebuildState.HoldsBegun` and Rust's `RebuildState::holds_begun` implement that rule. "The lock
+`RebuildState.HoldsBegun`, Rust's `RebuildState::holds_begun` and TypeScript's `holdsRebuildBegun`
+implement that rule. "The lock
 holds the lease" is exact only when the owner token is unique to the caller, because two
 concurrent begins under one token from the same generation produce the same lease. So Rust's
-`ProjectionRebuild::run` and `rebuild_with_lock` (whose owner token every journal rebuild shares)
-begin again only when the begin can no longer apply, and otherwise return the error. A
+`ProjectionRebuild::run` and `rebuild_with_lock` (whose owner token every journal rebuild shares),
+and TypeScript's `ProjectionRebuild.run`, begin again only when the begin can no longer apply, and otherwise return the error. A
 separate error rather than Rust's `Indeterminate` (or Go's `AmbiguousWriteError`), because those
 belong to outcome-carrying commits, which a store settles by re-reading the outcome row; a begin
 is settled from the lock row, and needs the fencing token it would have produced to do it.
@@ -2296,7 +2298,7 @@ force-release the owner alone (`:requestedOwner`) and puts the force-released it
 `:seenOdd` are numbers. Renew is one `UpdateItem` (not a transaction) on the lock item, as above.
 
 `Renew`, `End`, and `WriteViews` take the lease `Begin` returned (owner and generation. In Rust
-the `RebuildLease`), and fail with `RebuildLeaseLost` unless the lock row names that owner under
+and TypeScript the `RebuildLease`), and fail with `RebuildLeaseLost` unless the lock row names that owner under
 that generation. `Renew` returns the lease with its new expiry. It does not require the lease to be
 unexpired: an owner whose lease lapsed but whom no one has taken over may renew it. `End` runs
 the release transaction without reading first. A failed condition is `RebuildLeaseLost` as well. A

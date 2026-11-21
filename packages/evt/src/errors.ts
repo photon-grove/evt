@@ -4,6 +4,7 @@
 
 import type {Outcome} from './outcome.js'
 import type {ProjectedView} from './projection.js'
+import type {RebuildLease} from './rebuild-fence.js'
 
 /**
  * What went wrong:
@@ -72,6 +73,10 @@ import type {ProjectedView} from './projection.js'
  * - `historyDeclarationUnsupported`: a history-dependent projector needs its entity types declared
  *   in the store's feature manifest, and the repository has no `declareHistoryDependent`.
  * - `commitOrder`: stored commits have no order every stream agrees with.
+ * - `sharedViewKey`: a rebuild met one view row written for two different owner streams, whose
+ *   commits have no order the log keeps. Nothing was written.
+ * - `rebuildFailed`: a projection rebuild under a caller's lease failed. The rebuild's own error is
+ *   the `cause`, with how many guarded batches it attempted.
  * - `rebuildLockHeld`: another rebuild holds an unexpired lease on the rebuild lock.
  * - `rebuildLeaseLost`: the caller's rebuild lease no longer holds the lock: it was taken over,
  *   force-released or ended.
@@ -130,6 +135,8 @@ export type EvtErrorCode =
   | 'viewsUnsupported'
   | 'historyDeclarationUnsupported'
   | 'commitOrder'
+  | 'sharedViewKey'
+  | 'rebuildFailed'
   | 'rebuildLockHeld'
   | 'rebuildLeaseLost'
   | 'rebuildConflict'
@@ -914,6 +921,65 @@ export class CommitOrderError extends EvtError {
   }
 }
 
+/**
+ * A rebuild met one view row written for two different owner streams. Their commits have no
+ * order the log keeps, so a replay can't tell which write came last and refuses rather than guess.
+ */
+export class SharedViewKeyError extends EvtError {
+  override readonly name = 'SharedViewKeyError'
+  override readonly code = 'sharedViewKey'
+  readonly pk: string
+  readonly sk: string
+  /** The owner stream the rebuild met first. */
+  readonly first: string
+  /** The other owner stream. */
+  readonly second: string
+
+  constructor(pk: string, sk: string, first: string, second: string) {
+    super(
+      'sharedViewKey',
+      `view row ${JSON.stringify(pk)}/${JSON.stringify(sk)} is written for streams ` +
+        `${JSON.stringify(first)} and ${JSON.stringify(second)}, whose commits have no durable order`,
+    )
+    this.pk = pk
+    this.sk = sk
+    this.first = first
+    this.second = second
+  }
+}
+
+/**
+ * A projection rebuild under a caller's lease failed: its error (also the `cause`), and how far it
+ * got. The caller holds the lock and decides what to do with it: release it only when no write was
+ * attempted under the lease (`attempted` is 0 here, and the caller wrote nothing of its own) and
+ * its own begin acquired the lock from a settled generation (`acquiredFromSettled` over the
+ * generation read just before the begin). Otherwise keep it, because the rows may be half-written,
+ * until a rebuild completes. `isConflict` and `isRetryable` answer for its error.
+ */
+export class RebuildFailure extends EvtError {
+  override readonly name = 'RebuildFailure'
+  override readonly code = 'rebuildFailed'
+  /** Why the rebuild failed. */
+  readonly error: unknown
+  /**
+   * The guarded batches attempted, the failed one included: a write whose result is unknown may
+   * have applied. 0 means nothing was written.
+   */
+  readonly attempted: number
+  /** The batches the run planned to write; 0 when it failed before its plan was complete. */
+  readonly batches: number
+  /** The lease as the rebuild last renewed it, which the caller ends or keeps. */
+  readonly lease: RebuildLease
+
+  constructor(error: unknown, attempted: number, batches: number, lease: RebuildLease) {
+    super('rebuildFailed', messageOf(error), {cause: error})
+    this.error = error
+    this.attempted = attempted
+    this.batches = batches
+    this.lease = lease
+  }
+}
+
 function viewRef(view: ProjectedView): string {
   return (
     `projector ${JSON.stringify(view.projector)} (#${view.projectorIndex}) ` +
@@ -923,9 +989,13 @@ function viewRef(view: ProjectedView): string {
 
 /**
  * Whether an error is an optimistic-concurrency conflict: a `conflict`, a `sequenceGap` or a
- * `fenceConflict`.
+ * `fenceConflict`. A {@link RebuildFailure} answers for its error.
  */
 export function isConflict(error: unknown): boolean {
+  if (error instanceof RebuildFailure) {
+    return isConflict(error.error)
+  }
+
   return (
     error instanceof EvtError &&
     (error.code === 'conflict' || error.code === 'sequenceGap' || error.code === 'fenceConflict')
@@ -936,9 +1006,12 @@ export function isConflict(error: unknown): boolean {
  * Whether reloading and running the command again may succeed: after a conflict (a fence the
  * caller stamped excepted), while a rebuild holds the store, after the feature manifest changed
  * under the writer, after throttling, or after an ambiguous write, whose outcome check answers a
- * command that landed.
+ * command that landed. A {@link RebuildFailure} answers for its error.
  */
 export function isRetryable(error: unknown): boolean {
+  if (error instanceof RebuildFailure) {
+    return isRetryable(error.error)
+  }
   // A caller-stamped fence stays stale however often the command runs again.
   if (error instanceof FenceConflictError) {
     return error.provenance === 'engine'
