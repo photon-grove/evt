@@ -118,6 +118,49 @@ export function streamHeadsTable(tables: PgTables): string {
   return derived(tables.events, 'stream_heads')
 }
 
+/**
+ * The evt-owned views table (ADR 0008): `evt_events` yields `evt_events__evt_views`. Go keeps
+ * application-owned view tables, so {@link schemaDdl}, which every language runs, doesn't create
+ * it; {@link viewsDdl} does, as Rust's `views_ddl`.
+ */
+export function viewsTable(tables: PgTables): string {
+  return derived(tables.events, 'views')
+}
+
+/**
+ * The most UTF-8 bytes a view row's entity type, `pk` and `sk` may hold together in the views
+ * table. A btree index entry holds at most 2,704 bytes, less than DynamoDB's 2,048-byte `pk` plus
+ * 1,024-byte `sk`, so PostgreSQL refuses a longer key before writing.
+ */
+export const MAX_VIEW_INDEX_KEY_BYTES = 2600
+
+/** The most rows a page of the views table holds when the listing sets no limit. */
+export const MAX_VIEW_PAGE_ROWS = 1000
+
+/**
+ * The idempotent DDL of the views table and its indexes, byte for byte Rust's `views_ddl`:
+ * bytewise (`COLLATE "C"`) keys, so the primary key orders like DynamoDB's sort keys, an exact
+ * `text` payload, the entity-type index the entity-type listings read, and a partial `ttl` index
+ * for `purgeExpired`.
+ */
+export function viewsDdl(tables: PgTables): string {
+  const views = viewsTable(tables)
+
+  return `
+CREATE TABLE IF NOT EXISTS ${views} (
+    pk          text COLLATE "C" NOT NULL,
+    sk          text COLLATE "C" NOT NULL,
+    entity_id   text   NOT NULL,
+    entity_type text   NOT NULL,
+    payload     text   NOT NULL,
+    ttl         bigint NOT NULL DEFAULT 0,
+    PRIMARY KEY (pk, sk)
+);
+CREATE INDEX IF NOT EXISTS ${views}_type_idx ON ${views} (entity_type, pk, sk);
+CREATE INDEX IF NOT EXISTS ${views}_ttl_idx ON ${views} (ttl) WHERE ttl > 0;
+`
+}
+
 /** The entity-type index of the events table: `evt_events__evt_entity_type_idx`. */
 export function entityTypeIndex(tables: PgTables): string {
   return derived(tables.events, 'entity_type_idx')

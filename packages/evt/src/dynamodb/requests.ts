@@ -225,6 +225,9 @@ export function buildTransaction(
 const VIEW_ABSENT = 'attribute_not_exists(pk)'
 const VIEW_OWNED = 'attribute_not_exists(pk) OR entityID = :owner'
 const VIEW_PRESENT = 'attribute_exists(pk) AND entityID = :owner'
+// The engine's compare-and-set put (the journal's counter): the owner's row, holding exactly the
+// payload the writer read.
+const VIEW_EXPECTED_PAYLOAD = 'entityID = :owner AND payload = :expected'
 
 /**
  * The actions of view operations in `viewsTable`: a put writes the row's five attributes, and a
@@ -266,6 +269,17 @@ function viewAction(viewsTable: string, op: ViewOperation): TransactItem {
   }
   if (op.condition === 'absent') {
     return {Put: {TableName: viewsTable, Item: item, ConditionExpression: VIEW_ABSENT}}
+  }
+  const expected = op.expectedPayload
+  if (expected !== null && expected !== undefined) {
+    return {
+      Put: {
+        TableName: viewsTable,
+        Item: item,
+        ConditionExpression: VIEW_EXPECTED_PAYLOAD,
+        ExpressionAttributeValues: {...owner, ':expected': {S: viewDecoder.decode(expected)}},
+      },
+    }
   }
 
   return {

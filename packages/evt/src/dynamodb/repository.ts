@@ -179,6 +179,11 @@ export class DynamoRepository implements OutcomeRepository, StoreInitializer, Ev
     return true
   }
 
+  /** It applies a view put's expected-payload condition, in its views table. */
+  appliesExpectedPayload(): boolean {
+    return true
+  }
+
   /** The events table this repository writes. */
   get eventsTable(): string {
     return this.#table

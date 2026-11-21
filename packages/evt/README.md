@@ -27,7 +27,7 @@ builds a bank account aggregate with it, end to end.
 | `@photon-grove/evt/memory`   | `MemRepository` and `MemViewRepository`, for tests and local use           |
 | `@photon-grove/evt/testing`  | `scenario` and `Fixture`, the given/when/then helpers over `MemRepository` |
 | `@photon-grove/evt/dynamodb` | `DynamoRepository`, `viewProjector`, `DynamoViewRepository`, item codecs   |
-| `@photon-grove/evt/postgres` | `PgRepository`, its `ViewWriter`, and the schema: tables and `schemaDdl`   |
+| `@photon-grove/evt/postgres` | `PgRepository`, `PgViewRepository`, `ViewWriter`, the schema and its DDL   |
 
 ## DynamoDB
 
@@ -89,9 +89,19 @@ there for a deploy step that treats every backend alike. Every transaction runs 
 COMMITTED`, whatever the server's default. An abort is checked between statements and rolls the
 transaction back.
 
-evt defines no PostgreSQL view schema, so commit-wide projectors write to tables the application
-owns, through the `viewWriter` option, a function from a view operation to the statement that
-writes it, `{sql, args, keyConstraint}`, as Go's `WithViewWriter` takes. The statements run in the
+Commit-wide projectors write their views either to the evt-owned views table or to tables the
+application owns. With `viewsTable: true`, the commit writes them to `{events}__evt_views`, which
+`ensureSchema()` creates, as Rust's `with_views_table()` does: evt builds each statement with the
+DynamoDB repository's owner rules, counts it in the commit budget as its DynamoDB item, and
+refuses a key whose entity type, `pk` and `sk` are over 2600 bytes together (a
+`ViewKeyTooLongError`), which the table's btree indexes can't hold. The database must be `UTF8`.
+Before its first write the repository declares the `postgres-views` feature in the store's
+manifest, and from then on every writer without the views table refuses the store with an
+`UnsupportedFeatureError`, Go's included, so a store's views never split across two tables.
+`repository.viewRepository()` reads the rows back (see [Views](#views)).
+
+Otherwise the `viewWriter` option is a function from a view operation to the statement that
+writes it to the application's table, `{sql, args, keyConstraint}`, as Go's `WithViewWriter` takes. The statements run in the
 commit's transaction, after the events and before the snapshots, and the repository reads each
 condition from the statement's outcome, so the statements must store the row's owner and enforce
 it: a put with `condition: 'absent'` is a plain `INSERT` whose unique violation of the
@@ -103,8 +113,8 @@ statement returns, or the driver's `rowCount` (`affectedRows` on PGlite) when it
 and only its rows when it's marked `returning: true`, for a driver that reports no count.
 Any other error the database raises fails the commit with a `ProjectorOperationError` whose
 `reason` is the SQLSTATE, and each view counts in the commit budget as one action the size of its
-SQL text. Without a writer, a commit that carries view operations is refused with a
-`ViewsNotConfiguredError`.
+SQL text. A repository takes the views table or a writer, not both, and with neither, a commit
+that carries view operations is refused with a `ViewsNotConfiguredError`.
 
 ## Views
 
@@ -147,8 +157,15 @@ decodes it back; a row that doesn't decode throws a `ViewDecodeError` naming it,
 service reads must declare its properties in the Go struct's order, as for events. These writes are
 unconditional and part of no commit, so keep them to rows no commit-wide projector owns, and to
 rebuilds: a view is a projection, and every row must come back when the events are replayed.
-PostgreSQL has no view repository in Go, and Rust's `PgViewRepository` belongs to the PostgreSQL
-views table, which comes later.
+
+On PostgreSQL, `PgViewRepository` works on the views table, as Rust's does, and
+`repository.viewRepository()` returns the one a `PgRepository` writes to. Its keys order by bytes,
+as on DynamoDB, its payloads come back byte for byte, and its cursors are the DynamoDB ones, so a
+Rust process can continue a TypeScript listing. Every read sees every committed transaction,
+entity-type listings included, and a page without a `limit` holds at most 1000 rows. `putViews`
+writes its rows in one transaction, so unlike DynamoDB's batch it's atomic. Expired rows stay
+readable until `purgeExpired(now)` deletes them, since PostgreSQL has no TTL sweep. Go has no
+PostgreSQL view repository.
 
 ## Runtimes
 
@@ -191,8 +208,9 @@ of `AbortSignal`, which the DOM library, `@types/node`, and Bun's and Deno's typ
   it on the parsed JSON, losslessly. A stored version the upcasters don't bring to the declared one
   fails the load with a `ReplayError` rather than decoding into the wrong shape.
 - **The feature marker.** A store keeps one manifest of the features it uses. Every write path
-  refuses a store that declares a feature this package doesn't model (the journal, journal
-  compaction, the PostgreSQL views table) with an `UnsupportedFeatureError`, and compaction
+  refuses a store that declares a feature this package doesn't model (the journal and journal
+  compaction) with an `UnsupportedFeatureError`, a `PgRepository` without `viewsTable: true`
+  refuses one that declares the PostgreSQL views table (`postgres-views`), and compaction
   refuses an entity type the manifest declares history-dependent, which every repository's
   `declareHistoryDependent(types)` declares. `MemRepository` declares the required `stream-heads`
   feature on a fresh store's first write, and `initialize()` declares it up front.
@@ -214,19 +232,20 @@ of `AbortSignal`, which the DOM library, `@types/node`, and Bun's and Deno's typ
   operation's own `conflict` error as `mapped`. Operations are checked before any write (keys up to
   2048 and 1024 bytes, no key twice, none in the engine's journal partitions), and counted in the
   commit budget. `MemRepository` keeps the rows (`view`, `views`), `DynamoRepository` writes
-  them to its `viewsTable`, and `PgRepository` through its `viewWriter`. A projector that names a
-  `history` of entity types is history-dependent: it also gets the commit ID and the events of
-  those types, and the store declares them in its feature manifest's historyDependent set, once,
-  before the first commit that runs it, so compaction refuses them in every process. A repository
-  without `declareHistoryDependent` refuses it with `historyDeclarationUnsupported`.
-  `groupCommits` regroups stored events into the commits that wrote them.
+  them to its `viewsTable`, and `PgRepository` to its views table or through its `viewWriter`. A
+  projector that names a `history` of entity types is history-dependent: it also gets the commit
+  ID and the events of those types, and the store declares them in its feature manifest's
+  historyDependent set, once, before the first commit that runs it, so compaction refuses them in
+  every process. A repository without `declareHistoryDependent` refuses it with
+  `historyDeclarationUnsupported`. `groupCommits` regroups stored events into the commits that
+  wrote them.
 - **Enumeration.** Every repository is an `EventLog`: `streamAllEvents(filter)` walks the log in
   batches (one per entity in memory and on PostgreSQL, one per Scan page on DynamoDB), and
   `entityHeads(entityType)` reports each entity's head, the larger of its highest event sequence
   and what its snapshot covers. Neither yields a snapshot, a head item or an engine row in the
   `SYSTEM#` or `command-outcome#` namespaces, and both read the whole log on DynamoDB, so keep
   them to rebuilds and diagnostics. `store.streamEntities(aggregate)` folds each entity of the
-  aggregate's type from its events, as Go's `StreamEntities` does, and
+  aggregate's type from its events, as Rust's `stream_entities` does, and
   `store.streamEntitiesFromSnapshots(aggregate)` loads each from its snapshot and the events
   after it, so a compacted stream loads too. Both yield `{ok, entityId, loaded}`, or the entity's
   `error` and go on with the next.
@@ -274,6 +293,12 @@ of `AbortSignal`, which the DOM library, `@types/node`, and Bun's and Deno's typ
   and reads it back with `outcome()`, strongly consistent. `FaultRepository` in
   `@photon-grove/evt/testing` makes a commit apply and then fail, or fail without applying, to
   test recovery.
+- **Commit receipts.** The events `execute`, `executeWithOutcome`, `executeTransaction` and a
+  transaction's `commit` hand back are the events as the repository stored them, from its
+  receipt, by entity ID bytes then sequence. A repository that rewrites events as it commits
+  implements `commitWithReceipt` and `commitTransactionWithReceipt`, and a wrapper must forward
+  them. The root helpers of the same names call them, or commit and return the commit's own events
+  for a repository without them, as every backend here is.
 - **Sequences** are `bigint`s, because Go and Rust store them as 64-bit integers.
 
 Errors are `EvtError`s with a `code`. `isConflict` and `isRetryable` tell them apart.

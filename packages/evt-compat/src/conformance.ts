@@ -49,6 +49,8 @@ import {
   type EventLog,
   type StreamFilter,
   compareUtf8,
+  commitTransactionWithReceipt,
+  commitWithReceipt,
   defineAggregate,
   defineEvents,
   deleteView,
@@ -119,6 +121,10 @@ export async function conformance(
       ['a transaction built wrong is refused before any write', () => invalidTransactions(repo)],
       ['a transaction budgets its fences', () => transactionBudget(repo)],
       ['a store transaction fences what it reads and writes once', () => storeTransaction(repo)],
+      [
+        "a commit's receipt is its events as stored, on every path that hands them back",
+        () => commitReceipts(repo),
+      ],
     )
     if (fixtures) {
       cases.push([
@@ -141,6 +147,12 @@ export async function conformance(
         () => entityHeads(repo),
       ],
     )
+  }
+  if (repo.appliesExpectedPayload?.() === true) {
+    cases.push([
+      'an expected payload replaces exactly the row the commit read',
+      () => expectedPayload(repo),
+    ])
   }
   if (recordsOutcomes(repo)) {
     cases.push(
@@ -1020,6 +1032,84 @@ async function entityHeads(repo: Repository & EventLog): Promise<void> {
   ensure(!folded.has(emptied.id), 'a stream with no events left has nothing to fold')
 }
 
+// The engine's compare-and-set put, the journal's counter: it replaces the owner's row only while
+// that row holds exactly the expected bytes, and a failed expectation writes nothing. Each step's
+// success shows what the step before it stored.
+async function expectedPayload(repo: Repository): Promise<void> {
+  const ns = namespace()
+  const [owner, other] = [new Stream(ns, 'owner'), new Stream(ns, 'other')]
+  const pk = `${ns}-counter`
+  const put = (stream: Stream, payload: string, expected?: string): ProjectedView => {
+    const op = putView(pk, 'COUNTER', stream.id, 'journal-counter', payload, {
+      condition: expected === undefined ? 'absent' : 'none',
+    })
+    return expected === undefined
+      ? {projector: 'counter', projectorIndex: 0, operation: 0, op}
+      : expecting(op, encoder.encode(expected))
+  }
+  const commit = (stream: Stream, sequence: number, view: ProjectedView) =>
+    repo.commit({entityId: stream.id, events: [stream.event(sequence, 1)], views: [view]})
+
+  // The first counter is claimed with an absent put, as when the commit read none.
+  await commit(owner, 1, put(owner, '{"n":1}'))
+  // Expecting what is stored replaces it.
+  await commit(owner, 2, put(owner, '{"n":2}', '{"n":1}'))
+  // A stale expectation fails, and writes nothing.
+  await expectError(
+    commit(owner, 3, put(owner, '{"n":3}', '{"n":1}')),
+    'a stale payload',
+    conditionFailed,
+  )
+  ensureEqual((await repo.events(owner.id)).length, 2, 'the failed commit wrote no event')
+  await commit(owner, 3, put(owner, '{"n":3}', '{"n":2}'))
+
+  // Another stream cannot replace the row, even with the right payload.
+  await expectError(
+    commit(other, 1, put(other, '{"n":4}', '{"n":3}')),
+    'another owner',
+    conditionFailed,
+  )
+  // An expectation on a row that is not there fails.
+  const missing = put(owner, '{}', '{}')
+  await expectError(
+    commit(owner, 4, {...missing, op: {...missing.op, pk: `${ns}-missing`}}),
+    'an absent row',
+    conditionFailed,
+  )
+
+  // Built wrong, it's refused before any write.
+  const body = encoder.encode('{}')
+  for (const [what, view] of [
+    [
+      'with the absent condition',
+      expecting(putView(pk, 'x', owner.id, 't', '{}', {condition: 'absent'}), body),
+    ],
+    ['on a delete', expecting(deleteView(pk, 'x', owner.id), body)],
+    ['not UTF-8', expecting(putView(pk, 'x', owner.id, 't', '{}'), new Uint8Array([0xff]))],
+  ] as const) {
+    await expectError(
+      commit(owner, 4, view),
+      `an expected payload ${what}`,
+      coded('invalidViewOperation'),
+    )
+  }
+  ensureEqual((await repo.events(owner.id)).length, 3, 'the refused commits wrote no event')
+}
+
+function conditionFailed(error: unknown): boolean {
+  return error instanceof ProjectorOperationError && error.reason === 'ConditionalCheckFailed'
+}
+
+// A view operation of the `counter` projector that expects the stored payload.
+function expecting(op: ViewOperation, expected: Uint8Array): ProjectedView {
+  return {
+    projector: 'counter',
+    projectorIndex: 0,
+    operation: 0,
+    op: {...op, expectedPayload: expected},
+  }
+}
+
 // A view operation of the `handles` projector.
 function handle(op: ViewOperation, operation = 0): ProjectedView {
   return {projector: 'handles', projectorIndex: 0, operation, op}
@@ -1098,6 +1188,89 @@ async function storeTransaction(repo: TransactionalRepository): Promise<void> {
   )
   ensure(!isRetryable(caller), "a caller's fence conflict isn't retryable")
   ensureEqual((await repo.events(b)).length, 2, 'the stale commit wrote nothing to b')
+}
+
+// A commit's receipt is the events as stored: through the receipt helpers, which use the
+// repository's own receipt methods when it has them, and through every store and transaction path
+// that hands events back. Events compare as Rust's metadata does, by effective causation ID, which
+// a backend that stores the encoded JSON reads back filled in.
+async function commitReceipts(repo: TransactionalRepository): Promise<void> {
+  const ns = namespace()
+  const [a, b] = [new Stream(ns, 'a'), new Stream(ns, 'b')]
+
+  let receipt = await commitWithReceipt(repo, {entityId: a.id, events: a.events(1, 2)})
+  ensureEqual(receipt.events, await repo.events(a.id), 'a single-stream receipt')
+
+  // Given in the opposite order, returned in persisted order: entity ID bytes, then sequence.
+  receipt = await commitTransactionWithReceipt(repo, {
+    streams: [
+      {entityId: b.id, events: b.events(1, 1)},
+      {entityId: a.id, events: a.events(3, 3)},
+    ],
+  })
+  ensureEqual(
+    receipt.events,
+    [...(await repo.eventsAfter(a.id, 2n)), ...(await repo.events(b.id))],
+    'a multi-stream receipt',
+  )
+
+  // An empty commit stores nothing and returns nothing.
+  receipt = await commitTransactionWithReceipt(repo, {streams: []})
+  ensureEqual(receipt.events, [], "an empty transaction's receipt")
+
+  const type = outcomeLedger(ns)
+  const store = new Store(repo, {snapshotInterval: 0})
+  const [first, second] = [`${ns}-first`, `${ns}-second`]
+  const executed = await store.execute(type, first, {type: 'add', amount: 5})
+  ensure(executed.kind === 'committed', 'execute commits')
+  ensureEqual(
+    executed.kind === 'committed' ? executed.events : null,
+    await repo.events(first),
+    'Store.execute',
+  )
+
+  const tx = store.transaction()
+  const one = await tx.read(type, second)
+  const two = await tx.read(type, first)
+  tx.append(one, [added(1)]).append(two, [added(2)])
+  const committed = await tx.commit()
+  ensure(committed.kind === 'committed', 'the transaction commits')
+  ensureEqual(
+    committed.kind === 'committed' ? committed.events : null,
+    [...(await repo.eventsAfter(first, 1n)), ...(await repo.events(second))],
+    'Transaction.commit',
+  )
+
+  if (recordsOutcomes(repo)) {
+    const outcomes = outcomeStore(repo)
+    const recorded = await outcomes.executeWithOutcome(
+      type,
+      second,
+      {type: 'add', amount: 3},
+      {metadata: {commandId: `${ns}-receipt`}},
+    )
+    ensureEqual(
+      effective(recorded.events),
+      effective(await repo.eventsAfter(second, 1n)),
+      'Store.executeWithOutcome',
+    )
+    ensureEqual(
+      recorded.outcome.eventIds,
+      recorded.events.map((event) => event.id),
+      "the outcome lists the receipt's event IDs",
+    )
+  }
+}
+
+// Events with the causation ID the encoder writes: the one set, otherwise the command ID.
+function effective(events: readonly SerializedEvent[]): SerializedEvent[] {
+  return events.map((event) => ({
+    ...event,
+    metadata: {
+      ...event.metadata,
+      causationId: event.metadata.causationId ?? event.metadata.commandId,
+    },
+  }))
 }
 
 function fenceConflict(error: unknown, entityId: string, provenance: string): boolean {

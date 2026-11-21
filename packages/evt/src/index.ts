@@ -89,6 +89,8 @@ export {
 export {
   type FeatureManifest,
   type ManifestTexts,
+  POSTGRES_VIEWS_FEATURE,
+  POSTGRES_VIEWS_VERSION,
   STREAM_HEADS_FEATURE,
   STREAM_HEADS_VERSION,
   SUPPORTED_FEATURES,
@@ -153,6 +155,7 @@ export {
 export {
   type CallOptions,
   type Commit,
+  type CommitReceipt,
   type NewSnapshot,
   type NormalizedTransaction,
   type OutcomeRepository,
@@ -163,6 +166,8 @@ export {
   type TransactionCommit,
   type TransactionalRepository,
   commitAsTransaction,
+  commitTransactionWithReceipt,
+  commitWithReceipt,
   isReserved,
   normalizeTransaction,
 } from './repository.js'

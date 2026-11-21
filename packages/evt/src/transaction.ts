@@ -31,6 +31,7 @@ import {
   type ReadFence,
   type TransactionalRepository,
   checkNotReserved,
+  commitTransactionWithReceipt,
 } from './repository.js'
 import {
   commitSnapshot,
@@ -42,7 +43,6 @@ import {
 } from './staging.js'
 import type {CommitProjector, ProjectedView} from './projection.js'
 import type {ExecuteOptions, Loaded} from './store.js'
-import {compareUtf8} from './utf8.js'
 
 const MAX_INT64 = 2n ** 63n - 1n
 
@@ -119,12 +119,10 @@ export interface OutcomeCommitOptions extends CallOptions {
   response?: Uint8Array | null | undefined
 }
 
-// The commit a transaction builds: the written streams in read order, the fences, and the events
-// in the order the commit writes them.
+// The commit a transaction builds: the written streams in read order, and the fences.
 interface Prepared {
   readonly streams: Commit[]
   readonly fences: ReadFence[]
-  readonly events: SerializedEvent[]
   /** The commit-wide projectors' view operations over every written stream. */
   readonly views: ProjectedView[]
 }
@@ -403,13 +401,18 @@ export class Transaction {
       return {kind: 'duplicate', commandId}
     }
 
-    const {streams, fences, events, views} = this.#prepare(metadata)
-    if (events.length > 0) {
+    const {streams, fences, views} = this.#prepare(metadata)
+    // Only the streams that write events are prepared.
+    if (streams.length > 0) {
       await this.#context.declareHistory?.(options)
     }
-    await this.#context.repository.commitTransaction({streams, fences, views}, options)
+    const receipt = await commitTransactionWithReceipt(
+      this.#context.repository,
+      {streams, fences, views},
+      options,
+    )
 
-    return {kind: 'committed', events}
+    return {kind: 'committed', events: [...receipt.events]}
   }
 
   /**
@@ -517,7 +520,7 @@ export class Transaction {
     }))
     fences.push(...this.#callerFences())
 
-    return this.#record(pending, outcome, {streams: [], fences, events: [], views: []}, options)
+    return this.#record(pending, outcome, {streams: [], fences, views: []}, options)
   }
 
   /**
@@ -546,15 +549,15 @@ export class Transaction {
   ): Promise<CommandOutcome> {
     const config = this.#outcomeConfig()
     const repository = this.#context.repository as OutcomeRepository
-    const {streams, fences, events, views} = prepared
+    const {streams, fences, views} = prepared
 
     // Declared before the commit is sent, so a failed declaration is never settled as the commit's.
-    if (events.length > 0) {
+    if (streams.length > 0) {
       await this.#context.declareHistory?.(options)
     }
     try {
-      return await recordCommit(repository, pending, config, outcome, events, () =>
-        repository.commitTransaction({streams, fences, views, outcome}, options),
+      return await recordCommit(repository, pending, config, outcome, () =>
+        commitTransactionWithReceipt(repository, {streams, fences, views, outcome}, options),
       )
     } catch (error) {
       // Only the caller knows what it read, so a stale fence of its own is the command's answer.
@@ -650,10 +653,6 @@ export class Transaction {
     }
     fences.push(...this.#callerFences())
 
-    // Sorted apart from what the repository is given, which stays in read order.
-    const written = [...commits]
-    written.sort((a, b) => compareUtf8(a.entityId, b.entityId))
-
     const views = projectStreams(
       this.#context.commitProjectors ?? [],
       this.#context.repository,
@@ -673,7 +672,7 @@ export class Transaction {
       ),
     )
 
-    return {streams: commits, fences, events: written.flatMap((commit) => commit.events), views}
+    return {streams: commits, fences, views}
   }
 
   // Every stream the client expected at a head other than the one this transaction read.
