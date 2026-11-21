@@ -19,6 +19,8 @@ import {
 } from '@photon-grove/evt'
 import {
   DynamoRepository,
+  DynamoViewRepository,
+  ENTITY_TYPE_INDEX,
   type Item,
   eventItem,
   headFromItem,
@@ -37,6 +39,7 @@ import {
   markerConformance,
 } from './conformance.js'
 import {Checks, canonical} from './harness.js'
+import {viewRepositoryConformance} from './view-conformance.js'
 
 // Only a local emulator: a loopback address or a .localhost name.
 const endpoint = process.env['AWS_ENDPOINT_URL'] ?? ''
@@ -84,6 +87,7 @@ try {
   await initialization(created)
   await retention(created)
   await views(created)
+  await viewRepository(created)
 } finally {
   await Promise.all(created.map(deleteTable))
 }
@@ -308,6 +312,59 @@ async function views(tables: string[]): Promise<void> {
 
     await refuses(commit(2, '{"n":9}'), ConflictError, 'a commit that lost the race')
     ensure(canonical(await row()) === canonical(want), "the refused commit's row wasn't written")
+  })
+}
+
+// The view repository against a views table shaped like infra/local's: string pk and sk, and the
+// entityType-index the entity-type listings query.
+async function viewRepository(tables: string[]): Promise<void> {
+  const viewsTable = `evt-ts-view-repository-${run}`
+  await client.createTable({
+    TableName: viewsTable,
+    BillingMode: 'PAY_PER_REQUEST',
+    AttributeDefinitions: [
+      {AttributeName: 'pk', AttributeType: 'S'},
+      {AttributeName: 'sk', AttributeType: 'S'},
+      {AttributeName: 'entityType', AttributeType: 'S'},
+    ],
+    KeySchema: [
+      {AttributeName: 'pk', KeyType: 'HASH'},
+      {AttributeName: 'sk', KeyType: 'RANGE'},
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: ENTITY_TYPE_INDEX,
+        KeySchema: [{AttributeName: 'entityType', KeyType: 'HASH'}],
+        Projection: {ProjectionType: 'ALL'},
+      },
+    ],
+  })
+  tables.push(viewsTable)
+
+  const reader = new DynamoViewRepository(client, viewsTable)
+  await viewRepositoryConformance(checks, 'dynamodb', reader)
+
+  await checks.case('dynamodb views: the row a commit projected is read back', async () => {
+    const table = await freshTable(tables)
+    await new DynamoRepository(client, table).initialize()
+    const repo = new DynamoRepository(client, table)
+    const projector = viewProjector<unknown>(viewsTable)
+    const events = [ledgerEvent('views-a', 1)]
+    const group = projector.project({
+      entityType: 'ledger-views',
+      entityId: 'views-a',
+      state: null,
+      encodedState: new TextEncoder().encode('{"n":1}'),
+      events,
+    })
+    await repo.commit({entityId: 'views-a', events, projections: [group!]})
+
+    const stored = await reader.getView('ledger-views#views-a')
+    ensure(stored !== null, 'the committed row')
+    ensure(stored.entityId === 'views-a', 'the owner is the stream')
+    ensure(new TextDecoder().decode(stored.payload) === '{"n":1}', 'the state')
+    const listed = await reader.listViewsByEntityType('ledger-views')
+    ensure(listed.length === 1 && listed[0]!.pk === stored.pk, 'listed by entity type')
   })
 }
 

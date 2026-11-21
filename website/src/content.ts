@@ -1,22 +1,85 @@
 export const repoUrl = 'https://github.com/photon-grove/evt'
 
-// Lang is the language the reader picked; every code sample on the landing page has both.
-export type Lang = 'go' | 'rust'
+export const npmUrl = 'https://www.npmjs.com/package/@photon-grove/evt'
 
-export const langs: {id: Lang; label: string}[] = [
-  {id: 'rust', label: 'Rust'},
-  {id: 'go', label: 'Go'},
+// Lang is the language the reader picked; every code sample on the landing page has one per
+// language, or a note saying the feature hasn't reached that language yet.
+export type Lang = 'go' | 'rust' | 'ts'
+
+export const langs: {id: Lang; label: string; short: string; ext: string}[] = [
+  {id: 'rust', label: 'Rust', short: 'Rust', ext: 'rs'},
+  {id: 'go', label: 'Go', short: 'Go', ext: 'go'},
+  {id: 'ts', label: 'TypeScript', short: 'TS', ext: 'ts'},
 ]
+
+export function langExt(lang: Lang): string {
+  return langs.find((option) => option.id === lang)?.ext ?? lang
+}
 
 export type PerLang<T> = Record<Lang, T>
 
 export const installCommand: PerLang<string> = {
   rust: 'cargo add photon-evt --features dynamodb',
   go: 'go get github.com/photon-grove/evt/go',
+  ts: 'npm install @photon-grove/evt',
 }
 
+// One card per implementation: what it is, where it's published, and how far along it is. The
+// status line has to agree with the feature matrix (docs/reference/feature-matrix.md).
+export interface Implementation {
+  lang: Lang
+  name: string
+  registry: string
+  href: string
+  status: 'stable' | 'porting'
+  statusLabel: string
+  body: string
+}
+
+export const implementations: Implementation[] = [
+  {
+    lang: 'rust',
+    name: 'photon-evt',
+    registry: 'crates.io',
+    href: 'https://crates.io/crates/photon-evt',
+    status: 'stable',
+    statusLabel: 'Shipping · most features',
+    body: 'The core, fenced rebuilds, the sync journal, and photon-evt-lambda for DynamoDB Streams handlers.',
+  },
+  {
+    lang: 'go',
+    name: 'github.com/photon-grove/evt/go',
+    registry: 'pkg.go.dev',
+    href: 'https://pkg.go.dev/github.com/photon-grove/evt/go',
+    status: 'stable',
+    statusLabel: 'Shipping',
+    body: 'The original module, with transactions, outcomes, fenced rebuilds and the evt-doctor CLI. The sync journal is Rust-only for now.',
+  },
+  {
+    lang: 'ts',
+    name: '@photon-grove/evt',
+    registry: 'npm',
+    href: npmUrl,
+    status: 'porting',
+    statusLabel: 'Being ported',
+    body: 'A third native implementation, built in phases. The core, command outcomes and retry are in, transactions and the durable backends are landing, and projectors, rebuilds and views come next.',
+  },
+]
+
+// The shared golden fixtures under compat/fixtures, and the language that generates each.
+export const fixtures: {file: string; writer: 'Go' | 'Rust'}[] = [
+  {file: 'codec.json', writer: 'Go'},
+  {file: 'scenarios.json', writer: 'Go'},
+  {file: 'outcomes.json', writer: 'Go'},
+  {file: 'feature-marker.json', writer: 'Go'},
+  {file: 'views.json', writer: 'Go'},
+  {file: 'journal.json', writer: 'Rust'},
+  {file: 'lambda.json', writer: 'Rust'},
+]
+
 // The quick start is the root README's counter example, trimmed to its moving parts. The README's
-// copies run in CI (go/internal/docexamples and the photon-evt doctests), so keep these in step.
+// Go and Rust copies run in CI (go/internal/docexamples and the photon-evt doctests), so keep these
+// in step. The TypeScript one is the README's TypeScript counter.
 export const quickStart: PerLang<{file: string; code: string}> = {
   go: {
     file: 'counter.go',
@@ -73,17 +136,45 @@ let store = Store::<Counter, _>::new(MemRepository::new(), ());
 let executed = store.execute("counter-1", 2, Metadata::new("us-west-2")).await?;
 assert_eq!(executed.state.aggregate().total, 2);`,
   },
+  ts: {
+    file: 'counter.ts',
+    code: `const counterEvents = defineEvents({
+  'counter:incremented': {version: 1, codec: json<{by: number}>()},
+})
+
+const counter = defineAggregate({
+  type: 'counter',
+  events: counterEvents,
+  state: json<{total: number}>(),
+  initial: () => ({total: 0}),
+
+  handle: (_state, by: number) => ({
+    kind: 'accept',
+    events: [{type: 'counter:incremented', data: {by}}],
+  }),
+
+  apply: (state, event) => ({total: state.total + event.data.by}),
+})
+
+const store = new Store(new MemRepository()) // DynamoDB or PostgreSQL in production
+await store.execute(counter, 'counter-1', 2)
+
+const loaded = await store.load(counter, 'counter-1')
+// loaded.state.total === 2, loaded.sequence === 1n`,
+  },
 }
 
 // One stop on the concepts tour: what the piece does, why it matters, and the code for it. The
-// snippets are trimmed from go/examples/banking, crates/evt/examples, and the guides.
+// snippets are trimmed from go/examples/banking, crates/evt/examples, packages/evt/examples and the
+// guides. A language that doesn't have the piece yet gets a note instead of code.
 export interface TourStop {
   id: string
   title: string
   tagline: string
   body: string
   doc: string
-  code: PerLang<string>
+  code: Partial<PerLang<string>>
+  pending?: Partial<PerLang<string>>
 }
 
 export const tour: TourStop[] = [
@@ -114,6 +205,14 @@ export const tour: TourStop[] = [
         AccountEvent::Withdrawn(e) => self.balance -= e.amount,
     }
 }`,
+      ts: `apply(state, event) {
+  switch (event.type) {
+    case 'bank_account.opened':
+      return {id: event.data.accountId, balance: event.data.balance, opened: true}
+    case 'bank_account.money_deposited':
+      return {...state, balance: state.balance + event.data.amount}
+  }
+},`,
     },
   },
   {
@@ -151,6 +250,27 @@ export const tour: TourStop[] = [
         // ...
     }
 }`,
+      ts: `handle(state, command: AccountCommand) {
+  switch (command.type) {
+    case 'open':
+      if (state.opened) {
+        return reject('already-opened', 'account already opened')
+      }
+      return accept({
+        type: 'bank_account.opened',
+        data: {accountId: command.accountId, balance: command.initialBalance},
+      })
+
+    case 'deposit':
+      if (!state.opened) {
+        return reject('not-opened', 'account not opened')
+      }
+      return accept({
+        type: 'bank_account.money_deposited',
+        data: {accountId: state.id, amount: command.amount},
+      })
+  }
+},`,
     },
   },
   {
@@ -177,6 +297,14 @@ let outcome = store
     .await?;
 // a racing writer gets Error::Conflict, never a silent overwrite;
 // a retry with "cmd-7f3a" returns the stored outcome (outcome.replayed)`,
+      ts: `const repository = new DynamoRepository(new DynamoDB({}), 'event-log')
+const store = new Store(repository, {outcomes: true, snapshotInterval: 25})
+
+// account defines identify(command), which the outcome's identity digest covers
+const {outcome, replayed} = await store.executeWithOutcome(account, 'acct-1',
+  {type: 'deposit', amount: 50}, {metadata: {commandId: 'cmd-7f3a'}})
+// a racing writer is retried from a fresh load, never silently overwritten;
+// a retry with "cmd-7f3a" returns the stored outcome (replayed === true)`,
     },
   },
   {
@@ -219,12 +347,15 @@ store := snapshots.NewStore(repo, 25).WithCommitProjectors(directory{})`,
 
 let store = Store::<Account, _>::new(repository, ()).with_commit_projector(Arc::new(Directory));`,
     },
+    pending: {
+      ts: 'Commit-wide projectors are the next piece of the TypeScript port. Until they land, an aggregate can list in-band projectors such as viewProjector(\'views\'), which put its own view row in the commit.',
+    },
   },
   {
     id: 'derived',
     title: 'Rebuild and sync',
     tagline: 'Derived state you can throw away',
-    body: 'Views are derived, so the log can reproduce them. In Rust, the sync journal hands each scope an ordered, gap-checked feed for realtime clients. In Go, RebuildProjections replays the log into per-entity views behind a rebuild fence; the Rust port is in progress.',
+    body: 'Views are derived, so the log can reproduce them. Rust\'s ProjectionRebuild rebuilds commit-wide views behind a rebuild fence that keeps commits out until they settle, and Go\'s RebuildProjections does the same for per-entity views. In Rust, the sync journal also hands each scope an ordered, gap-checked feed for realtime clients.',
     doc: 'guide/projections',
     code: {
       go: `lease, err := fence.Begin(ctx, owner, 10*time.Minute) // fence out writers and readers
@@ -243,6 +374,9 @@ loop {
         break; // caught up with repository.high_watermark(&scope)
     }
 }`,
+    },
+    pending: {
+      ts: 'Rebuilds and the sync journal haven\'t reached TypeScript yet. Rebuilds come with the projectors, and the journal after them. The feature matrix tracks both.',
     },
   },
 ]
@@ -289,6 +423,7 @@ export const capabilities: ContentCard[] = [
   {
     icon: 'view',
     title: 'Commit-wide projectors',
+    tag: 'Rust · Go',
     body: 'View rows commit in the same transaction as the events that caused them, at any key, across every stream the commit touched.',
     doc: 'guide/projections',
   },
@@ -315,15 +450,15 @@ export const capabilities: ContentCard[] = [
   {
     icon: 'fence',
     title: 'Fenced rebuilds',
-    tag: 'Go',
-    body: 'RebuildProjections replays the log into per-entity views while a rebuild fence keeps writers out and tells readers when the views are settled. The Rust port is in progress.',
+    tag: 'Rust · Go',
+    body: 'Replay the log into fresh view rows while a rebuild fence keeps commits out and tells readers when the views have settled.',
     doc: 'guide/projections',
   },
   {
     icon: 'compat',
-    title: 'Rust and Go, one format',
-    body: 'Both languages read and write the same bytes, checked by golden fixtures and live interleaved runs against each backend.',
-    doc: 'reference/feature-matrix',
+    title: 'Three languages, one format',
+    body: 'Go and Rust write the same bytes, checked by golden fixtures and live interleaved runs. TypeScript is held to the same fixtures as it is built.',
+    doc: 'reference/storage-format',
   },
 ]
 
@@ -362,6 +497,7 @@ export interface PackageEntry {
 }
 
 const pkgGo = 'https://pkg.go.dev/github.com/photon-grove/evt/go'
+const pkgTs = `${repoUrl}/blob/main/packages/evt/README.md`
 
 export const packages: PerLang<PackageEntry[]> = {
   go: [
@@ -383,17 +519,31 @@ export const packages: PerLang<PackageEntry[]> = {
     {name: 'feature testing', body: 'Given/when/then helpers over MemRepository, plus the conformance fixtures.', href: 'https://docs.rs/photon-evt'},
     {name: 'photon-evt-lambda', body: 'DynamoDB Streams decode, event-source filters, journal wake-ups and partial-batch failures.', href: 'https://docs.rs/photon-evt-lambda'},
   ],
+  ts: [
+    {name: '@photon-grove/evt', body: 'Aggregates, codecs, upcasters, the Store, transactions, command outcomes, retry and the wire codecs.', href: `${pkgTs}#the-model`},
+    {name: '/memory', body: 'MemRepository, the in-memory backend for tests and local development.', href: `${pkgTs}#entry-points`},
+    {name: '/testing', body: 'scenario and Fixture, the given/when/then helpers over MemRepository.', href: `${pkgTs}#testing`},
+    {name: '/dynamodb', body: 'DynamoRepository on the AWS SDK\'s low-level client, and viewProjector.', href: `${pkgTs}#dynamodb`},
+    {name: '/postgres', body: 'PgRepository on any pg-shaped pool, and the schema it creates.', href: `${pkgTs}#postgresql`},
+  ],
 }
 
 export interface ExampleEntry {
   title: string
   body: string
-  lang: 'Go' | 'Rust'
+  lang: 'Go' | 'Rust' | 'TypeScript'
   command: string
   href: string
 }
 
 export const examples: ExampleEntry[] = [
+  {
+    title: 'Getting started',
+    lang: 'Rust',
+    body: 'The guide\'s bank account: domain_events!, an aggregate with typed rejections, command outcomes, and given/when/then tests.',
+    command: 'cargo run -p photon-evt --example getting_started --features testing',
+    href: `${repoUrl}/blob/main/crates/evt/examples/getting_started.rs`,
+  },
   {
     title: 'Banking',
     lang: 'Rust',
@@ -442,6 +592,13 @@ export const examples: ExampleEntry[] = [
     body: 'Debit one account and credit another in one commit, replay a retry from its stored outcome, and store an overdraft as a rejection.',
     command: 'go -C go run ./examples/transfer',
     href: `${repoUrl}/tree/main/go/examples/transfer`,
+  },
+  {
+    title: 'Getting started',
+    lang: 'TypeScript',
+    body: 'The guide\'s bank account: events, an aggregate that accepts or rejects, a store over MemRepository, and given/when/then tests.',
+    command: 'pnpm -C packages/evt build && node packages/evt/examples/getting-started.ts',
+    href: `${repoUrl}/blob/main/packages/evt/examples/getting-started.ts`,
   },
 ]
 

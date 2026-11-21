@@ -17,6 +17,12 @@ describe('titleFromMarkdown', () => {
     expect(titleFromMarkdown('# Projections and Rebuilds\n\nbody')).toBe('Projections and Rebuilds')
   })
 
+  it('drops inline-code backticks', () => {
+    expect(titleFromMarkdown('# ADR 0009: TypeScript implementation (`@photon-grove/evt`)')).toBe(
+      'ADR 0009: TypeScript implementation (@photon-grove/evt)',
+    )
+  })
+
   it('ignores deeper headings and returns undefined when there is no H1', () => {
     expect(titleFromMarkdown('## Subsection\n\nbody')).toBeUndefined()
   })

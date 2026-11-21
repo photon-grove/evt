@@ -145,7 +145,7 @@ jobs:
 
       - name: Moon checks
         run: |
-          pnpm exec moon run evt:check evt:lint evt:test website:typecheck website:build react-flow-diagrams:test
+          pnpm exec moon run evt:check evt:lint evt:test website:typecheck website:build website:test react-flow-diagrams:test
 
   rust:
     name: Rust

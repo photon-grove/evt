@@ -133,7 +133,7 @@
   - Moon tests: `pnpm exec moon run evt:test`
   - Go vet/check: `pnpm exec moon run evt:check`
   - Go lint (golangci-lint, must report zero findings): `pnpm exec moon run evt:lint`
-  - Website typecheck/build: `pnpm exec moon run website:typecheck website:build`
+  - Website typecheck/build/tests: `pnpm exec moon run website:typecheck website:build website:test`
   - React diagram tests: `pnpm exec moon run react-flow-diagrams:test`
   - TypeScript (`@photon-grove/evt`): `pnpm exec moon run evt-ts:check evt-ts:test evt-ts:runtimes`
     (tsc, oxlint with `--deny-warnings`, the import check, Vitest, and the fixture runner on Node,
@@ -168,7 +168,7 @@
 - Use upstream `actions/cache` (currently `@v6`); do not introduce archived cache forks.
 - CI quality checks include:
   - From `go/`: `go mod tidy` with no `go.mod`/`go.sum` diff, `go vet ./...` and `go test ./...`.
-  - `pnpm exec moon run evt:check evt:lint evt:test website:typecheck website:build react-flow-diagrams:test`
+  - `pnpm exec moon run evt:check evt:lint evt:test website:typecheck website:build website:test react-flow-diagrams:test`
   - `pnpm exec moon run evt-rust:check evt-rust:test` (Rust job)
   - `pnpm exec moon run evt-ts:check evt-ts:test evt-ts:runtimes evt-lambda:check evt-lambda:test
     evt-lambda:runtimes`, then the fixture runners on Node 22.12 (TypeScript job)
