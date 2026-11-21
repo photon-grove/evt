@@ -20,6 +20,7 @@ import {
   emptyMetadata,
   encodeManifest,
   encodeMetadata,
+  deleteView,
   eventId,
   putView,
 } from '@photon-grove/evt'
@@ -291,27 +292,60 @@ async function postgresCases(): Promise<void> {
     },
   )
 
-  await checks.case('postgres: a writer may add RETURNING to its statements', async () => {
-    const repo = await freshLog(pool, returning)
-    const put = (entityId: string, owner: string) =>
-      repo.commit({
-        entityId,
-        events: [ledgerEvent(entityId, 1)],
-        views: [projected(putView('k', 'one', owner, 'ledger', `{"by":"${owner}"}`))],
-      })
-    await put('a', 'a')
-    await reason(put('b', 'b'), 'ConditionalCheckFailed', "an overwrite of another owner's row")
-  })
+  await checks.case(
+    'postgres: RETURNING statements serve a driver that reports no count',
+    async () => {
+      const repo = await freshLog(countless(), returning)
+      const put = (entityId: string, owner: string) =>
+        repo.commit({
+          entityId,
+          events: [ledgerEvent(entityId, 1)],
+          views: [projected(putView('k', 'one', owner, 'ledger', `{"by":"${owner}"}`))],
+        })
+      await put('a', 'a')
+      await reason(put('b', 'b'), 'ConditionalCheckFailed', "an overwrite of another owner's row")
+
+      const release = (sequence: number, op: ViewOperation) =>
+        repo.commit({entityId: 'a', events: [ledgerEvent('a', sequence)], views: [projected(op)]})
+      await release(2, deleteView('k', 'one', 'a', {condition: 'present'}))
+      const absent = deleteView('k', 'one', 'a', {condition: 'present'})
+      await reason(release(3, absent), 'ConditionalCheckFailed', 'a release of an absent row')
+      await release(3, deleteView('k', 'one', 'a'))
+      ensure((await repo.events('a')).length === 3, 'the held conditions committed')
+    },
+  )
 }
 
-// The compat view writer with RETURNING on its puts, which makes their count driver-independent: a
-// put that returns nothing failed.
+// The compat view writer with RETURNING on its puts and present deletes, which makes their count
+// driver-independent: one that returns nothing affected nothing.
 function returning(views: string): ViewWriter {
   const writer = postgresViewWriter(views)
 
   return (op) => {
     const statement = writer(op)
-    return op.kind === 'put' ? {...statement, sql: `${statement.sql} RETURNING 1`} : statement
+    const counted = op.kind === 'put' ? op.condition !== 'absent' : op.condition === 'present'
+    return counted
+      ? {...statement, sql: `${statement.sql} RETURNING 1`, returning: true}
+      : statement
+  }
+}
+
+// A driver's result with its rows alone.
+async function rowsOnly(result: Promise<{rows: unknown[]}>): Promise<{rows: unknown[]}> {
+  return {rows: (await result).rows}
+}
+
+// The pool as a driver that returns rows and reports no affected-row count.
+function countless(): PgClient {
+  return {
+    query: (text, values) => rowsOnly(pool.query(text, values)),
+    async connect() {
+      const connection = await pool.connect()
+      return {
+        query: (text: string, values?: unknown[]) => rowsOnly(connection.query(text, values)),
+        release: (error?: Error) => connection.release(error),
+      }
+    },
   }
 }
 

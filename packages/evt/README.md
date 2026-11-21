@@ -99,7 +99,8 @@ it: a put with `condition: 'absent'` is a plain `INSERT` whose unique violation 
 WHERE` the owner matches, which affects no row when it doesn't, a delete with `condition:
 'present'` must delete the owner's row, and any other delete reports the rows of another owner it
 found (`WITH gone AS (DELETE ...) SELECT 1 FROM ... WHERE owner <> $3`). The count is the rows a
-statement returns, or the driver's `rowCount` (`affectedRows` on PGlite) when it returns none.
+statement returns, or the driver's `rowCount` (`affectedRows` on PGlite) when it returns none,
+and only its rows when it's marked `returning: true`, for a driver that reports no count.
 Any other error the database raises fails the commit with a `ProjectorOperationError` whose
 `reason` is the SQLSTATE, and each view counts in the commit budget as one action the size of its
 SQL text. Without a writer, a commit that carries view operations is refused with a

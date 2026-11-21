@@ -23,6 +23,13 @@ export interface ViewStatement {
    * SQLSTATE as its reason.
    */
   readonly keyConstraint?: string
+  /**
+   * The statement returns one row for each row it affects (a `RETURNING` clause), so its rows are
+   * its count, and none means it affected none, whatever the driver reports. Set it for a driver
+   * that reports no affected-row count. A delete without a condition is counted by its rows
+   * already, since it reports foreign rows with a `SELECT`.
+   */
+  readonly returning?: boolean
 }
 
 /**
@@ -47,7 +54,9 @@ export interface ViewStatement {
  *   owner <> $owner`. Reporting a row fails the condition.
  *
  * A statement's count is the rows it returns when it returns any, and otherwise the count the
- * driver reports (`pg` and Neon report `rowCount`, PGlite `affectedRows`). A failed condition is
+ * driver reports (`pg` and Neon report `rowCount`, PGlite `affectedRows`). With a driver that
+ * reports neither, add `RETURNING 1` to the puts and the `present` deletes and mark them
+ * {@link ViewStatement.returning}. A failed condition is
  * a `ProjectorOperationError` with the reason `ConditionalCheckFailed`; any other error the
  * database raises is one too, with its SQLSTATE as the reason. An error the writer throws fails
  * the commit before any write.
@@ -88,20 +97,24 @@ export function buildViews(views: readonly ProjectedView[], writer: ViewWriter):
 
 /**
  * The number of rows a view statement affected: the rows it returned, or the count the driver
- * reports when it returned none. A delete without a condition reports foreign rows with a
- * `SELECT`, so its rows are its count. A driver that reports no count can't serve any other
- * statement that returns no rows.
+ * reports when it returned none. A statement marked `returning`, and a delete without a condition,
+ * which reports foreign rows with a `SELECT`, are counted by their rows alone. A driver that
+ * reports no count can't serve any other statement that returns no rows.
  */
-export function affectedRows(result: PgResult, view: ProjectedView): number {
+export function affectedRows(result: PgResult, {view, statement}: BuiltView): number {
+  const reports = view.op.kind === 'delete' && view.op.condition !== 'present'
+  if (statement.returning === true || reports) {
+    return result.rows.length
+  }
+
   const counts = [result.rows.length, result.rowCount, result.affectedRows].filter(
     (count): count is number => typeof count === 'number' && Number.isFinite(count),
   )
-  const reports = view.op.kind === 'delete' && view.op.condition !== 'present'
-  if (result.rows.length === 0 && counts.length === 1 && !reports) {
+  if (result.rows.length === 0 && counts.length === 1) {
     throw invalidView(
       view,
       'the PostgreSQL client reported no affected-row count for a statement that returned no ' +
-        'rows: add RETURNING 1 to the statement',
+        'rows: add RETURNING 1 to the statement and mark it returning',
     )
   }
 

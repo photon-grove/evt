@@ -220,8 +220,9 @@ const repository = new PgRepository(pool, {
 ```
 
 It reads a statement's count from the rows it returns, or, when it returns none, from the driver's
-`rowCount` (`pg`, Neon) or `affectedRows` (PGlite). A driver that reports neither needs
-`RETURNING 1` on the puts and the `present` deletes.
+`rowCount` (`pg`, Neon) or `affectedRows` (PGlite). With a driver that reports neither, add
+`RETURNING 1` to the puts and the `present` deletes and mark their statements `returning: true`,
+so that a statement returning no row is a failed condition.
 
 #### The Rust views table
 

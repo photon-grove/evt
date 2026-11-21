@@ -3466,8 +3466,9 @@ CREATE TABLE IF NOT EXISTS evt_events__evt_stream_heads (
   the row. A `present` delete deletes the owner's row, and a count of zero fails the condition. A
   delete without a condition reports the rows of another owner instead of the rows it deleted (a
   count above zero fails the condition). TypeScript takes the count from the rows a statement
-  returns, or from the driver's reported count when it returns none, and refuses a statement that
-  needs a count its driver doesn't report with `InvalidViewOperation`. The engine hands the writer
+  returns, or from the driver's reported count when it returns none (only from the rows for a
+  statement the writer marks `returning`), and refuses a statement that needs a count its driver
+  doesn't report with `InvalidViewOperation`. The engine hands the writer
   the owner with the operation. A projector statement that the database rejects is a projector
   operation failure (a lost connection is a backend error), and so is an integrity violation
   raised at `COMMIT`, which only a deferred constraint on a projector's table can cause (it

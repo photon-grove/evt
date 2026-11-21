@@ -297,6 +297,9 @@ const writer: ViewWriter = (op) => {
     : {sql: `${insert} ON CONFLICT (pk, sk) DO UPDATE`, args: [op.pk, op.sk, op.owner, op.payload]}
 }
 
+// The writer, with every statement's rows taken as its count.
+const returning: ViewWriter = (op) => ({...writer(op), returning: true})
+
 // A writer whose statements are `size` bytes long and over.
 function sized(size: number): ViewWriter {
   return () => ({sql: `SELECT 1 ${'-'.repeat(size)}`})
@@ -419,6 +422,25 @@ describe('PgRepository view writer', () => {
     const {repo} = answering({rows: []})
     const error = await rejection(commitViews(repo, op))
     expect(error).toMatchObject({code: 'invalidViewOperation'})
+  })
+
+  test('counts only the rows of a statement marked returning', async () => {
+    const failed = fake({respond: (text) => (/views/.test(text) ? {rows: []} : undefined)})
+    const error = await rejection(
+      commitViews(
+        new PgRepository(failed.client, {viewWriter: returning}),
+        deleteView('k', 'one', 'a', {condition: 'present'}),
+      ),
+    )
+    expect(error).toMatchObject({reason: 'ConditionalCheckFailed'})
+
+    // The rows win over a count the driver reports.
+    const held = fake({
+      respond: (text) => (/views/.test(text) ? {rows: [{}], rowCount: 0} : undefined),
+    })
+    const repo = new PgRepository(held.client, {viewWriter: returning})
+    await commitViews(repo, putView('k', 'one', 'a', 'ledger', '{}'))
+    expect(held.log.at(-1)).toBe('COMMIT')
   })
 
   test('counts the rows an unconditioned delete reports, with no driver count', async () => {

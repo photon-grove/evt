@@ -953,7 +953,7 @@ async function execViews(run: TxStatement, views: readonly BuiltView[]): Promise
     // A put that requires the row to be absent fails with a unique violation, never by its count.
     const {op} = built.view
     const counted = op.kind === 'delete' || op.condition !== 'absent'
-    if (counted && viewConditionFailed(op, affectedRows(result, built.view))) {
+    if (counted && viewConditionFailed(op, affectedRows(result, built))) {
       throw new ProjectorOperationError(built.view, REASON_CONDITION_FAILED)
     }
   }
