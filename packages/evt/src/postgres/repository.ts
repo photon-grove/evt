@@ -585,7 +585,9 @@ export class PgRepository implements OutcomeRepository, StoreInitializer {
       return
     }
 
-    const manifest = await this.#readManifest((statement, values) => this.#read(statement, values))
+    const manifest = await this.#readManifest((statement, values) =>
+      this.#read(statement, values),
+    )
     checkSupported(manifest)
     if (!declaresStreamHeads(manifest)) {
       await this.initialize(options)
@@ -852,6 +854,7 @@ export class PgRepository implements OutcomeRepository, StoreInitializer {
       connection.release(broken)
     }
   }
+
 }
 
 // The operations queued on each single-connection client, shared by every repository on it: two
@@ -861,10 +864,7 @@ const queues = new WeakMap<PgQueryable, Promise<unknown>>()
 // Runs `task` on a single-connection client after every task queued on it before.
 function serialize<T>(client: PgQueryable, task: () => Promise<T>): Promise<T> {
   const result = (queues.get(client) ?? Promise.resolve()).then(task, task)
-  queues.set(
-    client,
-    result.catch(() => undefined),
-  )
+  queues.set(client, result.catch(() => undefined))
 
   return result
 }

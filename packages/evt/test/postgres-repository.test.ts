@@ -412,10 +412,52 @@ describe('PgRepository view writer', () => {
     expect(log.at(-1)).toBe('COMMIT')
   })
 
-  test('refuses a statement whose count the driver does not report', async () => {
+  test.each<[string, ViewOperation]>([
+    ['a put', putView('k', 'one', 'a', 'ledger', '{}')],
+    ['a delete of a required row', deleteView('k', 'one', 'a', {condition: 'present'})],
+  ])('refuses %s whose count the driver does not report', async (_name, op) => {
     const {repo} = answering({rows: []})
-    const error = await rejection(commitViews(repo, deleteView('k', 'one', 'a')))
+    const error = await rejection(commitViews(repo, op))
     expect(error).toMatchObject({code: 'invalidViewOperation'})
+  })
+
+  test('counts the rows an unconditioned delete reports, with no driver count', async () => {
+    const {repo, log} = answering({rows: []})
+    await commitViews(repo, deleteView('k', 'one', 'a'))
+    expect(log.at(-1)).toBe('COMMIT')
+  })
+
+  test("runs a transaction's views after every stream's events, before every snapshot", async () => {
+    const {client, log} = fake()
+    const payload = new TextEncoder().encode('{}')
+    const b = {...event(1), id: eventId('b', 1n), entityId: 'b'}
+    await new PgRepository(client, {viewWriter: writer}).commitTransaction({
+      streams: [
+        {
+          entityId: 'a',
+          events: [event(1)],
+          snapshot: {entityType: 'ledger', sequence: 1n, payload},
+        },
+        {entityId: 'b', events: [b], snapshot: {entityType: 'ledger', sequence: 1n, payload}},
+      ],
+      fences: [],
+      views: [projected(putView('k', 'one', 'a', 'ledger', '{}'))],
+    })
+
+    const writes = transaction(log)
+      .filter((text) => /^INSERT INTO (evt_events|views|evt_snapshots) /.test(text))
+      .map((text) => text.split(' ')[2])
+    expect(writes).toEqual(['evt_events', 'evt_events', 'views', 'evt_snapshots', 'evt_snapshots'])
+  })
+
+  test("sends a copy of the writer's arguments", async () => {
+    const args = ['k', 'one', 'a']
+    const {client, values, log} = fake()
+    const repo = new PgRepository(client, {viewWriter: () => ({sql: 'SELECT 1 FROM views', args})})
+    await commitViews(repo, deleteView('k', 'one', 'a'))
+    const sent = values[log.indexOf('SELECT 1 FROM views')]
+    expect(sent).toEqual(args)
+    expect(sent).not.toBe(args)
   })
 
   test('maps the errors a view statement raises', async () => {
@@ -442,6 +484,7 @@ describe('PgRepository view writer', () => {
     })
     // A rollback is transient or passes through, and so does a lost connection.
     expect(await raising(pgError('40001'), claim)).toBeInstanceOf(TransientError)
+    expect(await raising(pgError('40P01'), claim)).toBeInstanceOf(TransientError)
     expect(await raising(pgError('40003'), claim)).toMatchObject({code: '40003'})
     const lost = new Error('connection reset')
     expect(await raising(lost, claim)).toBe(lost)

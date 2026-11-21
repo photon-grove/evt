@@ -205,7 +205,8 @@ const repository = new PgRepository(pool, {
     }
     const insert =
       'INSERT INTO views (pk, sk, entity_id, entity_type, payload) VALUES ($1, $2, $3, $4, $5)'
-    const row = [...args, op.entityType, new TextDecoder().decode(op.payload)]
+    const payload = new TextDecoder('utf-8', {ignoreBOM: true}).decode(op.payload)
+    const row = [...args, op.entityType, payload]
     return op.condition === 'absent'
       ? {sql: insert, args: row, keyConstraint: 'views_pkey'}
       : {

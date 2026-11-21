@@ -291,7 +291,7 @@ async function postgresCases(): Promise<void> {
     },
   )
 
-  await checks.case('postgres: a statement that returns rows counts them', async () => {
+  await checks.case('postgres: a writer may add RETURNING to its statements', async () => {
     const repo = await freshLog(pool, returning)
     const put = (entityId: string, owner: string) =>
       repo.commit({

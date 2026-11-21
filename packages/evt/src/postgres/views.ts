@@ -88,14 +88,16 @@ export function buildViews(views: readonly ProjectedView[], writer: ViewWriter):
 
 /**
  * The number of rows a view statement affected: the rows it returned, or the count the driver
- * reports when it returned none. A driver that reports no count can't serve a statement that
- * returns no rows.
+ * reports when it returned none. A delete without a condition reports foreign rows with a
+ * `SELECT`, so its rows are its count. A driver that reports no count can't serve any other
+ * statement that returns no rows.
  */
 export function affectedRows(result: PgResult, view: ProjectedView): number {
   const counts = [result.rows.length, result.rowCount, result.affectedRows].filter(
     (count): count is number => typeof count === 'number' && Number.isFinite(count),
   )
-  if (result.rows.length === 0 && counts.length === 1) {
+  const reports = view.op.kind === 'delete' && view.op.condition !== 'present'
+  if (result.rows.length === 0 && counts.length === 1 && !reports) {
     throw invalidView(
       view,
       'the PostgreSQL client reported no affected-row count for a statement that returned no ' +
