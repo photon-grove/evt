@@ -157,12 +157,6 @@ export async function conformance(
       ],
     )
   }
-  if (isRebuildFence(repo) && isEventLog(repo) && repo.writesViews?.() === true) {
-    cases.push([
-      'a projection rebuild writes the rows its projectors derive from the log, and settles',
-      () => projectionRebuild(repo),
-    ])
-  }
   if (repo.appliesExpectedPayload?.() === true) {
     cases.push([
       'an expected payload replaces exactly the row the commit read',
@@ -200,6 +194,13 @@ export async function conformance(
     )
   }
 
+  // Last: it takes the store-wide rebuild lock, which a failure after a write would keep.
+  if (isRebuildFence(repo) && isEventLog(repo) && repo.writesViews?.() === true) {
+    cases.push([
+      'a projection rebuild writes the rows its projectors derive from the log, and settles',
+      () => projectionRebuild(repo),
+    ])
+  }
   for (const [name, run] of cases) {
     await checks.case(`conformance: ${name}`, run)
   }

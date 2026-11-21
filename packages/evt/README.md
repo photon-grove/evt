@@ -207,8 +207,8 @@ const page = await repository.page('account:a-1', 0n, 100)
   types history-dependent, so compaction refuses them. Only the repository handle a journal wraps
   accepts a store that declares the journal: every writer must journal its commits.
 
-Journal compaction, rebuilds under the rebuild lock and the journal on PostgreSQL are still Rust
-only.
+Journal compaction, journal rebuilds under the rebuild lock and the journal on PostgreSQL are still
+Rust only.
 
 ## Runtimes
 

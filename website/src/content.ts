@@ -346,16 +346,22 @@ store := snapshots.NewStore(repo, 25).WithCommitProjectors(directory{})`,
 }
 
 let store = Store::<Account, _>::new(repository, ()).with_commit_projector(Arc::new(Directory));`,
-    },
-    pending: {
-      ts: 'Commit-wide projectors are the next piece of the TypeScript port. Until they land, an aggregate can list in-band projectors such as viewProjector(\'views\'), which put its own view row in the commit.',
+      ts: `const directory: CommitProjector = {
+  name: 'directory',
+  project: (commit) =>
+    commit.streams.map((stream) =>
+      putView('directory', stream.entityId, stream.entityId, stream.entityType, stream.state),
+    ),
+}
+
+const store = new Store(repository, {commitProjectors: [directory]})`,
     },
   },
   {
     id: 'derived',
     title: 'Rebuild and sync',
     tagline: 'Derived state you can throw away',
-    body: 'Views are derived, so the log can reproduce them. Rust\'s ProjectionRebuild rebuilds commit-wide views behind a rebuild fence that keeps commits out until they settle, and Go\'s RebuildProjections does the same for per-entity views. In Rust, the sync journal also hands each scope an ordered, gap-checked feed for realtime clients.',
+    body: 'Views are derived, so the log can reproduce them. Rust\'s and TypeScript\'s ProjectionRebuild rebuild commit-wide views behind a rebuild fence that keeps commits out until they settle, and Go\'s RebuildProjections does the same for per-entity views. In Rust, the sync journal also hands each scope an ordered, gap-checked feed for realtime clients.',
     doc: 'guide/projections',
     code: {
       go: `lease, err := fence.Begin(ctx, owner, 10*time.Minute) // fence out writers and readers
@@ -374,9 +380,13 @@ loop {
         break; // caught up with repository.high_watermark(&scope)
     }
 }`,
-    },
-    pending: {
-      ts: 'Rebuilds and the sync journal haven\'t reached TypeScript yet. Rebuilds come with the projectors, and the journal after them. The feature matrix tracks both.',
+      ts: `const rebuild = new ProjectionRebuild(repository, {
+  projectors: [directory],
+  aggregates: [account],
+})
+
+// Fences out writers and readers, rewrites the views, and settles the generation.
+const report = await rebuild.run(owner, 10 * 60_000)`,
     },
   },
 ]

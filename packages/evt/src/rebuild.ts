@@ -214,7 +214,9 @@ export class ProjectionRebuild {
       throw failure.error
     }
 
-    await this.#repository.endRebuild(result.lease, options)
+    // Every row is written: settling the generation runs even after an abort, so a finished
+    // rebuild never leaves the store locked.
+    await this.#repository.endRebuild(result.lease)
 
     return result.report
   }
@@ -632,6 +634,8 @@ class Renewing {
   // was taken or last renewed, at once when that's unknown (or the clock went back). The second
   // covers the whole-second expiry: a lease taken late in a second lapses up to a second early.
   async keepAlive(): Promise<void> {
+    // Planning reads and folds without I/O between some checkpoints, so an abort is seen here too.
+    this.#options?.signal?.throwIfAborted()
     const due = Math.max(this.#renewMs / 2 - 1000, 0)
     const now = Date.now()
     const renewed = this.#renewed

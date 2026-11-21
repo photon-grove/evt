@@ -730,33 +730,33 @@ never refuses these entity types.
 
 The projection rebuild (v0.9, Rust's `photon_evt::ProjectionRebuild` and TypeScript's
 `ProjectionRebuild`, which leaves out Rust's diff mode and journal). It takes the rebuild lock
-([Rebuild fence](#rebuild-fence)) for the whole run, so no commit lands and readers under the
-epoch check are fenced while it reads the log. It writes through the guarded writer in batches of
-at most 99 operations, renews the lease as it goes, and releases the lock at the end, which
-settles the generation. Only streams of the aggregate types registered with it are read. It
-computes every operation before the first write and refuses, before writing, a row two owners would
-write (`SharedViewKey`), a key planned twice (`DuplicateViewKey`), and an operation too large for
-any batch (`CommitTooLarge`); batches hold at most 99 operations within the commit byte budget.
-Each operation is written without its condition or mapped error (a replay applies what the live
-commits wrote), so a rebuild runs over existing rows and is idempotent. By default it does not
-wipe: rows no projector produces any more stay until the caller deletes them. In Rust's diff mode
-(`diff`) the run owns the rows of the row types it is given (the stored `entityType`, plus the
-journal's row and counter types when it rebuilds the journal). After planning it lists them, and
-writes a put only for a planned row that is missing or differs in owner, type, payload or TTL, a
-planned delete only for a row of an owned type that exists (one of another type fails the run),
-and a delete for every owned row the plan does not produce whose owner is a stream the run read or
-no stream in the log (one owned by a stream of a type the run did not read, or with no owner, is
-kept and counted). The final operations are checked as a guarded write checks them,
-before the first write. A row is skipped as unchanged, or deleted as stale, only after a strongly consistent read
-of its key: the type listing may lag (DynamoDB's `entityType-index` is eventually consistent).
-Every planned put must be of an owned type (`InvalidConfig` before any write), and nothing else
-may write an owned type, since the run deletes what it does not plan. It needs strongly consistent reads
-of the log, or a commit that landed just before the lock was taken can be missed. Given the
-journal's configuration (`with_journal`, Rust only), the same run also rebuilds the [journal](#journal): it
-reads every event of the journal's entity types under the lock (each type read once, shared with
-the history replay), derives the rows and counters as the journal's rebuild does, checks their keys
-against the view rows (`SharedViewKey`, `DuplicateViewKey`), and writes them in the same guarded
-batches, so the views and the journal move through one generation.
+([Rebuild fence](#rebuild-fence)) for the whole run, so no commit lands and readers under the epoch
+check are fenced while it reads the log. It writes through the guarded writer in batches of at most
+99 operations, renews the lease as it goes, and releases the lock at the end, which settles the
+generation. Only streams of the aggregate types registered with it are read. It computes every
+operation before the first write and refuses, before writing, a row two owners would write
+(`SharedViewKey`), a key planned twice (`DuplicateViewKey`), and an operation too large for any
+batch (`CommitTooLarge`); batches hold at most 99 operations within the commit byte budget. Each
+operation is written without its condition or mapped error (a replay applies what the live commits
+wrote), so a rebuild runs over existing rows and is idempotent. By default it does not wipe: rows no
+projector produces any more stay until the caller deletes them. In Rust's diff mode (`diff`) the run
+owns the rows of the row types it is given (the stored `entityType`, plus the journal's row and
+counter types when it rebuilds the journal). After planning it lists them, and writes a put only for
+a planned row that is missing or differs in owner, type, payload or TTL, a planned delete only for a
+row of an owned type that exists (one of another type fails the run), and a delete for every owned
+row the plan does not produce whose owner is a stream the run read or no stream in the log (one
+owned by a stream of a type the run did not read, or with no owner, is kept and counted). The final
+operations are checked as a guarded write checks them, before the first write. A row is skipped as
+unchanged, or deleted as stale, only after a strongly consistent read of its key: the type listing
+may lag (DynamoDB's `entityType-index` is eventually consistent). Every planned put must be of an
+owned type (`InvalidConfig` before any write), and nothing else may write an owned type, since the
+run deletes what it does not plan. It needs strongly consistent reads of the log, or a commit that
+landed just before the lock was taken can be missed. Given the journal's configuration
+(`with_journal`, Rust only), the same run also rebuilds the [journal](#journal): it reads every
+event of the journal's entity types under the lock (each type read once, shared with the history
+replay), derives the rows and counters as the journal's rebuild does, checks their keys against the
+view rows (`SharedViewKey`, `DuplicateViewKey`), and writes them in the same guarded batches, so the
+views and the journal move through one generation.
 
 - A current-state projector runs once per stream of every registered type, over a view of that
   stream alone: its final state (the snapshot plus the events after it, so a compacted stream is
@@ -784,21 +784,21 @@ failure before its own first write included: only a rebuild that completes settl
 The run tells the cases apart by reading the generation just before it begins: the generation only
 grows, so a lease exactly one above a settled generation read then was acquired from it.
 
-Rebuilding a history-dependent projector (v0.9). A wipe-and-rebuild replays every
-commit grouped by `commitId`: each group's events, ordered by stream ID bytewise then by
-sequence (the same pinned order as the commit's transaction), form one `CommitView`, and the
-projector runs once per group, exactly as it did at commit time, with the state each stream had
-after that commit. The groups are applied in an order every stream agrees with: a commit that
-wrote a stream's sequence 3 precedes the commit that wrote its sequence 4, for every stream (Go
-`GroupCommits`, Rust `group_commits`, TypeScript `groupCommits`. Commits that no stream relates come in the order of their
-first event's stream ID bytes and sequence, which carries no meaning). Events whose commits cannot
-be ordered that way (a cycle) are not a log this engine wrote and fail with `CommitOrder`. The
-replay applies each operation to the rows, and refuses with `SharedViewKey` (Go
-`ReplayViews`, Rust `replay_views`, the TypeScript `ProjectionRebuild`'s replay) when two operations of different owner streams touch one row,
-because the final row would then depend on an order the log does not keep. Conditions are not
-evaluated in a replay: it applies what the live commits wrote. Nothing may have deleted the
-history, so compaction is forbidden for the entity types in the manifest's `historyDependent`
-set, and the prohibition is durable ([Feature marker](#feature-marker)):
+Rebuilding a history-dependent projector (v0.9). A wipe-and-rebuild replays every commit grouped by
+`commitId`: each group's events, ordered by stream ID bytewise then by sequence (the same pinned
+order as the commit's transaction), form one `CommitView`, and the projector runs once per group,
+exactly as it did at commit time, with the state each stream had after that commit. The groups are
+applied in an order every stream agrees with: a commit that wrote a stream's sequence 3 precedes the
+commit that wrote its sequence 4, for every stream (Go `GroupCommits`, Rust `group_commits`,
+TypeScript `groupCommits`. Commits that no stream relates come in the order of their first event's
+stream ID bytes and sequence, which carries no meaning). Events whose commits cannot be ordered that
+way (a cycle) are not a log this engine wrote and fail with `CommitOrder`. The replay applies each
+operation to the rows, and refuses with `SharedViewKey` (Go `ReplayViews`, Rust `replay_views`, the
+TypeScript `ProjectionRebuild`'s replay) when two operations of different owner streams touch one
+row, because the final row would then depend on an order the log does not keep. Conditions are not
+evaluated in a replay: it applies what the live commits wrote. Nothing may have deleted the history,
+so compaction is forbidden for the entity types in the manifest's `historyDependent` set, and the
+prohibition is durable ([Feature marker](#feature-marker)):
 
 - `CompactBelow` reads the manifest (consistent read) and refuses an entity type in
   `historyDependent` with a typed `HistoryDependentProjection` error before deleting anything:
@@ -2258,26 +2258,25 @@ traffic a lifecycle transaction can lose several races in a row and `Begin` retu
 acquire from a quiesced state by one, so a reader pinned to any earlier epoch sees a changed
 generation either way.
 
-A begin transaction whose result is unknown (DynamoDB: a timeout, a dispatch failure, an
-unparseable response, a 5xx or a server-fault code, `TransactionInProgressException`; PostgreSQL:
-an error the database did not raise at `COMMIT`, such as a dropped connection) is
-`RebuildBeginIndeterminate`, carrying the lease the transaction would have produced and the
-generation value its conditions named (`observed`). A throttled request or a cancellation
-(throttling, a failed condition, a transaction conflict) wrote nothing: it keeps its
-classification, and a lost race decides again. The caller settles an indeterminate begin by
-reading the state, generation first: the lock holds the lease (same owner and fencing token), so
-the begin applied; or the generation has moved from `observed` without it, so the begin does not
-hold the lock and can never apply, because its condition named `observed` and the generation only
-grows; or the generation is still `observed` and the begin may still land. Go's
-`RebuildState.HoldsBegun`, Rust's `RebuildState::holds_begun` and TypeScript's `holdsRebuildBegun`
-implement that rule. "The lock
-holds the lease" is exact only when the owner token is unique to the caller, because two
-concurrent begins under one token from the same generation produce the same lease. So Rust's
-`ProjectionRebuild::run` and `rebuild_with_lock` (whose owner token every journal rebuild shares),
-and TypeScript's `ProjectionRebuild.run`, begin again only when the begin can no longer apply, and otherwise return the error. A
-separate error rather than Rust's `Indeterminate` (or Go's `AmbiguousWriteError`), because those
-belong to outcome-carrying commits, which a store settles by re-reading the outcome row; a begin
-is settled from the lock row, and needs the fencing token it would have produced to do it.
+A begin transaction whose result is unknown (DynamoDB: a timeout, a dispatch failure, an unparseable
+response, a 5xx or a server-fault code, `TransactionInProgressException`; PostgreSQL: an error the
+database did not raise at `COMMIT`, such as a dropped connection) is `RebuildBeginIndeterminate`,
+carrying the lease the transaction would have produced and the generation value its conditions named
+(`observed`). A throttled request or a cancellation (throttling, a failed condition, a transaction
+conflict) wrote nothing: it keeps its classification, and a lost race decides again. The caller
+settles an indeterminate begin by reading the state, generation first: the lock holds the lease
+(same owner and fencing token), so the begin applied; or the generation has moved from `observed`
+without it, so the begin does not hold the lock and can never apply, because its condition named
+`observed` and the generation only grows; or the generation is still `observed` and the begin may
+still land. Go's `RebuildState.HoldsBegun`, Rust's `RebuildState::holds_begun` and TypeScript's
+`holdsRebuildBegun` implement that rule. "The lock holds the lease" is exact only when the owner
+token is unique to the caller, because two concurrent begins under one token from the same
+generation produce the same lease. So Rust's `ProjectionRebuild::run` and `rebuild_with_lock` (whose
+owner token every journal rebuild shares), and TypeScript's `ProjectionRebuild.run`, begin again
+only when the begin can no longer apply, and otherwise return the error. A separate error rather
+than Rust's `Indeterminate` (or Go's `AmbiguousWriteError`), because those belong to
+outcome-carrying commits, which a store settles by re-reading the outcome row; a begin is settled
+from the lock row, and needs the fencing token it would have produced to do it.
 
 Request shapes. The acquire's generation condition is the union written above, with all five
 values always bound, because DynamoDB rejects a request that binds a value its expressions do not
@@ -2297,17 +2296,17 @@ are numbers and a string as named. A release names the lease (`:me`, `:generatio
 force-release the owner alone (`:requestedOwner`) and puts the force-released item above, and the generation update's `:one`, `:two`, and
 `:seenOdd` are numbers. Renew is one `UpdateItem` (not a transaction) on the lock item, as above.
 
-`Renew`, `End`, and `WriteViews` take the lease `Begin` returned (owner and generation. In Rust
-and TypeScript the `RebuildLease`), and fail with `RebuildLeaseLost` unless the lock row names that owner under
-that generation. `Renew` returns the lease with its new expiry. It does not require the lease to be
-unexpired: an owner whose lease lapsed but whom no one has taken over may renew it. `End` runs
-the release transaction without reading first. A failed condition is `RebuildLeaseLost` as well. A
-takeover (even by the same owner token) and a force-release both change the lock row, so a stale
-lease cannot match it. `End` returns the settled generation. `ForceRelease` names the owner the
-operator observed. It fails with `RebuildLeaseLost` when the lock row is gone or names another
+`Renew`, `End`, and `WriteViews` take the lease `Begin` returned (owner and generation. In Rust and
+TypeScript the `RebuildLease`), and fail with `RebuildLeaseLost` unless the lock row names that
+owner under that generation. `Renew` returns the lease with its new expiry. It does not require the
+lease to be unexpired: an owner whose lease lapsed but whom no one has taken over may renew it.
+`End` runs the release transaction without reading first. A failed condition is `RebuildLeaseLost`
+as well. A takeover (even by the same owner token) and a force-release both change the lock row, so
+a stale lease cannot match it. `End` returns the settled generation. `ForceRelease` names the owner
+the operator observed. It fails with `RebuildLeaseLost` when the lock row is gone or names another
 owner (the rebuild it meant to release has already ended or been replaced), and returns the odd,
-flagged generation. It never runs the rebuild's cleanup, and it does not let commits through:
-every commit is refused with `RebuildInProgress` until a later rebuild ends.
+flagged generation. It never runs the rebuild's cleanup, and it does not let commits through: every
+commit is refused with `RebuildInProgress` until a later rebuild ends.
 
 Errors. The names are Go's, with Rust's variant in parentheses; TypeScript's are the Go names with an
 `Error` suffix (`RebuildLeaseLostError`, code `rebuildLeaseLost`). All are typed in every language
@@ -3724,8 +3723,8 @@ the commit target (`with_views_table()`) with the expected-payload condition, an
 `postgres-views` marker feature. The conformance suites of commit-wide views, the expected payload,
 the view repository and the rebuild run on it. TypeScript implements the same table, view
 repository (`PgViewRepository`), commit target (`viewsTable: true`) with the expected-payload
-condition, and marker feature, without rebuild view writes, which it doesn't model yet; its view
-repository, commit-wide view and expected-payload cases run on it. TypeScript differs only where storage can't see it: an
+condition, marker feature and rebuild view writes; its view repository, commit-wide view,
+expected-payload and rebuild cases run on it. TypeScript differs only where storage can't see it: an
 encoding other than `UTF8` is `invalidArgument` (Rust `InvalidConfig`), its commit statements end in
 `RETURNING 1` where their row count decides the condition, and its batch read is one statement over
 all the keys.
