@@ -295,7 +295,15 @@ of `AbortSignal`, which the DOM library, `@types/node`, and Bun's and Deno's typ
   `error` and go on with the next.
 - **Rebuilds.** While a projection rebuild holds the store, every commit fails with a
   `RebuildInProgressError`. It's retryable, so `executeWithRetry` runs the command again after its
-  backoff, though a rebuild usually outlasts the default policy's attempts.
+  backoff, though a rebuild usually outlasts the default policy's attempts. Every repository is the
+  rebuild fence (`RebuildFence`) that holds it: `beginRebuild(owner, leaseMs)` takes the lock (or
+  takes over an expired lease) and moves the generation to odd, `renewRebuild` extends the lease,
+  `writeRebuildViews` writes a batch of view rows only while the lease holds, `endRebuild` releases
+  it and settles the generation, and `forceReleaseRebuild(owner)` ends a crashed rebuild's lease
+  but leaves the generation odd, so commits stay refused until another rebuild ends. A reader of
+  derived state pins the generation with `observeRebuildEpoch` or `readAtRebuildEpoch`, which
+  fail with the retryable `RebuildUnavailableError` and `RebuildEpochChangedError`. The memory and
+  PostgreSQL repositories take a `clock` option for leases, as DynamoDB's does.
 - **Transactions.** `store.transaction()` commits several streams at once. `read(aggregate, id)`
   loads a stream of any aggregate type and returns a typed handle, `append(handle, events)` stages
   the events decided for it, and `commit({metadata})` stamps one commit ID on every event and
