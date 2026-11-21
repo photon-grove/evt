@@ -418,7 +418,8 @@ error before any write and is never split.
   resends it on its own retries, so an SDK retry that meets its own first attempt is
   `TransactionInProgressException` (indeterminate) or success, never a `TransactionConflict`. A
   per-command token would make a fence-aware retry, which resends the command ID with different
-  items, fail with `IdempotentParameterMismatchException`
+  items, fail with `IdempotentParameterMismatchException` (indeterminate, so it would end as an
+  ambiguous write instead of running)
 - A concurrent same-ID, same-digest loser returns only the winner's stored outcome, never its own
   handler error or local decision
 - Outcome rows read from storage are validated (known status, digest, rejection/code consistency,

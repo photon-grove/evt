@@ -40,7 +40,7 @@ func (c *tokenRecorder) TransactWriteItems(
 }
 
 // Commits leave ClientRequestToken to the SDK, which fills in a fresh one per call and resends it
-// on its own retries (storage spec, Writes). A token derived from the command ID would make a
+// on its own retries (storage spec, Ambiguous-write recovery). A token derived from the command ID would make a
 // fence-aware retry, which resends the command with other items, fail with
 // IdempotentParameterMismatch.
 func TestCommitsLeaveTheRequestTokenToTheSDK(t *testing.T) {

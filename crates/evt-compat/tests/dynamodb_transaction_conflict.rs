@@ -235,12 +235,15 @@ async fn respond(incoming: &mut TcpStream, status: &str, answer: &Value) {
     incoming.write_all(response.as_bytes()).await.unwrap();
 }
 
-/// A private table, so the cancelled commits cannot touch another test's rows.
+/// A private table, so the faulted commits cannot touch another test's rows. Tests in one process
+/// run in parallel, and the clock may tick in microseconds, so a counter keeps their names apart.
 async fn private_table() -> String {
+    static TABLES: AtomicUsize = AtomicUsize::new(0);
     let client = drivers::dynamo_client().await;
     let table = format!(
-        "evt-txn-conflict-{}-{}",
+        "evt-txn-conflict-{}-{}-{}",
         std::process::id(),
+        TABLES.fetch_add(1, Ordering::SeqCst),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -330,6 +333,13 @@ async fn a_transaction_conflict_is_never_recorded_as_a_stale_fence() {
         .unwrap();
     assert!(outcome.is_accepted(), "the resend commits: {outcome:?}");
     assert!(!outcome.replayed);
+    // The resend is a new call with its own token: evt never derives one from the command ID.
+    let tokens = proxy.tokens();
+    assert_eq!(tokens.len(), 2, "{tokens:?}");
+    assert_ne!(
+        tokens[0], tokens[1],
+        "the same command ID sent again gets a new token"
+    );
 
     // Several attempts: the conflict is retried like throttling, and the retry commits.
     proxy.arm(Fault::Cancel, 2);

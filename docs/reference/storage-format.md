@@ -1266,15 +1266,17 @@ with known reasons, throttling, a validation, missing-table, or authorization er
 error at statement or `COMMIT` time) is returned as is.
 
 DynamoDB's `TransactionInProgressException` is one more indeterminate result (the transaction is
-still running and may yet commit), recovered by the same polling.
+still running and may yet commit), recovered by the same polling. So is
+`IdempotentParameterMismatchException` (a request token reused with other items).
 
 A DynamoDB commit never sets `ClientRequestToken`. The AWS SDKs fill in a fresh token per call
 and resend it on their own retries, so a retry that reaches DynamoDB while its first attempt is
 still running gets `TransactionInProgressException` (indeterminate, as above), and one whose
 first attempt applied gets success. Neither is reported as a `TransactionConflict` with itself. A
 token per command would be wrong: fence-aware retry resends a command ID with different items
-within the token's 10-minute window, which DynamoDB refuses with
-`IdempotentParameterMismatchException`. A custom client must fill in the token the same way.
+within the token's 10-minute window, which DynamoDB answers with
+`IdempotentParameterMismatchException`, so the retry would end as an ambiguous write instead of
+running. A custom client must fill in the token the same way.
 
 A concurrent attempt with the same command ID and the same digest that loses the race for the
 outcome row returns only the winner's stored outcome (its result or rejection, marked
