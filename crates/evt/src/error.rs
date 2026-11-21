@@ -813,6 +813,8 @@ pub struct TransactionConflict {
     /// The backend's error, with the cancellation reasons.
     #[source]
     pub source: BoxError,
+    /// Whether the write collided on its command-outcome put.
+    outcome_row: bool,
 }
 
 impl TransactionConflict {
@@ -821,7 +823,24 @@ impl TransactionConflict {
         Self {
             entity_id,
             source: source.into(),
+            outcome_row: false,
         }
+    }
+
+    /// Marks the conflict as one on the write's command-outcome put
+    /// ([`on_outcome_row`](Self::on_outcome_row)).
+    #[must_use]
+    pub fn with_outcome_row(mut self) -> Self {
+        self.outcome_row = true;
+
+        self
+    }
+
+    /// Whether the write collided on its command-outcome put. Only another attempt of the same
+    /// command writes that item, so its winner is still committing: the store polls the outcome
+    /// row briefly to replay it, rather than reading it once.
+    pub fn on_outcome_row(&self) -> bool {
+        self.outcome_row
     }
 }
 
