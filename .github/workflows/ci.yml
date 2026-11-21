@@ -30,7 +30,8 @@ jobs:
       # go: anything outside the Rust crates and the TypeScript packages (Go, docs, website, infra),
       # plus moon config, which Quality checks from a renamed checkout.
       # rust: the Rust crates and the shared compatibility fixtures.
-      # ts: the TypeScript packages and the shared compatibility fixtures.
+      # ts: the TypeScript packages (packages/evt, evt-compat and evt-lambda) and the shared
+      # compatibility fixtures.
       # compat: anything that can change the shared storage format, which runs the
       # cross-language suite against live backends. The TypeScript packages set it too, since the
       # TypeScript driver writes in both of that suite's runs.
@@ -68,6 +69,9 @@ jobs:
                 go=true rust=true ts=true ;;
               packages/evt/* | packages/evt-compat/*)
                 ts=true compat=true ;;
+              packages/evt-lambda/*)
+                # Rust-first Lambda helpers: no backend writes, so the live suite has nothing new.
+                ts=true ;;
               .prototools)
                 # It pins Go and golangci-lint, and Bun and Deno for the TypeScript job.
                 go=true ts=true ;;
@@ -215,7 +219,9 @@ jobs:
       - run: pnpm install --frozen-lockfile
 
       - name: TypeScript checks
-        run: pnpm exec moon run evt-ts:check evt-ts:test evt-ts:runtimes
+        run: >-
+          pnpm exec moon run evt-ts:check evt-ts:test evt-ts:runtimes evt-lambda:check
+          evt-lambda:test evt-lambda:runtimes
 
       # The oldest Node that engines allows runs the fixture runner against the same build, and
       # loads the package with require(), which fails if the package gains top-level await.
@@ -227,7 +233,9 @@ jobs:
         run: |
           node packages/evt-compat/dist/fixtures.js
           node packages/evt-compat/dist/memory.js
+          node packages/evt-compat/dist/lambda.js
           (cd packages/evt && node -e "require('@photon-grove/evt'); require('@photon-grove/evt/dynamodb'); require('@photon-grove/evt/memory'); require('@photon-grove/evt/postgres'); require('@photon-grove/evt/testing')")
+          (cd packages/evt-lambda && node -e "require('@photon-grove/evt-lambda')")
 
   integration:
     name: DynamoDB integration

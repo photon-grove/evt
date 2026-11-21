@@ -28,6 +28,7 @@ Both sides implement the same account domain: `go/internal/compat/account.go` an
 | `go -C go test ./internal/compat`              | The Go output still matches the fixtures.                                                                      |
 | `cargo test -p evt-compat`               | The Rust output matches the fixtures byte for byte, running every step in Rust against `MemRepository`.        |
 | `moon run evt-ts:test evt-ts:runtimes`   | The TypeScript fixture runner (`packages/evt-compat`) reproduces the vectors it covers so far, and its conformance suite passes against `MemRepository`, on Node, Bun and Deno. It generates no fixtures. |
+| `moon run evt-lambda:test evt-lambda:runtimes` | `@photon-grove/evt-lambda` reproduces every `lambda.json` vector (`packages/evt-compat/src/lambda.ts`) on Node, Bun and Deno. |
 | `scripts/compat-integration.sh dynamo`   | Go and Rust take turns writing the same streams in the local DynamoDB emulator, then both verify every stream. Two passes over the scenarios TypeScript supports come first, in which the TypeScript driver stands in for Go, then for Rust. |
 | `scripts/compat-integration.sh postgres` | The same against local PostgreSQL, TypeScript passes included.                                                 |
 

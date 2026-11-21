@@ -272,6 +272,7 @@ The same pages, with interactive architecture diagrams, are on the
 | [`compat/`](compat/) | Shared scenarios and golden fixtures that keep the two languages writing the same bytes |
 | [`docs/`](docs/) | The guide, the reference, and the architecture decision records |
 | [`packages/evt`](packages/evt/) | The TypeScript package `@photon-grove/evt`, with its fixture runner in `packages/evt-compat` |
+| [`packages/evt-lambda`](packages/evt-lambda/) | `@photon-grove/evt-lambda`, the TypeScript port of `photon-evt-lambda` |
 | [`website/`](website/), [`packages/react-flow-diagrams`](packages/react-flow-diagrams/) | The docs site and the diagram package it uses |
 
 ## Contributing

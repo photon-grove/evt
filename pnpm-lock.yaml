@@ -38,6 +38,9 @@ importers:
       '@photon-grove/evt':
         specifier: workspace:*
         version: link:../evt
+      '@photon-grove/evt-lambda':
+        specifier: workspace:*
+        version: link:../evt-lambda
     devDependencies:
       '@aws-sdk/client-dynamodb':
         specifier: 3.1171.0
@@ -57,6 +60,27 @@ importers:
       typescript:
         specifier: ^7.0.2
         version: 7.0.2
+
+  packages/evt-lambda:
+    devDependencies:
+      '@photon-grove/evt':
+        specifier: workspace:*
+        version: link:../evt
+      '@types/aws-lambda':
+        specifier: 8.10.164
+        version: 8.10.164
+      '@types/node':
+        specifier: ^26.6.6
+        version: 26.6.6
+      oxlint:
+        specifier: 1.90.0
+        version: 1.90.0
+      typescript:
+        specifier: ^7.0.2
+        version: 7.0.2
+      vitest:
+        specifier: 5.0.5
+        version: 5.0.5(@types/node@26.6.6)(jsdom@30.1.3)(vite@8.3.5(@types/node@26.6.6)(esbuild@0.28.2))
 
   packages/react-flow-diagrams:
     dependencies:
@@ -793,6 +817,9 @@ packages:
 
   '@types/aria-query@5.0.4':
     resolution: {integrity: sha512-rfT93uj5s0PRL7EzccGMs3brplhcrghnDoV26NqKhCAS1hVo+WdNsPvE/yb6ilfr5hi2MEk6d5EWJTKdxg8jVw==}
+
+  '@types/aws-lambda@8.10.164':
+    resolution: {integrity: sha512-XOnrazWcOd6yWPnR7DxqCBPPYciDjHq+NN8LPwwqBCJNXLyPJgKo47fZpJ113+oyAn9Zti0Cf6H4k6yPcE3WFg==}
 
   '@types/chai@5.2.3':
     resolution: {integrity: sha512-Mw558oeA9fFbv65/y4mHtXDs9bPnFMZAL/jxdPFUpOHHIXX91mcgEHbS5Lahr+pwZFR8A7GQleRWeI6cGFC2UA==}
@@ -2478,6 +2505,8 @@ snapshots:
     optional: true
 
   '@types/aria-query@5.0.4': {}
+
+  '@types/aws-lambda@8.10.164': {}
 
   '@types/chai@5.2.3':
     dependencies:
