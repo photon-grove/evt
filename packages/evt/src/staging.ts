@@ -220,20 +220,30 @@ export function readyProjectors(
 }
 
 /**
+ * What a store has declared of its projectors' history: the entity types declared, and the
+ * declaration in flight, which concurrent commits wait for instead of sending their own.
+ */
+export interface HistoryLedger {
+  readonly declared: Set<string>
+  inflight: Promise<void> | null
+}
+
+/**
  * Durably declares the entity types the projectors read events of history-dependent, before a
- * commit that runs them: each type once per store, which `declared` remembers, so compaction
- * refuses them in every process from then on.
+ * commit that runs them: each type once per store, which the ledger remembers, so compaction
+ * refuses them in every process from then on. A failed declaration marks nothing, so the next
+ * commit declares again.
  */
 export async function declareHistory(
   projectors: readonly CommitProjector[],
   repository: Repository,
-  declared: Set<string>,
+  ledger: HistoryLedger,
   options?: CallOptions,
 ): Promise<void> {
   const pending: string[] = []
   for (const projector of projectors) {
     for (const entityType of projector.history ?? []) {
-      if (!declared.has(entityType) && !pending.includes(entityType)) {
+      if (!ledger.declared.has(entityType) && !pending.includes(entityType)) {
         pending.push(entityType)
       }
     }
@@ -242,9 +252,24 @@ export async function declareHistory(
     return
   }
 
+  // Another commit's declaration: wait for it, then see what's left, whatever its result.
+  const inflight = ledger.inflight
+  if (inflight !== null) {
+    await inflight.catch(() => undefined)
+
+    return declareHistory(projectors, repository, ledger, options)
+  }
+
   readyProjectors(projectors, repository)
-  await repository.declareHistoryDependent!(pending, options)
-  for (const entityType of pending) {
-    declared.add(entityType)
+  const run = repository.declareHistoryDependent!(pending, options).then(() => {
+    for (const entityType of pending) {
+      ledger.declared.add(entityType)
+    }
+  })
+  ledger.inflight = run
+  try {
+    await run
+  } finally {
+    ledger.inflight = null
   }
 }

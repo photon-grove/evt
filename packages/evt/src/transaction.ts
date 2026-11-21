@@ -548,13 +548,14 @@ export class Transaction {
     const repository = this.#context.repository as OutcomeRepository
     const {streams, fences, events, views} = prepared
 
+    // Declared before the commit is sent, so a failed declaration is never settled as the commit's.
+    if (events.length > 0) {
+      await this.#context.declareHistory?.(options)
+    }
     try {
-      return await recordCommit(repository, pending, config, outcome, events, async () => {
-        if (events.length > 0) {
-          await this.#context.declareHistory?.(options)
-        }
-        await repository.commitTransaction({streams, fences, views, outcome}, options)
-      })
+      return await recordCommit(repository, pending, config, outcome, events, () =>
+        repository.commitTransaction({streams, fences, views, outcome}, options),
+      )
     } catch (error) {
       // Only the caller knows what it read, so a stale fence of its own is the command's answer.
       if (error instanceof FenceConflictError && error.provenance === 'caller') {

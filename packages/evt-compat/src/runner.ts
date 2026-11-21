@@ -752,8 +752,6 @@ export class Runner {
     }
   }
 
-  // Commits the step's streams and fences through the repository, as the Go and Rust drivers do,
-  // and checks that a failed transaction left every stream it touches unchanged.
   // Applies one declaration to the store's feature manifest, as another writer would, and reports
   // how far it moved the version. The entity types name the scenario's stream with {id}.
   async #declare(step: JsonValue): Promise<Outcome> {
@@ -801,6 +799,8 @@ export class Runner {
     return {...outcome('ok'), delta: Number(declared.version - (before?.version ?? 0n))}
   }
 
+  // Commits the step's streams and fences through the repository, as the Go and Rust drivers do,
+  // and checks that a failed transaction left every stream it touches unchanged.
   async #transaction(step: JsonValue): Promise<Outcome> {
     const repository = this.#repository
     if (!isTransactional(repository)) {

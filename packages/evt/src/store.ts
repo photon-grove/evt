@@ -63,6 +63,7 @@ import {
   sleep,
 } from './retry.js'
 import {
+  type HistoryLedger,
   commitSnapshot,
   declareHistory,
   projectCommit,
@@ -163,7 +164,7 @@ export class Store {
   readonly #outcomes: OutcomeConfig | null
   readonly #commitProjectors: readonly CommitProjector[]
   // The entity types this store's history-dependent projectors read, once declared.
-  readonly #historyDeclared = new Set<string>()
+  readonly #history: HistoryLedger = {declared: new Set(), inflight: null}
 
   constructor(repository: Repository, options: StoreOptions = {}) {
     const interval = options.snapshotInterval ?? DEFAULT_SNAPSHOT_INTERVAL
@@ -465,7 +466,7 @@ export class Store {
 
   // Declares the history-dependent projectors' entity types before a commit that runs them.
   #declareHistory(options?: CallOptions): Promise<void> {
-    return declareHistory(this.#commitProjectors, this.repository, this.#historyDeclared, options)
+    return declareHistory(this.#commitProjectors, this.repository, this.#history, options)
   }
 
   /**
@@ -664,6 +665,16 @@ export class Store {
       return failed(error, 'internal')
     }
 
+    // Declared before the commit is sent, so a failed declaration is the command's own error and
+    // never settled as the commit's.
+    if (commit.events.length > 0) {
+      try {
+        await this.#declareHistory(options)
+      } catch (error) {
+        return failed(error, 'internal')
+      }
+    }
+
     try {
       const outcome = await recordCommit(
         repository,
@@ -671,12 +682,7 @@ export class Store {
         config,
         commit.outcome!,
         commit.events,
-        async () => {
-          if (commit.events.length > 0) {
-            await this.#declareHistory(options)
-          }
-          await repository.commit(commit, options)
-        },
+        () => repository.commit(commit, options),
       )
       return {kind: 'done', outcome}
     } catch (error) {
