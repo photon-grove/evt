@@ -79,14 +79,6 @@ export const SUPPORTED_SCENARIOS: readonly string[] = [
   'commit-grouping',
 ]
 
-/**
- * The scenarios a backend can't run yet: PostgreSQL writes commit-wide views through a view writer
- * TypeScript doesn't have so far.
- */
-export const UNSUPPORTED_ON: Readonly<Record<string, readonly string[]>> = Object.freeze({
-  postgres: ['commit-wide-views', 'commit-wide-projector', 'commit-too-large'],
-})
-
 /** The fixture run's name, which every run's identity digests use. */
 export const FIXTURE_RUN = 'fixture'
 

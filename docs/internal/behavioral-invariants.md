@@ -331,9 +331,10 @@ error before any write and is never split.
 - Multi-stream transactions require a repository that declares `evt.TransactionalRepository`;
   `snapshots.Store.Transaction` refuses one that does not with `*TransactionsUnsupportedError`
   before dispatching anything
-- Go PostgreSQL executes a commit's view operations through its `ViewWriter`, and refuses the
-  operations of a transaction group built for another storage type with
-  `*ProjectorOperationsUnsupportedError` before any write; it never drops them
+- Go PostgreSQL executes a commit's view operations through its `ViewWriter` (TypeScript: the
+  `PgRepository` `viewWriter` option), and refuses the operations of a transaction group built for
+  another storage type with `*ProjectorOperationsUnsupportedError` (TypeScript `invalidCommit`)
+  before any write; it never drops them
 - A commit that carries projector operations but writes no event is refused before any write
   (`ProjectorOnlyCommitError` / `Error::ProjectorWithoutEvents`): views are projections of
   committed events (ADR-0012). An empty command ID is treated as absent when deriving the commit ID

@@ -3,8 +3,8 @@
 // stream heads) in tables derived from the events table's name (storage format, "PostgreSQL").
 // Every commit is one READ COMMITTED transaction that runs the statements Go and Rust run, in
 // their order: the entity lock, the feature-marker check under its shared lock, the rebuild-lock
-// assertion under its own, the outcome probe, the head statement, the event inserts, the snapshot
-// upsert, then the outcome insert.
+// assertion under its own, the outcome probe, the head statement, the event inserts, the view
+// statements, the snapshot upsert, then the outcome insert.
 //
 // Each statement of a transaction needs the one before it, so they await in loops on purpose.
 /* oxlint-disable no-await-in-loop */
@@ -17,6 +17,7 @@ import {
   HistoryDependentProjectionError,
   IndeterminateError,
   OutcomeConflictError,
+  ProjectorOperationError,
   RebuildInProgressError,
   SequenceGapError,
   StreamHeadDriftError,
@@ -37,6 +38,7 @@ import {
 import {int64Argument} from '../fields.js'
 import {decodeMetadata, emptyMetadata, encodeMetadata} from '../metadata.js'
 import {type Outcome, checkCommandId} from '../outcome.js'
+import {type ProjectedView, REASON_CONDITION_FAILED} from '../projection.js'
 import {
   type CallOptions,
   type Commit,
@@ -53,8 +55,8 @@ import {
   rankFailures,
   transactionSizes,
 } from '../repository.js'
-import {compareUtf8} from '../utf8.js'
-import type {PgClient, PgConnection, PgQueryable} from './client.js'
+import {compareUtf8, utf8Length} from '../utf8.js'
+import type {PgClient, PgConnection, PgQueryable, PgResult} from './client.js'
 import {insertOutcomeSql, outcomeFromRow, outcomeRow, selectOutcomeSql} from './outcome.js'
 import {
   ENGINE_LOCK_EXCLUSIVE,
@@ -72,6 +74,15 @@ import {
   schemaDdl,
   streamHeadsTable,
 } from './schema.js'
+import {
+  type BuiltView,
+  type ViewWriter,
+  affectedRows,
+  buildViews,
+  mapViewError,
+  viewCommitError,
+  viewConditionFailed,
+} from './views.js'
 
 /** The tables a {@link PgRepository} stores its event log in. */
 export interface PgRepositoryOptions {
@@ -79,6 +90,13 @@ export interface PgRepositoryOptions {
   eventsTable?: string
   /** The snapshots table, `evt_snapshots` by default. */
   snapshotsTable?: string
+  /**
+   * Turns each commit-wide view operation into the statement that writes it to the application's
+   * own view table, run in the commit's transaction after the events and before the snapshots.
+   * Without one, a commit that carries view operations is refused with a
+   * {@link ViewsNotConfiguredError} before any write.
+   */
+  viewWriter?: ViewWriter
 }
 
 /** The backend name a projector group for the PostgreSQL repository would carry. */
@@ -105,6 +123,12 @@ const SQLSTATE = /^[0-9A-DF-Z][0-9A-Z]{4}$/
 // One statement inside a transaction: it checks the signal first, so an abort rolls back.
 type Statement = (text: string, values?: (string | null)[]) => Promise<Row[]>
 
+// A transaction's statements. `exec` runs a view writer's statement, with its own arguments, and
+// resolves the driver's whole result.
+interface TxStatement extends Statement {
+  exec(text: string, values: unknown[]): Promise<PgResult>
+}
+
 type Row = Record<string, unknown>
 
 /**
@@ -123,6 +147,7 @@ type Row = Record<string, unknown>
 export class PgRepository implements OutcomeRepository, StoreInitializer {
   readonly #client: PgClient
   readonly #tables: PgTables
+  readonly #viewWriter: ViewWriter | undefined
 
   // The manifest version this writer validated, or null until it validates.
   #validated: bigint | null = null
@@ -136,6 +161,15 @@ export class PgRepository implements OutcomeRepository, StoreInitializer {
   constructor(client: PgClient, options: PgRepositoryOptions = {}) {
     this.#client = client
     this.#tables = pgTables(options.eventsTable, options.snapshotsTable)
+    this.#viewWriter = options.viewWriter
+  }
+
+  /**
+   * It writes commit-wide view operations through its view writer. Without one, a commit that
+   * carries them is refused with a {@link ViewsNotConfiguredError}, as Go's and Rust's are.
+   */
+  writesViews(): boolean {
+    return true
   }
 
   /** The tables this repository reads and writes, folded to lower case. */
@@ -239,10 +273,6 @@ export class PgRepository implements OutcomeRepository, StoreInitializer {
   }
 
   async #write(transaction: NormalizedTransaction, options?: CallOptions): Promise<void> {
-    // There's nowhere to write view operations yet, so they're refused rather than dropped.
-    if (transaction.views.length > 0) {
-      throw new ViewsNotConfiguredError('postgres')
-    }
     for (const group of transaction.projections) {
       if (group.backend !== POSTGRES_BACKEND || group.operations.length > 0) {
         throw new EvtError(
@@ -252,12 +282,22 @@ export class PgRepository implements OutcomeRepository, StoreInitializer {
       }
     }
 
+    // The view statements are built before the budget, so each counts as one action sized by its
+    // SQL text, and before any write, so a writer that refuses one fails the whole commit.
+    const views = this.#buildViews(transaction.views)
+
     // Every backend budgets a commit the same way, so an oversized one fails before any request.
-    checkBudget(transactionSizes(transaction, () => undefined))
+    // A view's arguments are opaque, so its bytes are a lower bound, while its count is exact.
+    const sizes = transactionSizes({...transaction, views: []}, () => undefined)
+    for (const {statement} of views) {
+      sizes.push(utf8Length(statement.sql))
+    }
+    checkBudget(sizes)
     await this.#ensureStreamHeads(options)
 
     const {outcome} = transaction
-    await this.#transaction(options, outcome !== null, async (run) => {
+    const mode = {indeterminate: outcome !== null, views: views.length > 0}
+    await this.#transaction(options, mode, async (run) => {
       // Each stream once, in the bytewise order that also pins the transaction, so two
       // transactions that share streams lock them in the same sequence and can't deadlock.
       const ids = [...transaction.streams, ...transaction.fences].map(({entityId}) => entityId)
@@ -324,6 +364,9 @@ export class PgRepository implements OutcomeRepository, StoreInitializer {
       for (const stream of transaction.streams) {
         await this.#insertEvents(run, stream)
       }
+      // After the events, so a writer that lost a race fails on its head (a conflict) before it
+      // reaches a view row, and before the snapshots.
+      await execViews(run, views)
       for (const stream of transaction.streams) {
         await this.#writeCommitSnapshot(run, stream)
       }
@@ -331,6 +374,18 @@ export class PgRepository implements OutcomeRepository, StoreInitializer {
         await this.#insertOutcome(run, outcome)
       }
     })
+  }
+
+  // A commit's view statements, or a refusal when there are views and no writer.
+  #buildViews(views: readonly ProjectedView[]): BuiltView[] {
+    if (views.length === 0) {
+      return []
+    }
+    if (this.#viewWriter === undefined) {
+      throw new ViewsNotConfiguredError(POSTGRES_BACKEND)
+    }
+
+    return buildViews(views, this.#viewWriter)
   }
 
   // The outcome insert, the commit's last statement. A unique violation is a lost race.
@@ -767,15 +822,16 @@ export class PgRepository implements OutcomeRepository, StoreInitializer {
   // an IndeterminateError.
   async #transaction<T>(
     options: CallOptions | undefined,
-    indeterminate: boolean,
-    work: (run: Statement) => Promise<T>,
+    mode: TransactionMode | boolean,
+    work: (run: TxStatement) => Promise<T>,
   ): Promise<T> {
+    const flags = typeof mode === 'boolean' ? {indeterminate: mode, views: false} : mode
     const signal = options?.signal
     signal?.throwIfAborted()
 
     const client = this.#client
     if (client.connect === undefined) {
-      return serialize(client, () => inTransaction(client, signal, indeterminate, work))
+      return serialize(client, () => inTransaction(client, signal, flags, work))
     }
 
     const connection = await client.connect()
@@ -791,7 +847,7 @@ export class PgRepository implements OutcomeRepository, StoreInitializer {
 
     let broken: Error | undefined
     try {
-      return await inTransaction(connection, signal, indeterminate, work, (error) => {
+      return await inTransaction(connection, signal, flags, work, (error) => {
         broken = error
       })
     } finally {
@@ -813,22 +869,39 @@ function serialize<T>(client: PgQueryable, task: () => Promise<T>): Promise<T> {
   return result
 }
 
+// How a transaction's failures read: whether it records an outcome (`indeterminate`) and whether
+// it carries view statements (`views`).
+interface TransactionMode {
+  readonly indeterminate: boolean
+  readonly views: boolean
+}
+
 // One transaction on one connection. `broken` hears of a connection that failed to roll back.
 // With `indeterminate`, a COMMIT that fails without a database error (the connection dropped while
 // it was in flight) and an abort while it was in flight are IndeterminateErrors: the transaction
-// may have applied.
+// may have applied. With `views`, an integrity violation at COMMIT is a ProjectorError.
 async function inTransaction<T>(
   connection: PgQueryable | PgConnection,
   signal: AbortSignal | undefined,
-  indeterminate: boolean,
-  work: (run: Statement) => Promise<T>,
+  {indeterminate, views}: TransactionMode,
+  work: (run: TxStatement) => Promise<T>,
   broken?: (error: Error) => void,
 ): Promise<T> {
-  const run: Statement = async (statement, values) => {
+  const exec = async (statement: string, values: unknown[]): Promise<PgResult> => {
     signal?.throwIfAborted()
+    const result = await connection.query(statement, values)
+    rowsOf(result)
 
-    return rowsOf(await connection.query(statement, values))
+    return result
   }
+  const run: TxStatement = Object.assign(
+    async (statement: string, values?: (string | null)[]) => {
+      signal?.throwIfAborted()
+
+      return rowsOf(await connection.query(statement, values))
+    },
+    {exec},
+  )
 
   let result: T
   let committing = false
@@ -845,6 +918,10 @@ async function inTransaction<T>(
       broken?.(rollback instanceof Error ? rollback : new Error(String(rollback)))
     }
 
+    const failedViews = committing && views ? viewCommitError(error, sqlState(error)) : null
+    if (failedViews !== null) {
+      throw failedViews
+    }
     if (committing && indeterminate && sqlState(error) === null) {
       throw new IndeterminateError({cause: error})
     }
@@ -860,6 +937,26 @@ async function inTransaction<T>(
   signal?.throwIfAborted()
 
   return result
+}
+
+// Runs a commit's view statements in order. Each statement's outcome decides whether its
+// operation's condition held, and its first failure is mapped to the operation.
+async function execViews(run: TxStatement, views: readonly BuiltView[]): Promise<void> {
+  for (const built of views) {
+    let result: PgResult
+    try {
+      result = await run.exec(built.statement.sql, [...(built.statement.args ?? [])])
+    } catch (error) {
+      throw mapViewError(built, error, sqlState(error))
+    }
+
+    // A put that requires the row to be absent fails with a unique violation, never by its count.
+    const {op} = built.view
+    const counted = op.kind === 'delete' || op.condition !== 'absent'
+    if (counted && viewConditionFailed(op, affectedRows(result, built))) {
+      throw new ProjectorOperationError(built.view, REASON_CONDITION_FAILED)
+    }
+  }
 }
 
 // The SQLSTATE of an error PostgreSQL raised, or null for any other error.
