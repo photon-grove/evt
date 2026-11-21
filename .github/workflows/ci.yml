@@ -234,7 +234,7 @@ jobs:
           node packages/evt-compat/dist/fixtures.js
           node packages/evt-compat/dist/memory.js
           node packages/evt-compat/dist/lambda.js
-          (cd packages/evt && node -e "require('@photon-grove/evt'); require('@photon-grove/evt/dynamodb'); require('@photon-grove/evt/memory'); require('@photon-grove/evt/postgres'); require('@photon-grove/evt/testing')")
+          (cd packages/evt && node -e "require('@photon-grove/evt'); require('@photon-grove/evt/dynamodb'); require('@photon-grove/evt/journal'); require('@photon-grove/evt/memory'); require('@photon-grove/evt/postgres'); require('@photon-grove/evt/testing')")
           (cd packages/evt-lambda && node -e "require('@photon-grove/evt-lambda')")
 
   integration:

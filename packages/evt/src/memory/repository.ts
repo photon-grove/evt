@@ -25,12 +25,28 @@ import {
   checkSupported,
   checkWritable,
   declaresStreamHeads,
+  JOURNAL_MARKER,
+  checkJournalWriter,
+  type JournalMarker,
+  declaredAnything,
+  isJournalWriter,
+  journalDeclaration,
   entityTypeSet,
   missingHistoryDependent,
   withHistoryDependent,
+  withJournal,
   withStreamHeads,
+  withoutJournal,
 } from '../features.js'
 import {int64Argument} from '../fields.js'
+import {type JournalRow, journalRowFromView, readCounter} from '../journal/row.js'
+import {
+  COUNTER_SORT_KEY,
+  counterPartitionKey,
+  parseRowSortKey,
+  rowPartitionKey,
+  rowSortKey,
+} from '../journal/scope.js'
 import type {Metadata} from '../metadata.js'
 import {type Outcome, checkCommandId} from '../outcome.js'
 import {REASON_CONDITION_FAILED, type ViewOperation} from '../projection.js'
@@ -82,6 +98,7 @@ interface Controls {
 // Read a repository's private state, for the fixtures. The class's static block sets them.
 let streamsOf: (repo: MemRepository) => Map<string, Stream>
 let controlsOf: (repo: MemRepository) => Controls
+let viewsOf: (repo: MemRepository) => Map<string, Map<string, ViewRow>>
 
 /**
  * An in-memory {@link Repository}. Every call copies what it stores and what it returns, so a
@@ -105,7 +122,7 @@ export class MemRepository implements OutcomeRepository, StoreInitializer, Event
 
   async initialize(options?: CallOptions): Promise<boolean> {
     options?.signal?.throwIfAborted()
-    checkSupported(this.#controls.manifest)
+    checkSupported(this.#controls.manifest, isJournalWriter(this))
     if (declaresStreamHeads(this.#controls.manifest)) {
       return false
     }
@@ -148,7 +165,7 @@ export class MemRepository implements OutcomeRepository, StoreInitializer, Event
    */
   async declareHistoryDependent(types: readonly string[], options?: CallOptions): Promise<void> {
     options?.signal?.throwIfAborted()
-    checkSupported(this.#controls.manifest)
+    checkSupported(this.#controls.manifest, isJournalWriter(this))
     const missing = missingHistoryDependent(this.#controls.manifest, types)
     if (missing.length > 0) {
       this.#controls.manifest = withHistoryDependent(this.#controls.manifest, missing)
@@ -419,7 +436,7 @@ export class MemRepository implements OutcomeRepository, StoreInitializer, Event
 
     // Compaction validates the manifest, but never declares stream-heads itself.
     const {manifest} = this.#controls
-    checkWritable(manifest)
+    checkWritable(manifest, isJournalWriter(this))
 
     const stream = this.#streams.get(entityId)
     const snapshot = stream?.snapshot
@@ -444,15 +461,99 @@ export class MemRepository implements OutcomeRepository, StoreInitializer, Event
     return deleted
   }
 
+  /** A scope's journal counter: 0 when it has none. */
+  async readCounter(scope: string, options?: CallOptions): Promise<bigint> {
+    options?.signal?.throwIfAborted()
+    const row = this.#views.get(counterPartitionKey(scope))?.get(COUNTER_SORT_KEY)
+
+    return row === undefined ? 0n : readCounter(scope, row)
+  }
+
+  /** Several scopes' journal counters, in the order given. */
+  async readCounters(scopes: readonly string[], options?: CallOptions): Promise<bigint[]> {
+    options?.signal?.throwIfAborted()
+
+    return Promise.all(scopes.map((scope) => this.readCounter(scope)))
+  }
+
+  /** The highest position with a journal row in the scope: 0 when it has none. */
+  async readLastPosition(scope: string, options?: CallOptions): Promise<bigint> {
+    options?.signal?.throwIfAborted()
+    const pk = rowPartitionKey(scope)
+    const keys = [...(this.#views.get(pk)?.keys() ?? [])]
+    if (keys.length === 0) {
+      return 0n
+    }
+    keys.sort(compareUtf8)
+    const last = keys.at(-1)!
+    const position = parseRowSortKey(last)
+    if (position === null) {
+      throw new EvtError('invalidRecord', `journal row ${pk}/${last} has no position`)
+    }
+
+    return position
+  }
+
+  /** Up to `limit` journal rows of the scope above `after`, ascending by sort key. */
+  async readRows(
+    scope: string,
+    after: bigint,
+    limit: number,
+    options?: CallOptions,
+  ): Promise<JournalRow[]> {
+    options?.signal?.throwIfAborted()
+    const above = rowSortKey(after)
+    const rows = [...(this.#views.get(rowPartitionKey(scope))?.values() ?? [])].filter(
+      (row) => compareUtf8(row.sk, above) > 0,
+    )
+    rows.sort((a, b) => compareUtf8(a.sk, b.sk))
+
+    return rows.slice(0, limit).map((row) => journalRowFromView(scope, copyRow(row)))
+  }
+
+  /** The journal's declarations on this store's manifest. Internal. */
+  readonly [JOURNAL_MARKER]: JournalMarker = {
+    declareJournal: async (types, options) => {
+      options?.signal?.throwIfAborted()
+      checkJournalWriter(this)
+      // A store that holds data without stream-heads is refused by the commit, which takes the
+      // declaration back.
+      const {manifest} = this.#controls
+      checkSupported(manifest, isJournalWriter(this))
+      const declared = journalDeclaration(manifest, types)
+      // The feature, then the history, a declaration each.
+      if (declared.journal) {
+        this.#controls.manifest = withJournal(this.#controls.manifest, {journal: true, history: []})
+      }
+      if (declared.history.length > 0) {
+        this.#controls.manifest = withJournal(this.#controls.manifest, {
+          journal: false,
+          history: declared.history,
+        })
+      }
+
+      return declared
+    },
+    retractJournal: async (declared, options) => {
+      checkJournalWriter(this)
+      options?.signal?.throwIfAborted()
+      checkSupported(this.#controls.manifest, isJournalWriter(this))
+      if (declaredAnything(declared)) {
+        this.#controls.manifest = withoutJournal(this.#controls.manifest, declared)
+      }
+    },
+  }
+
   static {
     streamsOf = (repo) => repo.#streams
     controlsOf = (repo) => repo.#controls
+    viewsOf = (repo) => repo.#views
   }
 
   // Refuses a write to a store whose manifest declares an unsupported pair, and declares
   // stream-heads on a store without it, as its first writer, when the store holds no data.
   #checkManifest(): void {
-    checkSupported(this.#controls.manifest)
+    checkSupported(this.#controls.manifest, isJournalWriter(this))
     if (!declaresStreamHeads(this.#controls.manifest)) {
       this.#declareStreamHeads()
     }
@@ -582,6 +683,33 @@ export interface HeadFixtures {
  * Hooks that corrupt a repository's heads, for conformance suites only: a stream they touch
  * drifts, and every later write to it fails.
  */
+/** What the journal's conformance cases need to change a store's view rows outside a commit. */
+export interface ViewFixtures {
+  /** Writes or replaces a row, as another writer would. */
+  putView(row: ViewRow): void
+  /** Deletes a row, if there is one. */
+  deleteView(pk: string, sk: string): void
+}
+
+/**
+ * Changes a repository's view rows outside a commit, as another writer (a restore, a lost row)
+ * would, for the journal's conformance cases only.
+ */
+export function viewFixtures(repo: MemRepository): ViewFixtures {
+  const views = viewsOf(repo)
+
+  return {
+    putView(row) {
+      const partition = views.get(row.pk) ?? new Map<string, ViewRow>()
+      partition.set(row.sk, {...row, payload: copy(row.payload)})
+      views.set(row.pk, partition)
+    },
+    deleteView(pk, sk) {
+      views.get(pk)?.delete(sk)
+    },
+  }
+}
+
 export function headFixtures(repo: MemRepository): HeadFixtures {
   const streams = streamsOf(repo)
 
@@ -699,4 +827,8 @@ function copy(bytes: Uint8Array): Uint8Array {
 
 function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
   return a.length === b.length && a.every((byte, index) => byte === b[index])
+}
+
+function copyRow(row: ViewRow): ViewRow {
+  return {...row, payload: copy(row.payload)}
 }

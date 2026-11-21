@@ -78,6 +78,7 @@ import {
   projectStreams,
   serializeEvents,
 } from './staging.js'
+import {JournalRowTooLargeError} from './journal/config.js'
 import type {CommitProjector, ProjectedView} from './projection.js'
 import {compareUtf8} from './utf8.js'
 import {
@@ -458,6 +459,11 @@ export class Store {
       if (attempt.kind === 'done') {
         return attempt.outcome
       }
+      // A journal row over its cap refuses this command, not the store: it's recorded as the
+      // command's rejection, so a replay of the command ID gets the same answer.
+      if (attempt.error instanceof JournalRowTooLargeError) {
+        return persistRejection(repository, pending, config, attempt.error.toRejection(), options)
+      }
 
       const kind = retryKind(attempt.error, attempt.phase)
       if (kind === 'never') {
@@ -601,6 +607,11 @@ export class Store {
       const attempt = await this.#attemptWithOutcome(aggregate, entityId, command, pending, options)
       if (attempt.kind === 'done') {
         return attempt.outcome
+      }
+      // A journal row over its cap refuses this command, not the store: it's recorded as the
+      // command's rejection, so a replay of the command ID gets the same answer.
+      if (attempt.error instanceof JournalRowTooLargeError) {
+        return persistRejection(repository, pending, config, attempt.error.toRejection(), options)
       }
 
       const kind = retryKind(attempt.error, attempt.phase)

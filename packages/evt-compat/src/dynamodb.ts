@@ -29,8 +29,11 @@ import {
 } from '@photon-grove/evt/dynamodb'
 
 import {type HeadFixtures, conformance, markerConformance} from './conformance.js'
+import {Journal, JournalRepository} from '@photon-grove/evt/journal'
+
 import {dynamoControls} from './controls.js'
 import {Checks, canonical} from './harness.js'
+import {journalConformance, journalStoreCases} from './journal-conformance.js'
 import {viewRepositoryConformance} from './view-conformance.js'
 
 // Only a local emulator: a loopback address or a .localhost name.
@@ -80,6 +83,7 @@ try {
   await retention(created)
   await views(created)
   await viewRepository(created)
+  await journal(created)
 } finally {
   await Promise.all(created.map(deleteTable))
 }
@@ -411,6 +415,55 @@ async function refuses(
 }
 
 // An events table, whose sort key is the event sequence, or a views table, whose sort key is text.
+// The journal's cases, on an initialized store whose journal rows go to its own views table, and
+// the fresh-store cases on tables of their own.
+async function journal(tables: string[]): Promise<void> {
+  const table = await freshTable(tables)
+  const viewsTable = `evt-ts-journal-views-${run}`
+  await createTable(viewsTable, 'S')
+  tables.push(viewsTable)
+  await new DynamoRepository(client, table).initialize()
+
+  const reader = new DynamoViewRepository(client, viewsTable)
+  await journalConformance(checks, {
+    repo: new DynamoRepository(client, table, {viewsTable}),
+    manifest: async () => dynamoControls(client, table).manifest(),
+    views: {
+      getViewAt: (pk, sk) => reader.getViewAt(pk, sk),
+      putView: (row) => reader.putView(row),
+      deleteView: (pk, sk) => reader.deleteView(pk, sk),
+      listViewsByPk: (pk) => reader.listViewsByPk(pk),
+    },
+    handle: () => new DynamoRepository(client, table, {viewsTable}),
+  })
+  await checks.case(
+    'dynamodb journal: a strict writer refuses an uninitialized store before declaring',
+    async () => {
+      const fresh = await freshTable(tables)
+      const strict = new DynamoRepository(client, fresh, {viewsTable})
+      const journaled = new JournalRepository(
+        strict,
+        new Journal(['ledger'], (event) => [`ledger:${event.entityId}`]),
+      )
+      await refuses(
+        journaled.commit({entityId: 'a', events: [ledgerEvent('a', 1)]}),
+        StoreNotInitializedError,
+        'a journaled commit',
+      )
+      ensure((await manifestOf(fresh)) === null, 'the refusal declared nothing')
+    },
+  )
+  await journalStoreCases(checks, async () => {
+    const fresh = await freshTable(tables)
+
+    // Lazy, so an empty store validates and the cases decide its refusals.
+    return {
+      repo: new DynamoRepository(client, fresh, {viewsTable, lazyInitialization: true}),
+      manifest: async () => dynamoControls(client, fresh).manifest(),
+    }
+  })
+}
+
 async function createTable(name: string, sortKey: 'N' | 'S' = 'N'): Promise<void> {
   await client.createTable({
     TableName: name,
