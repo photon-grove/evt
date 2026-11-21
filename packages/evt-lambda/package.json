@@ -1,0 +1,53 @@
+{
+  "name": "@photon-grove/evt-lambda",
+  "version": "0.0.0",
+  "private": true,
+  "description": "AWS Lambda helpers for @photon-grove/evt: DynamoDB Streams event decode, event source mapping filter patterns, journal wake-ups, and partial batch failures.",
+  "keywords": [
+    "event-sourcing",
+    "dynamodb",
+    "lambda",
+    "aws",
+    "streams"
+  ],
+  "homepage": "https://github.com/photon-grove/evt/tree/main/packages/evt-lambda#readme",
+  "bugs": "https://github.com/photon-grove/evt/issues",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/photon-grove/evt.git",
+    "directory": "packages/evt-lambda"
+  },
+  "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=22.12"
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "peerDependencies": {
+    "@photon-grove/evt": "workspace:^"
+  },
+  "scripts": {
+    "build": "tsc",
+    "check": "tsc --noEmit && tsc -p tsconfig.test.json && oxlint --deny-warnings && node scripts/check-imports.ts",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@photon-grove/evt": "workspace:*",
+    "@types/aws-lambda": "8.10.164",
+    "@types/node": "^26.6.6",
+    "oxlint": "1.94.0",
+    "typescript": "^7.0.2",
+    "vitest": "5.1.1"
+  }
+}

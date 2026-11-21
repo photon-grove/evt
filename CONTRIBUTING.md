@@ -44,6 +44,13 @@ proto install bun && proto install deno
 moon run evt-ts:check evt-ts:test evt-ts:runtimes
 ```
 
+The Lambda helpers in `packages/evt-lambda` have the same three tasks. `evt-lambda:test` and
+`evt-lambda:runtimes` run the `lambda.json` vectors through `packages/evt-compat/dist/lambda.js`:
+
+```sh
+moon run evt-lambda:check evt-lambda:test evt-lambda:runtimes
+```
+
 CI also runs the fixture runner on Node 22.12, the oldest Node that `engines` allows.
 
 ## Integration tests

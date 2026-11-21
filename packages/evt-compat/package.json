@@ -2,7 +2,7 @@
   "name": "@photon-grove/evt-compat",
   "version": "0.0.0",
   "private": true,
-  "description": "The fixture runner and live-run driver that hold @photon-grove/evt to the shared compat/fixtures vectors.",
+  "description": "The fixture runner and live-run driver that hold @photon-grove/evt and @photon-grove/evt-lambda to the shared compat/fixtures vectors.",
   "license": "Apache-2.0",
   "type": "module",
   "scripts": {
@@ -11,7 +11,8 @@
     "fixtures": "node dist/fixtures.js"
   },
   "dependencies": {
-    "@photon-grove/evt": "workspace:*"
+    "@photon-grove/evt": "workspace:*",
+    "@photon-grove/evt-lambda": "workspace:*"
   },
   "devDependencies": {
     "@aws-sdk/client-dynamodb": "3.1171.0",

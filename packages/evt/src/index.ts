@@ -156,6 +156,7 @@ export {
   type TransactionCommit,
   type TransactionalRepository,
   commitAsTransaction,
+  isReserved,
   normalizeTransaction,
 } from './repository.js'
 export {
