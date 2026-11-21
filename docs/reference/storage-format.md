@@ -1852,9 +1852,10 @@ It declares `journal` with the first journaled commit ([Journal](#feature-marker
 ([Compaction](#journal-compaction)). A
 fourth, `postgres-views` (format version 1, `photon-evt` 0.3, ADR 0008), records that a
 PostgreSQL store's commit-wide views live in its evt-owned [views table](#postgresql-views-table).
-Rust models it (it is in `SUPPORTED_FEATURES`), and a Rust PostgreSQL repository without the views
-table refuses a store that declares it with `UnsupportedFeature`, on commits, snapshot writes,
-compaction and rebuild view writes. Go does not model it, so a Go writer refuses the store too. The `historyDependent` set declares the entity types whose commit-wide projectors are
+Rust and TypeScript model it (it is in their `SUPPORTED_FEATURES`), and a PostgreSQL repository of
+either without the views table refuses a store that declares it with `UnsupportedFeature`, on
+commits, snapshot writes, compaction and (Rust) rebuild view writes. Go does not model it, so a Go
+writer refuses the store too. The `historyDependent` set declares the entity types whose commit-wide projectors are
 history-dependent ([Views](#views)), compaction is forbidden for them. The `retention` set
 declares the entity types configured with retention (a positive `ttl`), fences are refused for
 them ([Read fences](#read-fences)). Both sets are JSON arrays of entity-type names, sorted and deduplicated,
@@ -3333,8 +3334,8 @@ compare-and-set, so its journal reads are refused with `ViewsNotConfigured`.
 
 The schema is created by Go's `postgres.Repository.EnsureSchema`, Rust's
 `PostgresRepository::ensure_schema` or TypeScript's `PgRepository.ensureSchema`, which run the same
-idempotent DDL. Rust's also creates the
-Rust-only [views table](#postgresql-views-table), which Go's does not. Table names default to
+idempotent DDL. Rust's and TypeScript's also create the
+[views table](#postgresql-views-table), which Go's does not. Table names default to
 `evt_events` and `evt_snapshots` and can be changed in every implementation. The v0.9 auxiliary
 relations derive from the configured events table name through a reserved infix
 (`{events}__evt_command_outcomes`, `{events}__evt_features`, `{events}__evt_rebuild_lock`,
@@ -3708,11 +3709,17 @@ name.)
 
 ### PostgreSQL views table
 
-[ADR 0008](../adr/0008-postgresql-views-table-and-journal.md), `photon-evt` 0.3, Rust only.
-Implemented: the table and its DDL, the view repository (`PgViewRepository`), the commit target
-(`with_views_table()`) with the expected-payload condition, and the `postgres-views` marker
-feature. The conformance suites of commit-wide views, the expected payload, the view repository and
-the rebuild run on it.
+[ADR 0008](../adr/0008-postgresql-views-table-and-journal.md), `photon-evt` 0.3, Rust and
+TypeScript. Implemented in Rust: the table and its DDL, the view repository (`PgViewRepository`),
+the commit target (`with_views_table()`) with the expected-payload condition, and the
+`postgres-views` marker feature. The conformance suites of commit-wide views, the expected payload,
+the view repository and the rebuild run on it. TypeScript implements the same table, view
+repository (`PgViewRepository`), commit target (`viewsTable: true`) and marker feature, without the
+expected-payload condition or rebuild view writes, which it doesn't model yet; its view repository
+and commit-wide view cases run on it. TypeScript differs only where storage can't see it: an
+encoding other than `UTF8` is `invalidArgument` (Rust `InvalidConfig`), its commit statements end in
+`RETURNING 1` where their row count decides the condition, and its batch read is one statement over
+all the keys.
 
 `ensure_schema` creates one more derived relation, the views table, and two indexes:
 
@@ -3842,9 +3849,9 @@ declaration takes the exclusive marker lock), once per handle and its clones, af
 database is `UTF8`. It then requires the feature: a store that stops declaring it (an operator
 removed it) fails the commit as `Error::Transient`, and the retry declares it again. A writer that
 does not support it refuses the store with `UnsupportedFeature`, as for any unknown feature
-([Feature marker](#feature-marker)): a Go writer and a Rust repository that uses `with_view_writer`
-or no view target cannot write a store whose views live in `{events}__evt_views`, so commit-wide
-rows never split across two tables.
+([Feature marker](#feature-marker)): a Go writer, and a Rust or TypeScript repository that uses a
+view writer or no view target, cannot write a store whose views live in `{events}__evt_views`, so
+commit-wide rows never split across two tables.
 
 ### Journal on PostgreSQL
 

@@ -15,7 +15,6 @@ import {
   EvtError,
   FenceConflictError,
   HistoryDependentProjectionError,
-  IndeterminateError,
   OutcomeConflictError,
   ProjectorOperationError,
   RebuildInProgressError,
@@ -23,11 +22,14 @@ import {
   StreamHeadDriftError,
   StreamHeadsNotMigratedError,
   TransientError,
+  UnsupportedFeatureError,
   ViewsNotConfiguredError,
 } from '../errors.js'
 import type {SerializedEvent, SerializedSnapshot} from '../event.js'
 import {
   type FeatureManifest,
+  POSTGRES_VIEWS_FEATURE,
+  POSTGRES_VIEWS_VERSION,
   checkSupported,
   checkWritable,
   declaresStreamHeads,
@@ -57,7 +59,7 @@ import {
   transactionSizes,
 } from '../repository.js'
 import {compareUtf8, utf8Length} from '../utf8.js'
-import type {PgClient, PgConnection, PgQueryable, PgResult} from './client.js'
+import type {PgClient, PgResult} from './client.js'
 import {manifestWrite} from './marker.js'
 import {insertOutcomeSql, outcomeFromRow, outcomeRow, selectOutcomeSql} from './outcome.js'
 import {
@@ -75,16 +77,30 @@ import {
   rebuildLockTable,
   schemaDdl,
   streamHeadsTable,
+  viewsDdl,
+  viewsTable,
 } from './schema.js'
+import {
+  type Row,
+  type Statement,
+  type TransactionMode,
+  type TxStatement,
+  nullableText,
+  query,
+  sqlState,
+  text,
+  transaction as runTransaction,
+} from './session.js'
 import {
   type BuiltView,
   type ViewWriter,
   affectedRows,
   buildViews,
   mapViewError,
-  viewCommitError,
   viewConditionFailed,
+  viewsTableStatements,
 } from './views.js'
+import {PgViewRepository, checkViewsEncoding} from './view-repository.js'
 
 /** The tables a {@link PgRepository} stores its event log in. */
 export interface PgRepositoryOptions {
@@ -95,10 +111,19 @@ export interface PgRepositoryOptions {
   /**
    * Turns each commit-wide view operation into the statement that writes it to the application's
    * own view table, run in the commit's transaction after the events and before the snapshots.
-   * Without one, a commit that carries view operations is refused with a
+   * Without one, or {@link viewsTable}, a commit that carries view operations is refused with a
    * {@link ViewsNotConfiguredError} before any write.
    */
   viewWriter?: ViewWriter
+  /**
+   * Makes the evt-owned views table, `{events}__evt_views` ({@link PgViewRepository}), the target
+   * of each commit's view operations, in place of a {@link viewWriter}: a repository has one or
+   * the other, and setting both fails with `invalidArgument`. evt builds each statement with the
+   * DynamoDB repository's owner rules, sizes it in the commit budget as its DynamoDB item, and
+   * declares the `postgres-views` feature before the first write, so a writer that would put the
+   * views elsewhere refuses the store. The database must be `UTF8`. Rust's `with_views_table()`.
+   */
+  viewsTable?: boolean
 }
 
 /** The backend name a projector group for the PostgreSQL repository would carry. */
@@ -111,27 +136,8 @@ const EVENT_COLUMNS =
   'event_id, sequence::text AS sequence, event_type, version::text AS version, entity_id, ' +
   "entity_type, encode(payload, 'hex') AS payload, metadata::text AS metadata"
 
-// SQLSTATEs for which PostgreSQL rolled the transaction back and a retry may not hit again: a
-// serialization failure and a detected deadlock.
-const TRANSIENT_STATES = new Set(['40001', '40P01'])
-
 // A unique violation, which the outcome insert raises when another writer recorded the outcome.
 const UNIQUE_VIOLATION = '23505'
-
-// The shape of a SQLSTATE: five digits or capital letters. No class starts with E, so a Node
-// system error code such as EPIPE never matches.
-const SQLSTATE = /^[0-9A-DF-Z][0-9A-Z]{4}$/
-
-// One statement inside a transaction: it checks the signal first, so an abort rolls back.
-type Statement = (text: string, values?: (string | null)[]) => Promise<Row[]>
-
-// A transaction's statements. `exec` runs a view writer's statement, with its own arguments, and
-// resolves the driver's whole result.
-interface TxStatement extends Statement {
-  exec(text: string, values: unknown[]): Promise<PgResult>
-}
-
-type Row = Record<string, unknown>
 
 /**
  * A {@link Repository} on PostgreSQL, through any client shaped like `pg`'s `Pool`
@@ -150,9 +156,14 @@ export class PgRepository implements OutcomeRepository, StoreInitializer {
   readonly #client: PgClient
   readonly #tables: PgTables
   readonly #viewWriter: ViewWriter | undefined
+  // Whether commits write their views to the views table, which #viewRepository reads.
+  readonly #viewsTable: boolean
+  readonly #viewRepository: PgViewRepository
 
   // The manifest version this writer validated, or null until it validates.
   #validated: bigint | null = null
+  // Whether this writer saw the manifest declare postgres-views, so it declares it only once.
+  #viewsDeclared = false
   // Whether the rebuild-lock table exists, which a commit's assertion probes for until it does.
   #rebuildReady = false
 
@@ -164,14 +175,34 @@ export class PgRepository implements OutcomeRepository, StoreInitializer {
     this.#client = client
     this.#tables = pgTables(options.eventsTable, options.snapshotsTable)
     this.#viewWriter = options.viewWriter
+    this.#viewsTable = options.viewsTable === true
+    if (this.#viewsTable && this.#viewWriter !== undefined) {
+      throw new EvtError(
+        'invalidArgument',
+        'postgres: a repository writes its views to the views table or through a view writer, ' +
+          'not both',
+      )
+    }
+    this.#viewRepository = new PgViewRepository(client, this.#tables)
   }
 
   /**
-   * It writes commit-wide view operations through its view writer. Without one, a commit that
-   * carries them is refused with a {@link ViewsNotConfiguredError}, as Go's and Rust's are.
+   * It writes commit-wide view operations to its views table or through its view writer. With
+   * neither, a commit that carries them is refused with a {@link ViewsNotConfiguredError}, as
+   * Go's and Rust's are.
    */
   writesViews(): boolean {
     return true
+  }
+
+  /**
+   * The view repository over this event log's views table, `{events}__evt_views`, which
+   * {@link PgRepository.ensureSchema} creates: the table commits write their views to with
+   * `viewsTable: true`, so a handler can commit and then read its own rows. Every read sees every
+   * committed transaction.
+   */
+  viewRepository(): PgViewRepository {
+    return this.#viewRepository
   }
 
   /** The tables this repository reads and writes, folded to lower case. */
@@ -181,12 +212,14 @@ export class PgRepository implements OutcomeRepository, StoreInitializer {
 
   /**
    * Creates the event log's tables if they don't exist, with the DDL Go and Rust run
-   * ({@link schemaDdl}), under the schema lock they take. Safe to call on every start.
+   * ({@link schemaDdl}), and the views table ({@link viewsDdl}), which Rust's `ensure_schema`
+   * creates and Go's `EnsureSchema` doesn't, under the schema lock they take. Safe to call on
+   * every start.
    */
   async ensureSchema(options?: CallOptions): Promise<void> {
     await this.#transaction(options, false, async (run) => {
       await run(SCHEMA_LOCK, [this.#tables.events])
-      for (const statement of statements(schemaDdl(this.#tables))) {
+      for (const statement of statements(schemaDdl(this.#tables) + viewsDdl(this.#tables))) {
         await run(statement)
       }
     })
@@ -307,18 +340,25 @@ export class PgRepository implements OutcomeRepository, StoreInitializer {
       }
     }
 
-    // The view statements are built before the budget, so each counts as one action sized by its
-    // SQL text, and before any write, so a writer that refuses one fails the whole commit.
+    // The view statements are built before the budget and before any write, so a writer that
+    // refuses one fails the whole commit.
     const views = this.#buildViews(transaction.views)
 
     // Every backend budgets a commit the same way, so an oversized one fails before any request.
-    // A view's arguments are opaque, so its bytes are a lower bound, while its count is exact.
-    const sizes = transactionSizes({...transaction, views: []}, () => undefined)
-    for (const {statement} of views) {
-      sizes.push(utf8Length(statement.sql))
+    // A views-table statement counts as the DynamoDB item it mirrors, so the budget refuses the
+    // same commits it refuses on DynamoDB. A view writer's statement counts its SQL text: its
+    // arguments are opaque, so its bytes are a lower bound, while its count is exact.
+    const sizes = this.#viewsTable
+      ? transactionSizes(transaction, () => undefined)
+      : transactionSizes({...transaction, views: []}, () => undefined)
+    if (!this.#viewsTable) {
+      for (const {statement} of views) {
+        sizes.push(utf8Length(statement.sql))
+      }
     }
     checkBudget(sizes)
     await this.#ensureStreamHeads(options)
+    await this.#ensureViewsDeclared(options)
 
     const {outcome} = transaction
     const mode = {indeterminate: outcome !== null, views: views.length > 0}
@@ -333,7 +373,7 @@ export class PgRepository implements OutcomeRepository, StoreInitializer {
         }
       }
 
-      const manifest = await this.#checkManifest(run)
+      const manifest = await this.#checkManifest(run, this.#viewsTable)
       const retention = manifest.retention
       checkFenceRetention(transaction, (entityType) => retention.includes(entityType))
       await this.#assertNoRebuildLock(run)
@@ -401,10 +441,13 @@ export class PgRepository implements OutcomeRepository, StoreInitializer {
     })
   }
 
-  // A commit's view statements, or a refusal when there are views and no writer.
+  // A commit's view statements, or a refusal when there are views and nowhere to write them.
   #buildViews(views: readonly ProjectedView[]): BuiltView[] {
     if (views.length === 0) {
       return []
+    }
+    if (this.#viewsTable) {
+      return viewsTableStatements(viewsTable(this.#tables), views)
     }
     if (this.#viewWriter === undefined) {
       throw new ViewsNotConfiguredError(POSTGRES_BACKEND)
@@ -574,6 +617,7 @@ export class PgRepository implements OutcomeRepository, StoreInitializer {
     return this.#transaction(options, false, async (run) => {
       await run(ENGINE_LOCK_SHARED, [featuresLockKey(this.#tables)])
       const manifest = await this.#readManifest(run)
+      this.#refuseForeignViews(manifest)
       checkWritable(manifest)
 
       const rows = await run(
@@ -613,18 +657,77 @@ export class PgRepository implements OutcomeRepository, StoreInitializer {
     const manifest = await this.#readManifest((statement, values) =>
       this.#read(statement, values),
     )
+    this.#refuseForeignViews(manifest)
     checkSupported(manifest)
     if (!declaresStreamHeads(manifest)) {
       await this.initialize(options)
     }
   }
 
+  // Declares postgres-views on a store whose views live in the views table, once per writer, after
+  // checking the database is UTF8. It runs before the write's transaction, which holds the shared
+  // lock a declaration would wait for, and the commit checks the declaration again under that lock.
+  async #ensureViewsDeclared(options: CallOptions | undefined): Promise<void> {
+    if (!this.#viewsTable || this.#viewsDeclared) {
+      return
+    }
+
+    await checkViewsEncoding(this.#viewRepository, options)
+    // Read first, without a lock: a store that declares it needs no exclusive lock, which would
+    // wait for every open commit and hold back new ones.
+    const observed = await this.#readManifest((statement, values) => this.#read(statement, values))
+    const version = observed?.features.get(POSTGRES_VIEWS_FEATURE)
+    if (version !== undefined && version !== POSTGRES_VIEWS_VERSION) {
+      throw new UnsupportedFeatureError([{name: POSTGRES_VIEWS_FEATURE, version}])
+    }
+    if (version !== undefined) {
+      this.#viewsDeclared = true
+      return
+    }
+
+    try {
+      await this.#transaction(options, false, async (run) => {
+        await run(ENGINE_LOCK_EXCLUSIVE, [featuresLockKey(this.#tables)])
+        const manifest = await this.#readManifest(run)
+        // A version of postgres-views other than this package's is unsupported, like any feature
+        // this package doesn't model, and nothing is declared on such a store.
+        checkSupported(manifest)
+        if (!manifest?.features.has(POSTGRES_VIEWS_FEATURE)) {
+          await this.#writeManifest(run, manifest, withPostgresViews(manifest))
+        }
+      })
+    } finally {
+      // A declaration moved the version: the next write reads it again.
+      this.#validated = null
+    }
+
+    this.#viewsDeclared = true
+  }
+
+  // Refuses a store that declares postgres-views unless this writer writes its views to the views
+  // table, so a store's commit-wide views never split between the views table and an
+  // application's tables.
+  #refuseForeignViews(manifest: FeatureManifest | null): void {
+    const version = manifest?.features.get(POSTGRES_VIEWS_FEATURE)
+    if (version !== undefined && !this.#viewsTable) {
+      throw new UnsupportedFeatureError([{name: POSTGRES_VIEWS_FEATURE, version}])
+    }
+  }
+
   // The commit-time marker check, under the manifest's shared lock held to COMMIT, so a
   // declaration can't slip between the check and the write. A manifest that changed since this
-  // writer validated it is validated again.
-  async #checkManifest(run: Statement): Promise<FeatureManifest> {
+  // writer validated it is validated again. A store that declares postgres-views is refused unless
+  // this writer has the views table, and with `views` (a commit through the views table, which
+  // #ensureViewsDeclared declared it for) a store that no longer declares it is a TransientError,
+  // whose retry declares it again.
+  async #checkManifest(run: Statement, views = false): Promise<FeatureManifest> {
     await run(ENGINE_LOCK_SHARED, [featuresLockKey(this.#tables)])
     const manifest = await this.#readManifest(run)
+    this.#refuseForeignViews(manifest)
+    if (views && !manifest?.features.has(POSTGRES_VIEWS_FEATURE)) {
+      this.#viewsDeclared = false
+      throw new TransientError('the store no longer declares postgres-views; declaring it again')
+    }
     if (manifest !== null && manifest.version === this.#validated) {
       return manifest
     }
@@ -819,135 +922,17 @@ export class PgRepository implements OutcomeRepository, StoreInitializer {
 
   // One statement outside a transaction.
   async #read(statement: string, values?: (string | null)[]): Promise<Row[]> {
-    const client = this.#client
-    if (client.connect !== undefined) {
-      return rowsOf(await client.query(statement, values))
-    }
-
-    return serialize(client, async () => rowsOf(await client.query(statement, values)))
+    return query(this.#client, statement, values)
   }
 
-  // Runs `work` in one READ COMMITTED transaction on a connection of its own, and commits it. A
-  // failure, an abort included, rolls it back. A serialization failure or a deadlock is transient.
-  // For a commit that records an outcome (`indeterminate`), a `COMMIT` whose result is unknown is
-  // an IndeterminateError.
+  // Runs `work` in one READ COMMITTED transaction (see `transaction`).
   async #transaction<T>(
     options: CallOptions | undefined,
     mode: TransactionMode | boolean,
     work: (run: TxStatement) => Promise<T>,
   ): Promise<T> {
-    const flags = typeof mode === 'boolean' ? {indeterminate: mode, views: false} : mode
-    const signal = options?.signal
-    signal?.throwIfAborted()
-
-    const client = this.#client
-    if (client.connect === undefined) {
-      return serialize(client, () => inTransaction(client, signal, flags, work))
-    }
-
-    const connection = await client.connect()
-    if (typeof connection?.query !== 'function' || typeof connection.release !== 'function') {
-      if (typeof connection?.release === 'function') {
-        connection.release()
-      }
-      throw new EvtError(
-        'invalidArgument',
-        "the PostgreSQL client's connect() lent no connection: pass a pool, such as pg's Pool",
-      )
-    }
-
-    let broken: Error | undefined
-    try {
-      return await inTransaction(connection, signal, flags, work, (error) => {
-        broken = error
-      })
-    } finally {
-      connection.release(broken)
-    }
+    return runTransaction(this.#client, options, mode, work)
   }
-
-}
-
-// The operations queued on each single-connection client, shared by every repository on it: two
-// transactions on one session would share its locks, and one's ROLLBACK would undo the other.
-const queues = new WeakMap<PgQueryable, Promise<unknown>>()
-
-// Runs `task` on a single-connection client after every task queued on it before.
-function serialize<T>(client: PgQueryable, task: () => Promise<T>): Promise<T> {
-  const result = (queues.get(client) ?? Promise.resolve()).then(task, task)
-  queues.set(client, result.catch(() => undefined))
-
-  return result
-}
-
-// How a transaction's failures read: whether it records an outcome (`indeterminate`) and whether
-// it carries view statements (`views`).
-interface TransactionMode {
-  readonly indeterminate: boolean
-  readonly views: boolean
-}
-
-// One transaction on one connection. `broken` hears of a connection that failed to roll back.
-// With `indeterminate`, a COMMIT that fails without a database error (the connection dropped while
-// it was in flight) and an abort while it was in flight are IndeterminateErrors: the transaction
-// may have applied. With `views`, an integrity violation at COMMIT is a ProjectorError.
-async function inTransaction<T>(
-  connection: PgQueryable | PgConnection,
-  signal: AbortSignal | undefined,
-  {indeterminate, views}: TransactionMode,
-  work: (run: TxStatement) => Promise<T>,
-  broken?: (error: Error) => void,
-): Promise<T> {
-  const exec = async (statement: string, values: unknown[]): Promise<PgResult> => {
-    signal?.throwIfAborted()
-    const result = await connection.query(statement, values)
-    rowsOf(result)
-
-    return result
-  }
-  const run: TxStatement = Object.assign(
-    async (statement: string, values?: (string | null)[]) => {
-      signal?.throwIfAborted()
-
-      return rowsOf(await connection.query(statement, values))
-    },
-    {exec},
-  )
-
-  let result: T
-  let committing = false
-  try {
-    await connection.query('START TRANSACTION ISOLATION LEVEL READ COMMITTED')
-    result = await work(run)
-    signal?.throwIfAborted()
-    committing = true
-    await connection.query('COMMIT')
-  } catch (error) {
-    try {
-      await connection.query('ROLLBACK')
-    } catch (rollback) {
-      broken?.(rollback instanceof Error ? rollback : new Error(String(rollback)))
-    }
-
-    const failedViews = committing && views ? viewCommitError(error, sqlState(error)) : null
-    if (failedViews !== null) {
-      throw failedViews
-    }
-    if (committing && indeterminate && sqlState(error) === null) {
-      throw new IndeterminateError({cause: error})
-    }
-
-    throw transient(error)
-  }
-
-  // An abort while the COMMIT was in flight rejects too, though the commit may have applied, as
-  // CallOptions promises: there is nothing left to roll back.
-  if (indeterminate && signal?.aborted) {
-    throw new IndeterminateError({cause: signal.reason})
-  }
-  signal?.throwIfAborted()
-
-  return result
 }
 
 // Runs a commit's view statements in order. Each statement's outcome decides whether its
@@ -970,23 +955,6 @@ async function execViews(run: TxStatement, views: readonly BuiltView[]): Promise
   }
 }
 
-// The SQLSTATE of an error PostgreSQL raised, or null for any other error.
-function sqlState(error: unknown): string | null {
-  const code = typeof error === 'object' && error !== null ? (error as {code?: unknown}).code : null
-
-  return typeof code === 'string' && SQLSTATE.test(code) ? code : null
-}
-
-// A driver error PostgreSQL raised for a rollback a retry may not hit again, as a TransientError.
-function transient(error: unknown): unknown {
-  const code = sqlState(error)
-  if (code !== null && TRANSIENT_STATES.has(code)) {
-    return new TransientError(`PostgreSQL rolled the transaction back (${code})`, {cause: error})
-  }
-
-  return error
-}
-
 // The statements of a DDL script, one at a time, since a driver's extended protocol runs one per
 // call. Each ends at a semicolon that ends its line and comes before a blank line, a CREATE, an
 // ALTER, a DO or the end, which no statement inside the DO block's body is followed by.
@@ -995,30 +963,6 @@ function statements(ddl: string): string[] {
     .split(/;\n(?=\n|CREATE |ALTER |DO |$)/)
     .map((statement) => statement.trim())
     .filter((statement) => statement !== '')
-}
-
-function rowsOf(result: {rows?: readonly unknown[]} | undefined): Row[] {
-  const rows = result?.rows
-  if (!Array.isArray(rows)) {
-    throw new EvtError('invalidRecord', 'the PostgreSQL client returned a result without rows')
-  }
-
-  return rows as Row[]
-}
-
-// A text column of a row that may be NULL.
-function nullableText(row: Row, column: string): string | null {
-  return row[column] === null ? null : text(row, column)
-}
-
-// A text column of a row.
-function text(row: Row, column: string): string {
-  const value = row[column]
-  if (typeof value !== 'string') {
-    throw new EvtError('invalidRecord', `the PostgreSQL row has no text column ${column}`)
-  }
-
-  return value
 }
 
 function eventFromRow(row: Row): SerializedEvent {
@@ -1072,6 +1016,19 @@ function conflict(entityId: string): ConflictError {
     entityId,
     'conditional check failed: the sequence or snapshot changed since it was read',
   )
+}
+
+// The manifest with postgres-views declared and its version bumped.
+function withPostgresViews(manifest: FeatureManifest | null): FeatureManifest {
+  const features = new Map(manifest?.features)
+  features.set(POSTGRES_VIEWS_FEATURE, POSTGRES_VIEWS_VERSION)
+
+  return {
+    version: (manifest?.version ?? 0n) + 1n,
+    features,
+    historyDependent: manifest?.historyDependent ?? [],
+    retention: manifest?.retention ?? [],
+  }
 }
 
 // A stored head of 0 is an absent head.

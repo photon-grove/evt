@@ -1,3 +1,7 @@
+import {readFileSync} from 'node:fs'
+import {dirname, join} from 'node:path'
+import {fileURLToPath} from 'node:url'
+
 import {describe, expect, test} from 'vitest'
 
 import {EvtError} from '../src/errors.ts'
@@ -12,8 +16,12 @@ import {
   pgTables,
   rebuildGenerationTable,
   rebuildLockKey,
+  MAX_VIEW_INDEX_KEY_BYTES,
+  MAX_VIEW_PAGE_ROWS,
   SCHEMA_LOCK,
   schemaDdl,
+  viewsDdl,
+  viewsTable,
 } from '../src/postgres/schema.ts'
 
 // The error pgTables throws for a pair of names it refuses.
@@ -109,5 +117,31 @@ describe('PostgreSQL locks', () => {
     expect(ENTITY_LOCK).toBe('SELECT pg_advisory_xact_lock(1702261760, hashtext($1))')
     expect(ENGINE_LOCK_SHARED).toBe('SELECT pg_advisory_xact_lock_shared(1702261761, hashtext($1))')
     expect(ENGINE_LOCK_EXCLUSIVE).toBe('SELECT pg_advisory_xact_lock(1702261761, hashtext($1))')
+  })
+})
+
+describe('PostgreSQL views table', () => {
+  test('derives its name from the events table and stays out of the shared DDL', () => {
+    const tables = pgTables('Orders', 'orders_snaps')
+    expect(viewsTable(tables)).toBe('orders__evt_views')
+    expect(schemaDdl(tables)).not.toContain('__evt_views')
+    // Every views relation fits the identifier limit at the longest events table name.
+    const longest = viewsTable(pgTables('e'.repeat(MAX_EVENTS_TABLE_NAME_BYTES)))
+    expect(`${longest}_type_idx`.length).toBeLessThanOrEqual(63)
+  })
+
+  // There is no fixture for the views table's DDL, which only Rust runs, so this reads Rust's
+  // source: the DDL and the bounds must match it byte for byte.
+  test("is Rust's views_ddl, with Rust's bounds", () => {
+    const wire = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), '../../../crates/evt/src/wire/postgres.rs'),
+      'utf8',
+    )
+    const body = /pub fn views_ddl[\s\S]*?format!\(\s*r#"([\s\S]*?)"#/.exec(wire)?.[1]
+    expect(body).toBeDefined()
+    expect(viewsDdl(pgTables('orders'))).toBe(body!.replaceAll('{views}', 'orders__evt_views'))
+    expect(wire).toContain(`MAX_VIEW_INDEX_KEY_BYTES: usize = 2_600;`)
+    expect(wire).toContain(`MAX_VIEW_PAGE_ROWS: usize = 1_000;`)
+    expect([MAX_VIEW_INDEX_KEY_BYTES, MAX_VIEW_PAGE_ROWS]).toEqual([2600, 1000])
   })
 })
