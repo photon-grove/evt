@@ -1468,7 +1468,10 @@ pub(crate) async fn pre_check<R: Repository>(
 ///   `window` (bounded backoff via [`Repository::backoff`]): present with the same digest, the
 ///   commit won; another digest, [`Error::IdempotencyKeyReuse`]; still absent when the window ends
 ///   (or unreadable), a retryable [`Error::AmbiguousWrite`], never "not applied", because a
-///   transaction can land after any single read. The handler is never re-run.
+///   transaction can land after any single read. The handler is never re-run;
+/// - a DynamoDB transaction conflict on the outcome put polls the row briefly (up to 150 ms), and
+///   any other conflict, which may also be the loser of a race for the same command ID, reads it
+///   once: present, the winner's outcome is replayed; absent, the error stands.
 pub(crate) async fn settle<R: Repository>(
     repository: &R,
     command_id: &CommandId,
@@ -1522,12 +1525,33 @@ pub(crate) async fn settle<R: Repository>(
                 }),
             }
         }
+        // A DynamoDB transaction conflict on the outcome put: only another attempt of the same
+        // command writes that item, and its transaction was still committing, so one read right
+        // away can miss its row. Poll briefly; absent after that, the error stands as below.
+        Err(conflict) if collided_on_outcome_row(&conflict) => {
+            let polled = poll_for_row(
+                || repository.outcome(command_id),
+                |step| repository.backoff(step),
+                |limit| repository.deadline(limit),
+                window.min(OUTCOME_ROW_CONFLICT_WINDOW),
+            )
+            .await;
+
+            match polled {
+                Polled::Found(stored) => {
+                    Ok(Settled::Replayed(Box::new(same_command(*stored, digest)?)))
+                }
+                // A malformed row is corruption, not a conflict to retry past.
+                Polled::Corrupt(err) => Err(err),
+                _ => Err(conflict),
+            }
+        }
         // An ordinary conflict may be the loser of a race for the same command ID: the winner's
         // row exists by now. Re-read once, so the retry's pre-check is not needed to find it. That
         // includes a fence conflict: the winner wrote the very stream the loser fenced, and a
         // backend that asserts fences before inserting the outcome (PostgreSQL) reports the fence,
-        // not the lost outcome put, and a DynamoDB transaction conflict: the loser was cancelled
-        // while the winner's transaction held the outcome item. Absent, the error stands and the
+        // not the lost outcome put, and a DynamoDB transaction conflict on another item: the loser
+        // was cancelled while the winner's transaction held it. Absent, the error stands and the
         // fence-aware retry runs; a failed read keeps the error.
         Err(conflict) if may_have_lost_the_race(&conflict) => {
             match read_bounded(repository, command_id, window).await {
@@ -1540,6 +1564,23 @@ pub(crate) async fn settle<R: Repository>(
             }
         }
         Err(other) => Err(other),
+    }
+}
+
+/// How long [`settle`] polls the outcome row after a DynamoDB transaction conflict on the outcome
+/// put: reads at 0, 50 and 150 ms, never past the recovery window. The winner's transaction was
+/// committing when the loser was cancelled, and DynamoDB transactions finish in milliseconds. A
+/// winner that fails leaves no row, so the poll stays short rather than waiting out the window.
+const OUTCOME_ROW_CONFLICT_WINDOW: Duration = Duration::from_millis(150);
+
+/// Reports whether a failed commit is a DynamoDB transaction conflict on its own outcome put
+/// ([`TransactionConflict::on_outcome_row`](crate::error::TransactionConflict::on_outcome_row)).
+fn collided_on_outcome_row(error: &Error) -> bool {
+    match error {
+        Error::Transient(source) => source
+            .downcast_ref::<crate::error::TransactionConflict>()
+            .is_some_and(crate::error::TransactionConflict::on_outcome_row),
+        _ => false,
     }
 }
 
@@ -2208,5 +2249,142 @@ mod tests {
         let throttled = Err(Error::Transient("throttled".into()));
         let settled = settle(&repository, &won, &digest, window, throttled).await;
         assert!(matches!(settled, Err(Error::Transient(_))), "{settled:?}");
+    }
+
+    /// A repository whose outcome row appears only on the `appears`th read, as a winner's does
+    /// when its transaction is still committing.
+    struct LateRow<R> {
+        inner: R,
+        reads: std::sync::atomic::AtomicUsize,
+        appears: usize,
+    }
+
+    impl<R> LateRow<R> {
+        fn reads(&self) -> usize {
+            self.reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl<R: Repository> Repository for LateRow<R> {
+        type Operation = R::Operation;
+
+        async fn commit(&self, commit: crate::Commit<R::Operation>) -> Result<(), Error> {
+            self.inner.commit(commit).await
+        }
+
+        async fn outcome(&self, command_id: &CommandId) -> Result<Option<Outcome>, Error> {
+            let read = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if read < self.appears {
+                return Ok(None);
+            }
+
+            self.inner.outcome(command_id).await
+        }
+
+        async fn events(
+            &self,
+            entity_id: &crate::EntityId,
+        ) -> Result<Vec<crate::SerializedEvent>, Error> {
+            self.inner.events(entity_id).await
+        }
+
+        async fn events_after(
+            &self,
+            entity_id: &crate::EntityId,
+            after: crate::EventSequence,
+        ) -> Result<Vec<crate::SerializedEvent>, Error> {
+            self.inner.events_after(entity_id, after).await
+        }
+
+        async fn latest(
+            &self,
+            entity_id: &crate::EntityId,
+            n: usize,
+        ) -> Result<Vec<crate::SerializedEvent>, Error> {
+            self.inner.latest(entity_id, n).await
+        }
+
+        async fn snapshot(
+            &self,
+            entity_id: &crate::EntityId,
+        ) -> Result<Option<crate::SerializedSnapshot>, Error> {
+            self.inner.snapshot(entity_id).await
+        }
+
+        async fn put_snapshot(&self, snapshot: &crate::SerializedSnapshot) -> Result<bool, Error> {
+            self.inner.put_snapshot(snapshot).await
+        }
+
+        async fn compact_below(
+            &self,
+            entity_id: &crate::EntityId,
+            through: crate::EventSequence,
+        ) -> Result<usize, Error> {
+            self.inner.compact_below(entity_id, through).await
+        }
+
+        async fn entity_heads(
+            &self,
+            entity_type: Option<&crate::EntityType>,
+        ) -> Result<std::collections::BTreeMap<crate::EntityId, crate::EventSequence>, Error>
+        {
+            self.inner.entity_heads(entity_type).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transaction_conflict_on_the_outcome_row_polls_for_the_winner() {
+        use crate::conformance::{Add, Ledger};
+        use crate::error::TransactionConflict;
+        use crate::{MemRepository, Metadata, Store};
+
+        let inner = MemRepository::new();
+        let won = CommandId::new("won");
+        Store::<Ledger, _>::new(&inner, ())
+            .with_outcomes(OutcomeConfig::new())
+            .execute_with_outcome(
+                "ledger",
+                Add(1),
+                Metadata::new("local").with_command_id("won"),
+            )
+            .await
+            .unwrap();
+        let digest = inner.outcome(&won).await.unwrap().unwrap().digest;
+        let late = |appears| LateRow {
+            inner: &inner,
+            reads: 0.into(),
+            appears,
+        };
+
+        let window = Duration::from_secs(10);
+        let on_outcome_row = || {
+            Err(Error::Transient(Box::new(
+                TransactionConflict::new("ledger".into(), "cancelled").with_outcome_row(),
+            )))
+        };
+        let elsewhere = || {
+            Err(Error::Transient(Box::new(TransactionConflict::new(
+                "ledger".into(),
+                "cancelled",
+            ))))
+        };
+
+        // On the outcome put: the winner's row, found on the third read.
+        let repository = late(3);
+        let settled = settle(&repository, &won, &digest, window, on_outcome_row()).await;
+        assert!(matches!(settled, Ok(Settled::Replayed(_))), "{settled:?}");
+        assert_eq!(repository.reads(), 3);
+
+        // The poll is short: a row that never appears ends it after three reads, transient.
+        let repository = late(usize::MAX);
+        let settled = settle(&repository, &won, &digest, window, on_outcome_row()).await;
+        assert!(matches!(settled, Err(Error::Transient(_))), "{settled:?}");
+        assert_eq!(repository.reads(), 3);
+
+        // On another item the winner may be another command: one read, and the error stands.
+        let repository = late(2);
+        let settled = settle(&repository, &won, &digest, window, elsewhere()).await;
+        assert!(matches!(settled, Err(Error::Transient(_))), "{settled:?}");
+        assert_eq!(repository.reads(), 1);
     }
 }

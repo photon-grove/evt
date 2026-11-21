@@ -427,9 +427,14 @@ func (repo *Repository) classifyCommitFailure(
 		}
 
 		// Another transaction was writing one of the items: transient, not an optimistic conflict,
-		// as in Rust. Fence-aware retry runs the command again but never records it as stale.
+		// as in Rust. Fence-aware retry runs the command again but never records it as stale. On
+		// the outcome put it can only be another attempt of the same command, which the store waits
+		// for.
 		if hasTransactionConflict(err) {
-			return wrapClassifiedError(fmt.Errorf("%w: %w", ErrTransactionConflict, err))
+			outcome := controlItems + len(transactItems) + len(layout.views) + layout.outcomeIndex
+			onOutcomeRow := layout.hasOutcome && codeAt(cancellationCodes(err), outcome) == "TransactionConflict"
+
+			return wrapClassifiedError(&transactionConflictError{err: err, onOutcomeRow: onOutcomeRow})
 		}
 
 		// A commit that carries an outcome and fails indeterminately is resolved by re-reading the

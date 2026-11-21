@@ -1412,13 +1412,24 @@ impl DynamoRepository {
             )));
         }
 
-        // A concurrent transaction is reported on the item it collided with.
+        // A concurrent transaction is reported on the item it collided with. One on the outcome
+        // put can only be another attempt of the same command, which the store waits for.
         let colliding = failed_items(&codes, "TransactionConflict").next();
         let entity = colliding
             .and_then(|index| layout.entity_at(index))
             .unwrap_or_else(|| layout.fallback.clone());
+        let on_outcome_row =
+            failed_items(&codes, "TransactionConflict").any(|index| Some(index) == layout.outcome);
 
-        classify_transaction_error(&entity, layout.projector_items(), carries_outcome, err)
+        match classify_transaction_error(&entity, layout.projector_items(), carries_outcome, err) {
+            Error::Transient(source) if on_outcome_row => {
+                match source.downcast::<TransactionConflict>() {
+                    Ok(conflict) => Error::Transient(Box::new((*conflict).with_outcome_row())),
+                    Err(source) => Error::Transient(source),
+                }
+            }
+            other => other,
+        }
     }
 
     async fn query_events(
@@ -5397,6 +5408,42 @@ mod tests {
         let error = classified(&[(1, "TransactionConflict"), (9, "ConditionalCheckFailed")]).await;
         assert!(error.is_conflict(), "{error:?}");
         assert!(transaction_conflict(&error).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_transaction_conflict_on_the_outcome_put_says_so() {
+        let repository = views_repository();
+        let commit = view_commit();
+        let (items, mut layout) = repository
+            .transaction_stream_items(&commit, ValidatedMarker::Version(3))
+            .unwrap();
+        // The outcome put is the last action, after every stream item.
+        let outcome = items.len();
+        layout.outcome = Some(outcome);
+
+        let conflict_on = |failed: &[usize]| {
+            let mut codes = vec![Some("None"); outcome + 1];
+            for index in failed {
+                codes[*index] = Some("TransactionConflict");
+            }
+
+            codes
+        };
+
+        for (failed, expected) in [
+            (vec![outcome], true),
+            (vec![7, outcome], true),
+            (vec![1], false),
+            (vec![7], false),
+        ] {
+            let error = repository
+                .classify_commit_failure(&layout, true, cancelled(&conflict_on(&failed)))
+                .await;
+            let conflict = transaction_conflict(&error).expect("a TransactionConflict source");
+
+            assert_eq!(conflict.on_outcome_row(), expected, "items {failed:?}");
+            assert!(error.is_retryable() && !error.is_conflict(), "{error:?}");
+        }
     }
 
     #[tokio::test]
