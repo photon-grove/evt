@@ -88,6 +88,13 @@ import type {ProjectedView} from './projection.js'
  * - `journalRowTooLarge`: a journal row is over the configured size cap. Nothing was written.
  * - `expectedPayloadUnsupported`: the journal was asked to commit through a repository that
  *   doesn't apply the expected-payload view condition its counters need. Nothing was written.
+ * - `journalGone`: a journal page asked for rows below the scope's compaction floor: install the
+ *   snapshot it names.
+ * - `journalSnapshotMoved`: a compaction snapshot's chunk is missing or doesn't match its
+ *   manifest. Retryable: read the manifest again.
+ * - `foreignJournalRow`: a row in a journal compaction partition isn't the engine's.
+ * - `compactionLeaseHeld`: another compaction holds the scope's unexpired lease.
+ * - `compactionLeaseLost`: a compaction's lease no longer matches: it lapsed or was taken.
  */
 export type EvtErrorCode =
   | 'invalidJson'
@@ -140,6 +147,11 @@ export type EvtErrorCode =
   | 'invalidJournal'
   | 'journalRowTooLarge'
   | 'expectedPayloadUnsupported'
+  | 'journalGone'
+  | 'journalSnapshotMoved'
+  | 'foreignJournalRow'
+  | 'compactionLeaseHeld'
+  | 'compactionLeaseLost'
 
 export class EvtError extends Error {
   override readonly name: string = 'EvtError'
@@ -955,7 +967,8 @@ export function isRetryable(error: unknown): boolean {
       error.code === 'rebuildEpochChanged' ||
       error.code === 'featureManifestChanged' ||
       error.code === 'transient' ||
-      error.code === 'ambiguousWrite')
+      error.code === 'ambiguousWrite' ||
+      error.code === 'journalSnapshotMoved')
   )
 }
 

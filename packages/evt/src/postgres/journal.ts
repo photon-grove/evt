@@ -5,6 +5,7 @@
 // flight.
 
 import {EvtError} from '../errors.js'
+import {compactionPartitionKey} from '../journal/compaction.js'
 import {type JournalRow, journalRowFromView, readCounter} from '../journal/row.js'
 import {
   COUNTER_SORT_KEY,
@@ -101,9 +102,6 @@ export async function readRows(
   return rows.map((row) => journalRowFromView(scope, viewRowFrom(row)))
 }
 
-// The partition of a scope's journal compaction rows (storage format, "Journal compaction").
-const COMPACTION_PARTITION_PREFIX = 'journal-compaction#'
-
 /** A row of the scope's journal compaction partition at `sk`, or null, in one statement. */
 export async function readCompactionRow(
   client: PgClient,
@@ -116,7 +114,7 @@ export async function readCompactionRow(
   const rows = await query(
     client,
     `SELECT ${VIEW_COLUMNS} FROM ${table} WHERE pk = $1 AND sk = $2`,
-    [COMPACTION_PARTITION_PREFIX + checkScope(scope), sk],
+    [compactionPartitionKey(checkScope(scope)), sk],
   )
 
   return rows[0] === undefined ? null : viewRowFrom(rows[0])

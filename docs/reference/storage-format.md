@@ -3182,7 +3182,8 @@ again. The engine's regroup-and-replay of the projector
 ### Journal compaction
 
 Journal compaction (ADR 0005) deletes a scope's oldest rows, `1..=checkpoint`, after storing them as a
-snapshot: a manifest and its chunks. The checkpoint becomes the scope's floor. A reader
+snapshot: a manifest and its chunks. Rust implements it on every backend, and TypeScript on its
+in-memory and DynamoDB repositories. The checkpoint becomes the scope's floor. A reader
 whose cursor is below the floor gets a `410 Gone` handoff naming the snapshot, installs it, and pages
 on from the checkpoint. Compaction is explicit (an operator or a scheduled job calls it), per scope,
 and never runs in a command or read path. It never touches events: the journaled entity types are
