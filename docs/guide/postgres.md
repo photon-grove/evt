@@ -262,7 +262,8 @@ repository's owner rules, so you write no SQL, and counts each one in the commit
 DynamoDB item, so the budget refuses the same commits on both backends. The repository declares the
 `postgres-views` marker feature before its first commit, after which a Go writer, or a Rust or
 TypeScript repository without the views table, refuses the store instead of putting views somewhere
-else. The TypeScript repository doesn't apply an expected payload yet, nor does it journal. The [sync journal](../reference/storage-format.md#journal) works on PostgreSQL through the same table:
+else. The TypeScript repository applies the journal's expected-payload condition there too, though
+it doesn't journal on PostgreSQL yet. The [sync journal](../reference/storage-format.md#journal) works on PostgreSQL through the same table:
 wrap the repository in a `JournalRepository` and it journals, pages and compacts as it does on
 DynamoDB. Each journaled commit runs `pg_notify` per scope it wrote, and a `JournalListener`
 (one dedicated connection) turns those into wake-ups: page the scope it names, and every scope on

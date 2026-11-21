@@ -815,8 +815,11 @@ transaction as the events. The byte-level rules are in the
   writer without the views table (Go's, and Rust's or TypeScript's with a view writer or none)
   refuses a store that declares it on commits, snapshot writes and compaction, so a store's views
   never split across two tables. Initialization still succeeds on such a store.
-- TypeScript doesn't apply the expected-payload condition or write rebuild views on PostgreSQL yet;
-  Rust does both on the views table.
+- With the views table, and only with it, the engine's expected payload (the journal's counter) is a
+  compare-and-set: `UPDATE ... WHERE pk, sk, entity_id = owner AND payload = expected`, and no row
+  fails the condition (`appliesExpectedPayload()` / `applies_expected_payload()` is true). Through a
+  view writer it is refused with `invalidViewOperation` / `InvalidViewOperation` before any write.
+- TypeScript doesn't write rebuild views on PostgreSQL yet; Rust does on the views table.
 
 ## Journal (X1, Rust-first)
 

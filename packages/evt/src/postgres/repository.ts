@@ -196,6 +196,15 @@ export class PgRepository implements OutcomeRepository, StoreInitializer {
   }
 
   /**
+   * Whether it applies a view put's engine-only expected payload (the journal's counter): with the
+   * views table, whose statements evt builds, as Rust's does. A view writer can't express it, so
+   * a commit that carries one through a writer is refused before any write.
+   */
+  appliesExpectedPayload(): boolean {
+    return this.#viewsTable
+  }
+
+  /**
    * The view repository over this event log's views table, `{events}__evt_views`, which
    * {@link PgRepository.ensureSchema} creates: the table commits write their views to with
    * `viewsTable: true`, so a handler can commit and then read its own rows. Every read sees every

@@ -12,7 +12,13 @@ import {
 } from '../src/errors.ts'
 import {type SerializedEvent, eventId} from '../src/event.ts'
 import {emptyMetadata} from '../src/metadata.ts'
-import {type ProjectedView, type ViewOperation, deleteView, putView} from '../src/projection.ts'
+import {
+  type ProjectedView,
+  type ViewOperation,
+  deleteView,
+  expectPayload,
+  putView,
+} from '../src/projection.ts'
 import type {PgClient, PgConnection, PgResult} from '../src/postgres/client.ts'
 import {PgRepository, type PgRepositoryOptions} from '../src/postgres/repository.ts'
 import type {PgViewRepository} from '../src/postgres/view-repository.ts'
@@ -884,6 +890,46 @@ describe('PgRepository views table', () => {
     })
     const views = new PgRepository(client, {viewsTable: true}).viewRepository()
     expect(await rejection(call(views, controller.signal))).toMatchObject({message: 'stop'})
+  })
+
+  test("applies the expected payload as a compare-and-set on the owner's row", async () => {
+    const {client, log, values} = tableStore()
+    const repo = new PgRepository(client, {viewsTable: true})
+    expect(repo.appliesExpectedPayload()).toBe(true)
+    const counter = putView('k', 'COUNTER', 'a', 'journal-counter', '{"n":2}')
+    await commitViews(repo, expectPayload(counter, new TextEncoder().encode('{"n":1}')))
+
+    const update = log.findIndex((text) => text.startsWith('UPDATE evt_events__evt_views'))
+    expect(log[update]).toBe(
+      'UPDATE evt_events__evt_views SET entity_type = $4, payload = $5, ttl = 0 ' +
+        'WHERE pk = $1 AND sk = $2 AND entity_id = $3 AND payload = $6 RETURNING 1',
+    )
+    expect(values[update]).toEqual(['k', 'COUNTER', 'a', 'journal-counter', '{"n":2}', '{"n":1}'])
+    expect(log.at(-1)).toBe('COMMIT')
+  })
+
+  test('a stale expected payload fails the condition and writes nothing', async () => {
+    const {client, log} = tableStore({
+      respond: (text) => (text.startsWith('UPDATE evt_events__evt_views') ? {rows: []} : undefined),
+    })
+    const counter = putView('k', 'COUNTER', 'a', 'journal-counter', '{"n":2}', {conflict: 'moved'})
+    const stale = expectPayload(counter, new TextEncoder().encode('{"n":0}'))
+    const error = await rejection(commitViews(new PgRepository(client, {viewsTable: true}), stale))
+    expect(error).toMatchObject({reason: 'ConditionalCheckFailed', mapped: 'moved'})
+    expect(log.at(-1)).toBe('ROLLBACK')
+  })
+
+  test('a view writer refuses an expected payload before any query', async () => {
+    const {client, log} = fake()
+    const repo = new PgRepository(client, {viewWriter: writer})
+    expect(repo.appliesExpectedPayload()).toBe(false)
+    const counter = putView('k', 'COUNTER', 'a', 'journal-counter', '{}')
+    const error = await rejection(
+      commitViews(repo, expectPayload(counter, new TextEncoder().encode('{}'))),
+    )
+    expect(error).toMatchObject({code: 'invalidViewOperation'})
+    expect((error as Error).message).toContain('a view writer cannot apply an expected payload')
+    expect(log).toEqual([])
   })
 
   test('takes the views table or a view writer, not both', () => {
