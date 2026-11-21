@@ -725,8 +725,9 @@ transaction as the events. The byte-level rules are in the
   ID and the events and state of those types only (other streams by ID and type), and the
   store durably adds them to the manifest's `historyDependent` set before the first commit that runs
   it (`CompactBelow` then refuses them in every process). A repository that cannot declare
-  (`evt.HistoryDeclarer`) refuses the commit (`HistoryDeclarationUnsupportedError`), and a store its
-  writer refuses as uninitialized is refused before anything is declared.
+  (`evt.HistoryDeclarer`; TypeScript `declareHistoryDependent`) refuses the commit
+  (`HistoryDeclarationUnsupportedError`; TypeScript `historyDeclarationUnsupported`), and a store
+  its writer refuses as uninitialized is refused before anything is declared.
 - Every operation of every projector names an owner stream the commit wrote (of a declared type
   for a history-dependent projector). The owner is stored as the row's `entityID`, and every write
   to the row (put or delete) is conditioned on it: DynamoDB
@@ -751,10 +752,7 @@ transaction as the events. The byte-level rules are in the
 - A repository must declare `evt.ViewWritingRepository` (its `WritesViews()` returns true; a
   decorator returns the wrapped repository's; Rust `Repository::writes_views`; TypeScript
   `writesViews()`) or the store refuses a commit-wide projector (`ViewsUnsupportedError`, TypeScript
-  `viewsUnsupported`). TypeScript runs only current-state projectors so far: it can't declare
-  history-dependent entity types yet, so it refuses a projector that names a `history` with
-  `historyDeclarationUnsupported`, as Go and Rust refuse one on a backend that can't declare;
-  `CheckProjectorOperationsSupported`
+  `viewsUnsupported`). `CheckProjectorOperationsSupported`
   stays fail-closed for view operations.
 
 **Operations**

@@ -102,6 +102,38 @@ export function withStreamHeads(manifest: FeatureManifest | null): FeatureManife
   }
 }
 
+/**
+ * The entity types not yet in the manifest's historyDependent set, in order and without
+ * duplicates. A store with no manifest declares nothing, so every type is missing.
+ */
+export function missingHistoryDependent(
+  manifest: FeatureManifest | null,
+  types: readonly string[],
+): string[] {
+  const declared = new Set(manifest?.historyDependent)
+  const missing: string[] = []
+  for (const entityType of types) {
+    if (!declared.has(entityType) && !missing.includes(entityType)) {
+      missing.push(entityType)
+    }
+  }
+
+  return missing
+}
+
+/** The manifest with the entity types added to its historyDependent set and its version bumped. */
+export function withHistoryDependent(
+  manifest: FeatureManifest | null,
+  types: readonly string[],
+): FeatureManifest {
+  return {
+    version: (manifest?.version ?? 0n) + 1n,
+    features: new Map(manifest?.features),
+    historyDependent: entityTypeSet([...(manifest?.historyDependent ?? []), ...types]),
+    retention: manifest?.retention ?? [],
+  }
+}
+
 /** A manifest's stored JSON texts, as the marker row holds them. */
 export interface ManifestTexts {
   /** A JSON object, feature name to stored-format version, keys sorted. `{}` when empty. */

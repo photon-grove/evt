@@ -531,7 +531,8 @@ kind can give it again, and the declaration is enforced, not trusted:
 
 Before the first commit that runs a history-dependent projector, the store durably adds its entity
 types to the manifest's `historyDependent` set ([Feature marker](#feature-marker)). A repository
-that cannot declare (Go `evt.HistoryDeclarer`, Rust `Repository::declare_history_dependent`)
+that cannot declare (Go `evt.HistoryDeclarer`, Rust `Repository::declare_history_dependent`,
+TypeScript `Repository.declareHistoryDependent`)
 refuses the commit with `HistoryDeclarationUnsupported` before any write, and so does a repository
 whose feature-marker table does not match its events table. So `CompactBelow` refuses those types
 in every process, whether or not it registered the projector.
@@ -2693,8 +2694,9 @@ write path that validates the marker: commits (outcome-only and rejection commit
 `PutSnapshot`, `CompactBelow`, and the mutating `evt-doctor` commands other than `init` and
 `migrate-heads`. The paths that make their own marker declarations consult the marker before
 declaring, so a refused store is refused without any declaration of its own. That covers the Rust
-journal's first journaled commit and Go's `DeclareHistoryDependent`, which a history-dependent
-projector's first commit runs before the commit is sent. Read-only paths do not need it.
+journal's first journaled commit and Go's `DeclareHistoryDependent` (TypeScript's
+`declareHistoryDependent`), which a history-dependent projector's first commit runs before the
+commit is sent. Read-only paths do not need it.
 
 A store whose marker does not declare the feature (no marker row, or a row without it) is declared
 by initializing it: Go `StoreInitializer.Initialize`, which every repository implements, Rust

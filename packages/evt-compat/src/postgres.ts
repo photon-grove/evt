@@ -9,7 +9,6 @@ import {Pool} from 'pg'
 
 import {
   CommitTooLargeError,
-  type FeatureManifest,
   POSTGRES_VIEWS_FEATURE,
   type ProjectedView,
   ProjectorError,
@@ -21,9 +20,7 @@ import {
   ViewKeyTooLongError,
   type ViewOperation,
   type ViewRow,
-  decodeManifest,
   emptyMetadata,
-  encodeManifest,
   encodeMetadata,
   deleteView,
   eventId,
@@ -34,11 +31,10 @@ import {type PgClient, PgRepository, type ViewWriter} from '@photon-grove/evt/po
 import {
   type ControlFixtures,
   type HeadFixtures,
-  type ManifestDraft,
-  type RebuildState,
   conformance,
   markerConformance,
 } from './conformance.js'
+import {postgresControls} from './controls.js'
 import {Checks} from './harness.js'
 import {postgresViewDdl, postgresViewWriter} from './pgviews.js'
 import {viewRepositoryConformance} from './view-conformance.js'
@@ -64,7 +60,7 @@ try {
 
   // The marker cases declare store-wide, so they get a log of their own.
   const marked = await freshLog()
-  await markerConformance(checks, marked, controlFixtures(marked))
+  await markerConformance(checks, marked, controls(marked))
 
   // A client without connect() is one connection, which the repository runs one operation at a
   // time on, as it would PGlite.
@@ -142,7 +138,7 @@ async function postgresCases(): Promise<void> {
   await checks.case("postgres: a writer's first write declares stream-heads", async () => {
     const repo = await freshLog()
     await repo.commit({entityId: 'a', events: [ledgerEvent('a', 1)]})
-    const manifest = await controlFixtures(repo).manifest()
+    const manifest = await controls(repo).manifest()
     ensure(manifest?.version === 1n, 'the first write declares version 1')
     ensure(manifest.features.get('stream-heads') === 1, 'it declares stream-heads')
   })
@@ -153,7 +149,7 @@ async function postgresCases(): Promise<void> {
     const declared = await Promise.all(repos.map((each) => each.initialize()))
     ensure(declared.filter(Boolean).length === 1, `one call declares: got ${declared}`)
     ensure(!(await repo.initialize()), 'initializing again declares nothing')
-    ensure((await controlFixtures(repo).manifest())?.version === 1n, 'the version bumps once')
+    ensure((await controls(repo).manifest())?.version === 1n, 'the version bumps once')
   })
 
   await checks.case('postgres: a store holding data without stream-heads is refused', async () => {
@@ -165,7 +161,7 @@ async function postgresCases(): Promise<void> {
       StreamHeadsNotMigratedError,
       'a commit',
     )
-    ensure((await controlFixtures(repo).manifest()) === null, 'nothing was declared')
+    ensure((await controls(repo).manifest()) === null, 'nothing was declared')
   })
 
   await checks.case('postgres: a cached writer validates a declaration as it commits', async () => {
@@ -174,9 +170,9 @@ async function postgresCases(): Promise<void> {
 
     // The commit reads the manifest under the shared lock, so a supported declaration needs no
     // retry, and an unsupported one refuses the next commit.
-    await controlFixtures(repo).declare((draft) => draft.retention.push('session'))
+    await controls(repo).declare((draft) => draft.retention.push('session'))
     await repo.commit({entityId: 'a', events: [ledgerEvent('a', 2)]})
-    await controlFixtures(repo).declare((draft) => draft.features.set('journal', 1))
+    await controls(repo).declare((draft) => draft.features.set('journal', 1))
     await refuses(
       repo.commit({entityId: 'a', events: [ledgerEvent('a', 3)]}),
       UnsupportedFeatureError,
@@ -189,8 +185,8 @@ async function postgresCases(): Promise<void> {
     const first = await freshLog()
     const second = await freshLog()
     await first.commit({entityId: 'a', events: [ledgerEvent('a', 1)]})
-    await controlFixtures(first).declare((draft) => draft.features.set('journal', 1))
-    await controlFixtures(first).setRebuild({generation: 1n, lock: 'held'})
+    await controls(first).declare((draft) => draft.features.set('journal', 1))
+    await controls(first).setRebuild({generation: 1n, lock: 'held'})
 
     // The same entity in the other log has its own head, marker and rebuild fence.
     await second.commit({entityId: 'a', events: [ledgerEvent('a', 1)]})
@@ -502,7 +498,7 @@ async function viewsTableCases(): Promise<void> {
     async () => {
       const repo = await tableLog()
       await repo.commit({entityId: 'a', events: [ledgerEvent('a', 1)]})
-      const manifest = await controlFixtures(repo).manifest()
+      const manifest = await controls(repo).manifest()
       ensure(manifest?.features.get(POSTGRES_VIEWS_FEATURE) === 1, 'the feature is declared')
 
       const {events, snapshots} = repo.tables
@@ -550,14 +546,14 @@ async function viewsTableCases(): Promise<void> {
     async () => {
       const repo = await tableLog()
       await repo.commit({entityId: 'a', events: [ledgerEvent('a', 1)]})
-      await controlFixtures(repo).declare((draft) => draft.features.delete(POSTGRES_VIEWS_FEATURE))
+      await controls(repo).declare((draft) => draft.features.delete(POSTGRES_VIEWS_FEATURE))
       await refuses(
         repo.commit({entityId: 'a', events: [ledgerEvent('a', 2)]}),
         TransientError,
         'a commit after the declaration was lost',
       )
       await repo.commit({entityId: 'a', events: [ledgerEvent('a', 2)]})
-      const manifest = await controlFixtures(repo).manifest()
+      const manifest = await controls(repo).manifest()
       ensure(manifest?.features.get(POSTGRES_VIEWS_FEATURE) === 1, 'declared again')
       ensure((await repo.events('a')).length === 2, 'the retry committed')
     },
@@ -654,6 +650,11 @@ async function reason(call: Promise<unknown>, want: string, what: string): Promi
   throw new Error(`${what}: resolved, want a ProjectorOperationError`)
 }
 
+// The log's marker and rebuild-fence rows, written straight to its tables.
+function controls(repo: PgRepository): ControlFixtures {
+  return postgresControls(pool, repo.tables.events)
+}
+
 function repoTables(repo: PgRepository): {eventsTable: string; snapshotsTable: string} {
   return {eventsTable: repo.tables.events, snapshotsTable: repo.tables.snapshots}
 }
@@ -728,72 +729,6 @@ function headFixtures(repo: PgRepository): HeadFixtures {
       )
 
       return rows[0] === undefined ? null : BigInt(rows[0].head)
-    },
-  }
-}
-
-// Writes the marker and rebuild-fence rows straight to the tables, as another writer would.
-function controlFixtures(repo: PgRepository): ControlFixtures {
-  const {events} = repo.tables
-  const features = `${events}__evt_features`
-
-  const manifest = async (): Promise<FeatureManifest | null> => {
-    const {rows} = await pool.query<Record<string, string>>(
-      'SELECT version::text AS version, features, history_dependent, retention ' +
-        `FROM ${features} WHERE id = 0`,
-    )
-    const row = rows[0]
-
-    return row === undefined
-      ? null
-      : decodeManifest(BigInt(row['version']!), {
-          features: row['features']!,
-          historyDependent: row['history_dependent']!,
-          retention: row['retention']!,
-        })
-  }
-
-  return {
-    manifest,
-    async declare(change: (draft: ManifestDraft) => void) {
-      const stored = await manifest()
-      const draft: ManifestDraft = {
-        features: new Map(stored?.features),
-        historyDependent: [...(stored?.historyDependent ?? [])],
-        retention: [...(stored?.retention ?? [])],
-      }
-      change(draft)
-
-      const texts = encodeManifest({...draft, version: 0n})
-      const version = ((stored?.version ?? 0n) + 1n).toString()
-      await pool.query(
-        `INSERT INTO ${features} (id, version, features, history_dependent, retention) ` +
-          'VALUES (0, $1::bigint, $2, $3, $4) ON CONFLICT (id) DO UPDATE SET ' +
-          'version = EXCLUDED.version, features = EXCLUDED.features, ' +
-          'history_dependent = EXCLUDED.history_dependent, retention = EXCLUDED.retention',
-        [version, texts.features, texts.historyDependent, texts.retention],
-      )
-
-      // Read back as stored: each set sorted and deduplicated.
-      return (await manifest())!
-    },
-    async setRebuild(state: RebuildState) {
-      // PostgreSQL keeps no lock row for a force-release: the generation row's flag records it.
-      const generation = state.generation.toString()
-      await pool.query(
-        `INSERT INTO ${events}__evt_rebuild_generation (id, value, force_released) ` +
-          'VALUES (0, $1::bigint, $2) ON CONFLICT (id) DO UPDATE SET ' +
-          'value = EXCLUDED.value, force_released = EXCLUDED.force_released',
-        [generation, state.lock === 'forceReleased'],
-      )
-      await pool.query(`DELETE FROM ${events}__evt_rebuild_lock WHERE id = 0`)
-      if (state.lock === 'held') {
-        await pool.query(
-          `INSERT INTO ${events}__evt_rebuild_lock (id, owner, generation, lease_expires_at) ` +
-            "VALUES (0, 'conformance', $1::bigint, now() + interval '5 minutes')",
-          [generation],
-        )
-      }
     },
   }
 }

@@ -34,7 +34,8 @@ import {
   checkWritable,
   declaresStreamHeads,
   decodeManifest,
-  encodeManifest,
+  missingHistoryDependent,
+  withHistoryDependent,
   withStreamHeads,
 } from '../features.js'
 import {int64Argument} from '../fields.js'
@@ -59,6 +60,7 @@ import {
 } from '../repository.js'
 import {compareUtf8, utf8Length} from '../utf8.js'
 import type {PgClient, PgResult} from './client.js'
+import {manifestWrite} from './marker.js'
 import {insertOutcomeSql, outcomeFromRow, outcomeRow, selectOutcomeSql} from './outcome.js'
 import {
   ENGINE_LOCK_EXCLUSIVE,
@@ -249,6 +251,29 @@ export class PgRepository implements OutcomeRepository, StoreInitializer {
         await this.#writeManifest(run, manifest, withStreamHeads(manifest))
 
         return true
+      })
+    } finally {
+      // A declaration moved the version: the next write reads it again.
+      this.#validated = null
+    }
+  }
+
+  /**
+   * Adds the entity types to the feature manifest's historyDependent set in one declaration under
+   * the manifest's exclusive lock, so compaction refuses them in every process. Types already
+   * declared are left alone, and nothing is written when there are none to add. A store that
+   * declares an unsupported feature is refused first.
+   */
+  async declareHistoryDependent(types: readonly string[], options?: CallOptions): Promise<void> {
+    try {
+      await this.#transaction(options, false, async (run) => {
+        await run(ENGINE_LOCK_EXCLUSIVE, [featuresLockKey(this.#tables)])
+        const manifest = await this.#readManifest(run)
+        checkSupported(manifest)
+        const missing = missingHistoryDependent(manifest, types)
+        if (missing.length > 0) {
+          await this.#writeManifest(run, manifest, withHistoryDependent(manifest, missing))
+        }
       })
     } finally {
       // A declaration moved the version: the next write reads it again.
@@ -884,22 +909,8 @@ export class PgRepository implements OutcomeRepository, StoreInitializer {
     stored: FeatureManifest | null,
     next: FeatureManifest,
   ): Promise<void> {
-    const table = featuresTable(this.#tables)
-    const texts = encodeManifest(next)
-    const {features, historyDependent, retention} = texts
-    const values = [next.version.toString(), features, historyDependent, retention]
-    const rows =
-      stored === null
-        ? await run(
-            `INSERT INTO ${table} (id, version, features, history_dependent, retention) ` +
-              'VALUES (0, $1::bigint, $2, $3, $4) RETURNING 1',
-            values,
-          )
-        : await run(
-            `UPDATE ${table} SET version = $1::bigint, features = $2, history_dependent = $3, ` +
-              'retention = $4 WHERE id = 0 AND version = $5::bigint RETURNING 1',
-            [...values, stored.version.toString()],
-          )
+    const write = manifestWrite(this.#tables, stored, next)
+    const rows = await run(write.text, write.values)
     if (rows.length !== 1) {
       // Impossible while the exclusive lock is held: refuse rather than guess.
       throw new EvtError(

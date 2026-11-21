@@ -30,7 +30,7 @@ import {
   snapshotItem,
   transactionItems,
 } from '@photon-grove/evt/dynamodb'
-import {MemRepository, headFixtures} from '@photon-grove/evt/memory'
+import {MemRepository, controlFixtures, headFixtures} from '@photon-grove/evt/memory'
 import {LEDGER_PK} from './account.js'
 import {FaultRepository} from '@photon-grove/evt/testing'
 
@@ -108,8 +108,10 @@ async function runScenario(
 
   const repository = new MemRepository()
   const recorder = new Recorder(repository)
+  const controls = controlFixtures(repository)
   const runner = new Runner(recorder, scenario, FIXTURE_RUN, {
     bypassHead: async (event) => headFixtures(repository).appendBypassingHead(event),
+    marker: controls,
   })
   const outcomes = scenario instanceof Map && scenario.get('outcomes') === true
 
@@ -137,13 +139,9 @@ async function runScenario(
     // the step was refused before any request.
     if (str(field(step, 'op')) === 'transaction' && !REFUSED_BEFORE_WRITE.has(want.result)) {
       const transaction = normalizeTransaction(transactionCommit(runner.entityId, step))
-      const items = transactionItems(
-        TABLE,
-        transaction,
-        MARKER_VERSION,
-        () => undefined,
-        VIEWS_TABLE,
-      )
+      // The version the writer validated: a fresh store's, or what the scenario declared since.
+      const version = controls.manifest()?.version ?? MARKER_VERSION
+      const items = transactionItems(TABLE, transaction, version, () => undefined, VIEWS_TABLE)
       transactions.push({step: index, actions: items.map(action)})
     }
   }
