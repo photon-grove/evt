@@ -9,7 +9,9 @@ import {
   type CommandOutcome,
   type Commit,
   DEFAULT_RETRY_POLICY,
+  CommitTooLargeError,
   type DigestInput,
+  DuplicateViewKeyError,
   type EventOf,
   IdempotencyKeyReuseError,
   type JsonValue,
@@ -17,7 +19,11 @@ import {
   type OutcomeOptions,
   type OutcomeRepository,
   type ReadFence,
+  ProjectorOnlyCommitError,
+  ProjectorOperationError,
+  type ProjectedView,
   type Repository,
+  ReservedEntityIdError,
   type SerializedEvent,
   Store,
   type StoreOptions,
@@ -27,16 +33,21 @@ import {
   type TransactionCommit,
   type TransactionalRepository,
   defaultDigest,
+  deleteView,
   emptyMetadata,
   encodeEvent,
   encodeSnapshot,
   eventId,
+  groupCommits,
   isConflict,
+  putView,
   stringifyJson,
+  utf8Length,
+  ViewKeyTooLongError,
 } from '@photon-grove/evt'
 import {FaultRepository} from '@photon-grove/evt/testing'
 
-import {type Account, account, accountCommand, sortedKeys} from './account.js'
+import {type Account, account, accountCommand, ledgerProjector, sortedKeys} from './account.js'
 import {type Checks, canonical, field, int, list, num, plain, str} from './harness.js'
 
 /** The scenarios TypeScript supports so far, in memory and in the live run. */
@@ -62,7 +73,19 @@ export const SUPPORTED_SCENARIOS: readonly string[] = [
   'outcomes-ambiguous',
   'stream-heads-drift',
   'fence-aware-retry',
+  'commit-wide-views',
+  'commit-wide-projector',
+  'commit-too-large',
+  'commit-grouping',
 ]
+
+/**
+ * The scenarios a backend can't run yet: PostgreSQL writes commit-wide views through a view writer
+ * TypeScript doesn't have so far.
+ */
+export const UNSUPPORTED_ON: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  postgres: ['commit-wide-views', 'commit-wide-projector', 'commit-too-large'],
+})
 
 /** The fixture run's name, which every run's identity digests use. */
 export const FIXTURE_RUN = 'fixture'
@@ -80,6 +103,10 @@ const OUTCOME_KEYS = new Set([
   'code',
   'replayed',
   'prepares',
+  'projector',
+  'operation',
+  'mapped',
+  'groups',
 ])
 
 // The step keys this runner reads. A supported scenario that gains another fails loudly rather
@@ -114,6 +141,7 @@ const STEP_KEYS = new Set([
   'writes',
   'retryWrites',
   'interfere',
+  'projectors',
 ])
 
 // The keys this runner reads of an executeTransaction step's writes and its interference.
@@ -122,11 +150,11 @@ const INTERFERE_KEYS = new Set(['suffix', 'event', 'times'])
 
 // The keys this runner reads of a transaction step's streams, their events and its fences.
 const STREAM_KEYS = new Set(['suffix', 'sequence', 'events', 'snapshot'])
-const EVENT_KEYS = new Set(['type', 'version', 'payload'])
+const EVENT_KEYS = new Set(['type', 'version', 'payload', 'pad'])
 const FENCE_KEYS = new Set(['suffix', 'head', 'callerStamped'])
 
 // The scenario flags that need what TypeScript lacks so far.
-const LATER_FLAGS = ['projector', 'exclusive']
+const LATER_FLAGS = ['exclusive']
 
 const encoder = new TextEncoder()
 const decoder = new TextDecoder()
@@ -191,6 +219,12 @@ export interface Outcome {
   replayed?: true
   /** How many times a multi-stream command's decision step ran. */
   prepares?: number
+  /** The projector of a failed view operation, its operation, and its mapped error's message. */
+  projector?: string
+  operation?: number
+  mapped?: string
+  /** A groupCommits step's commits, each its ID and its events. */
+  groups?: string[]
 }
 
 export function expectedOutcome(expect: JsonValue): Outcome {
@@ -217,6 +251,23 @@ export function expectedOutcome(expect: JsonValue): Outcome {
     ...(expect.has('prepares') && num(field(expect, 'prepares')) !== 0
       ? {prepares: num(field(expect, 'prepares'))}
       : {}),
+    ...viewFields(
+      optionalString(expect, 'projector') ?? '',
+      expect.has('operation') ? num(field(expect, 'operation')) : 0,
+      optionalString(expect, 'mapped') ?? '',
+    ),
+    ...(optionalList(expect, 'groups').length > 0 && {
+      groups: optionalList(expect, 'groups').map(str),
+    }),
+  }
+}
+
+// A failed view operation's fields, each only when set, as Go's Outcome omits empty ones.
+function viewFields(projector: string, operation: number, mapped: string): Partial<Outcome> {
+  return {
+    ...(projector !== '' && {projector}),
+    ...(operation !== 0 && {operation}),
+    ...(mapped !== '' && {mapped}),
   }
 }
 
@@ -333,6 +384,7 @@ export class Runner {
     this.#options = {
       snapshotInterval: num(field(scenario, 'snapshotInterval')),
       ...(this.#outcomes && {outcomes: outcomeOptions(run)}),
+      ...(optionalBoolean(scenario, 'projector') && {commitProjectors: [ledgerProjector]}),
     }
     this.#store = new Store(repository, this.#options)
     this.#bypassHead = options.bypassHead
@@ -348,11 +400,7 @@ export class Runner {
       case 'appendRaw': {
         const raw = field(step, 'event')
         const loaded = await this.#store.load(account, id)
-        const event = rawEvent(id, loaded.sequence + 1n, step, {
-          type: str(field(raw, 'type')),
-          version: num(field(raw, 'version')),
-          payload: str(field(raw, 'payload')),
-        })
+        const event = rawEvent(id, loaded.sequence + 1n, step, rawFields(raw))
         return this.#commitRaw(event)
       }
       case 'conflictProbe': {
@@ -406,6 +454,8 @@ export class Runner {
         return this.#resolveOutcome(id, step)
       case 'transaction':
         return this.#transaction(step)
+      case 'groupCommits':
+        return this.#groupCommits(step)
       case 'compact':
         try {
           const deleted = await this.#repository.compactBelow(id, int(field(step, 'through')))
@@ -557,6 +607,29 @@ export class Runner {
 
     // Go omits a count of zero, as it omits every empty field.
     return prepares === 0 ? result : {...result, prepares}
+  }
+
+  // Reads the primary stream and each of `reads`, regroups their events into the commits that
+  // wrote them, and lists each commit: its ID (`-` for none), then its events as `suffix:sequence`.
+  async #groupCommits(step: JsonValue): Promise<Outcome> {
+    const base = this.entityId
+    const suffixes = ['', ...optionalList(step, 'reads').map(str)]
+    const events = (
+      await Promise.all(suffixes.map((suffix) => this.#repository.events(streamId(base, suffix))))
+    ).flat()
+    const groups = groupCommits(events).map((commit) => {
+      const members = commit.streams.flatMap((stream) => {
+        const suffix = stream.entityId.startsWith(base)
+          ? stream.entityId.slice(base.length).replace(/^-/, '')
+          : stream.entityId.replace(/^-/, '')
+
+        return stream.events.map((event) => `${suffix}:${event.sequence}`)
+      })
+
+      return `${commit.commitId === '' ? '-' : commit.commitId} ${members.join(' ')}`
+    })
+
+    return {...outcome('ok', events.length), ...(groups.length > 0 && {groups})}
   }
 
   // A command that writes no events, recorded as an accepted outcome carrying the step's response.
@@ -785,12 +858,22 @@ async function prepareStep(
 }
 /* oxlint-enable no-await-in-loop */
 
+// A key padded with `x` to `size` UTF-8 bytes, so a step can make an overlong one.
+function padKey(text: string, size: number): string {
+  const length = utf8Length(text)
+
+  return length < size ? text + 'x'.repeat(size - length) : text
+}
+
 // A raw event of a step: its type, version and payload text.
 function rawFields(event: JsonValue): {type: string; version: number; payload: string} {
+  // A payload's first `{pad}` stands for `pad` bytes of `x`, so a step can make a large event.
+  const pad = optionalNumber(event, 'pad') ?? 0
+
   return {
     type: str(field(event, 'type')),
     version: num(field(event, 'version')),
-    payload: str(field(event, 'payload')),
+    payload: str(field(event, 'payload')).replace('{pad}', () => 'x'.repeat(pad)),
   }
 }
 
@@ -800,15 +883,42 @@ function optionalNumber(value: JsonValue, name: string): number | null {
   return found === undefined || found === null ? null : num(found)
 }
 
+// In the order Go classifies them.
 function classify(error: unknown): Outcome {
-  if (isConflict(error)) {
-    return outcome('conflict')
+  if (error instanceof CommitTooLargeError) {
+    return outcome('commitTooLarge')
+  }
+  if (error instanceof ReservedEntityIdError) {
+    return outcome('reserved')
+  }
+  if (error instanceof ProjectorOperationError) {
+    return {
+      ...outcome('projector'),
+      ...viewFields(error.projector, error.operation, error.mapped ? messageOf(error.mapped) : ''),
+    }
+  }
+  if (error instanceof ProjectorOnlyCommitError) {
+    return outcome('projectorOnly')
+  }
+  if (error instanceof ViewKeyTooLongError) {
+    return outcome('viewKeyTooLong')
+  }
+  if (error instanceof DuplicateViewKeyError) {
+    return outcome('duplicateViewKey')
   }
   if (error instanceof StreamHeadDriftError) {
     return outcome('drift')
   }
+  if (isConflict(error)) {
+    return outcome('conflict')
+  }
 
   throw error
+}
+
+// A mapped error's message, as Go's Err.Error() gives it.
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }
 
 // A step's metadata. Every field is determined by the step, so every language writes the same
@@ -842,11 +952,7 @@ export function transactionCommit(base: string, step: JsonValue): TransactionCom
     const id = streamId(base, optionalString(stream, 'suffix') ?? '')
     const first = int(field(stream, 'sequence'))
     const events = list(field(stream, 'events')).map((raw, index) =>
-      rawEvent(id, first + BigInt(index), step, {
-        type: str(field(raw, 'type')),
-        version: num(field(raw, 'version')),
-        payload: str(field(raw, 'payload')),
-      }),
+      rawEvent(id, first + BigInt(index), step, rawFields(raw)),
     )
     const snapshot = stream instanceof Map ? stream.get('snapshot') : undefined
     if (snapshot === undefined || snapshot === null) {
@@ -869,8 +975,51 @@ export function transactionCommit(base: string, step: JsonValue): TransactionCom
     head: int(field(fence, 'head')),
     provenance: optionalBoolean(fence, 'callerStamped') ? 'caller' : 'engine',
   }))
+  const views = stepViews(base, step)
 
-  return {streams, fences}
+  return views.length > 0 ? {streams, fences, views} : {streams, fences}
+}
+
+/**
+ * A transaction step's view operations, in its projectors' order, each operation once or
+ * `repeat` times. `{id}` is the scenario's entity ID, `{n}` the copy's index as three digits, and
+ * `pkPad` and `skPad` pad a key with `x` to that many bytes.
+ */
+export function stepViews(base: string, step: JsonValue): ProjectedView[] {
+  const views: ProjectedView[] = []
+  const scope = (text: string) => text.replaceAll('{id}', base)
+
+  optionalList(step, 'projectors').forEach((projector, projectorIndex) => {
+    const name = str(field(projector, 'name'))
+    let operation = 0
+    for (const item of list(field(projector, 'operations'))) {
+      const repeat = Math.max(optionalNumber(item, 'repeat') ?? 0, 1)
+      for (let copy = 0; copy < repeat; copy++) {
+        const number = (text: string) => text.replaceAll('{n}', String(copy).padStart(3, '0'))
+        const pk = padKey(number(scope(str(field(item, 'pk')))), optionalNumber(item, 'pkPad') ?? 0)
+        const sk = padKey(number(scope(str(field(item, 'sk')))), optionalNumber(item, 'skPad') ?? 0)
+        const owner = scope(str(field(item, 'owner')))
+        const condition = (optionalString(item, 'condition') ?? '') || 'none'
+        const conflict = optionalString(item, 'conflict') ?? ''
+        const mapped = conflict === '' ? {} : {conflict: new Error(conflict)}
+        const op =
+          str(field(item, 'op')) === 'delete'
+            ? deleteView(pk, sk, owner, {condition: condition as 'none' | 'present', ...mapped})
+            : putView(
+                pk,
+                sk,
+                owner,
+                optionalString(item, 'entityType') ?? '',
+                number(scope(optionalString(item, 'payload') ?? '')),
+                {condition: condition as 'none' | 'absent', ...mapped},
+              )
+        views.push({projector: name, projectorIndex, operation, op})
+        operation++
+      }
+    }
+  })
+
+  return views
 }
 
 function rawEvent(

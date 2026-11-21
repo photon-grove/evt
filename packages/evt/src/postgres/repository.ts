@@ -22,6 +22,7 @@ import {
   StreamHeadDriftError,
   StreamHeadsNotMigratedError,
   TransientError,
+  ViewsNotConfiguredError,
 } from '../errors.js'
 import type {SerializedEvent, SerializedSnapshot} from '../event.js'
 import {
@@ -238,6 +239,10 @@ export class PgRepository implements OutcomeRepository, StoreInitializer {
   }
 
   async #write(transaction: NormalizedTransaction, options?: CallOptions): Promise<void> {
+    // There's nowhere to write view operations yet, so they're refused rather than dropped.
+    if (transaction.views.length > 0) {
+      throw new ViewsNotConfiguredError('postgres')
+    }
     for (const group of transaction.projections) {
       if (group.backend !== POSTGRES_BACKEND || group.operations.length > 0) {
         throw new EvtError(

@@ -25,6 +25,9 @@ import {
   type Outcome,
   OutcomeConflictError,
   type OutcomeRepository,
+  ProjectorOnlyCommitError,
+  ProjectorOperationError,
+  type ProjectedView,
   RebuildInProgressError,
   type ReadFence,
   type Repository,
@@ -42,13 +45,16 @@ import {
   type TransactionalRepository,
   StreamHeadsNotMigratedError,
   UnsupportedFeatureError,
+  type ViewOperation,
   defineAggregate,
   defineEvents,
+  deleteView,
   emptyMetadata,
   encodeRejection,
   eventId,
   json,
   isConflict,
+  putView,
   isRetryable,
 } from '@photon-grove/evt'
 import {FaultRepository} from '@photon-grove/evt/testing'
@@ -115,6 +121,9 @@ export async function conformance(
         () => transactionRanking(repo, fixtures),
       ])
     }
+  }
+  if (repo.writesViews?.() === true) {
+    cases.push(['views commit with their events, each conditioned on its owner', () => views(repo)])
   }
   if (recordsOutcomes(repo)) {
     cases.push(
@@ -801,6 +810,81 @@ async function expectedHeads(repo: OutcomeRepository): Promise<void> {
 }
 
 // A ledger aggregate of the namespace's own entity type, for the store's transaction API.
+// A commit's view operations are written in its transaction: a failed condition fails the whole
+// commit with the operation named, and no stream may write or delete another's row.
+async function views(repo: Repository): Promise<void> {
+  const ns = namespace()
+  const [a, b] = [new Stream(ns, 'a'), new Stream(ns, 'b')]
+  const pk = `${ns}-handles`
+  const claim = (owner: string) =>
+    putView(pk, 'ada', owner, 'ledger', '{"claimed":true}', {
+      condition: 'absent',
+      conflict: new Error('taken'),
+    })
+
+  await repo.commit({entityId: a.id, events: [a.event(1, 1)], views: [handle(claim(a.id))]})
+  const taken = await expectError(
+    repo.commit({entityId: b.id, events: [b.event(1, 1)], views: [handle(claim(b.id))]}),
+    'a second claim of the key',
+    (error) =>
+      error instanceof ProjectorOperationError && error.reason === 'ConditionalCheckFailed',
+  )
+  ensureEqual(messageOf((taken as ProjectorOperationError).mapped), 'taken', 'the mapped error')
+  ensureEqual(await repo.events(b.id), [], 'the refused commit wrote no event')
+
+  await expectError(
+    repo.commit({
+      entityId: b.id,
+      events: [b.event(1, 1)],
+      views: [handle(putView(pk, 'ada', b.id, 'ledger', '{}'))],
+    }),
+    "an overwrite of another stream's row",
+    (error) => error instanceof ProjectorOperationError,
+  )
+  await expectError(
+    repo.commit({
+      entityId: b.id,
+      events: [b.event(1, 1)],
+      views: [handle(deleteView(pk, 'ada', b.id))],
+    }),
+    "a delete of another stream's row",
+    (error) => error instanceof ProjectorOperationError,
+  )
+
+  // The owner releases the key, and a delete that needs the row then fails.
+  await repo.commit({
+    entityId: a.id,
+    events: [a.event(2, 1)],
+    views: [handle(deleteView(pk, 'ada', a.id, {condition: 'present'}))],
+  })
+  await expectError(
+    repo.commit({
+      entityId: a.id,
+      events: [a.event(3, 1)],
+      views: [handle(deleteView(pk, 'ada', a.id, {condition: 'present'}))],
+    }),
+    'a release of an absent key',
+    (error) => error instanceof ProjectorOperationError,
+  )
+  await repo.commit({entityId: b.id, events: [b.event(1, 1)], views: [handle(claim(b.id))]})
+  ensureEqual((await repo.events(b.id)).length, 1, 'the freed key is claimed')
+
+  await expectError(
+    repo.commit({entityId: a.id, events: [], views: [handle(claim(a.id))]}),
+    'views without an event',
+    (error) => error instanceof ProjectorOnlyCommitError,
+  )
+}
+
+// A view operation of the `handles` projector.
+function handle(op: ViewOperation, operation = 0): ProjectedView {
+  return {projector: 'handles', projectorIndex: 0, operation, op}
+}
+
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
 function ledger(ns: string) {
   return defineAggregate({
     type: `${ns}-ledger`,

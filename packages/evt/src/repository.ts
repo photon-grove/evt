@@ -17,6 +17,7 @@ import {
 } from './errors.js'
 import {type SerializedEvent, type SerializedSnapshot, eventId} from './event.js'
 import {type Outcome, checkCommitText, checkOutcome, storedOutcome} from './outcome.js'
+import {type ProjectedView, checkViews, viewOperationSize} from './projection.js'
 import {MAX_COMMIT_ITEM_BYTES} from './snapshots.js'
 import {compareUtf8} from './utf8.js'
 
@@ -58,6 +59,11 @@ export interface Commit {
   snapshot?: NewSnapshot | null | undefined
   /** The operations the aggregate's projectors add, written first, in order. */
   projections?: readonly ProjectorGroup[] | null | undefined
+  /**
+   * The commit-wide projectors' view operations, written after the projector groups and before
+   * the stream, on a repository that writes views.
+   */
+  views?: readonly ProjectedView[] | null | undefined
   /**
    * The command outcome to record in the same transaction, as its last write, on an
    * {@link OutcomeRepository}. Its event IDs are replaced by the commit's own.
@@ -107,6 +113,12 @@ export interface CallOptions {
 export interface Repository {
   /** Appends a commit's events, and its snapshot if it has one, atomically. */
   commit(commit: Commit, options?: CallOptions): Promise<void>
+
+  /**
+   * Whether it writes a commit's view operations. A store refuses commit-wide projectors on a
+   * repository that doesn't say so, which would drop their rows.
+   */
+  writesViews?(): boolean
 
   /** Every stored event of the stream, ascending. */
   events(entityId: string, options?: CallOptions): Promise<SerializedEvent[]>
@@ -182,6 +194,11 @@ export interface TransactionCommit {
   /** The streams read but not written, at most one fence per stream. */
   fences?: readonly ReadFence[] | null | undefined
   /**
+   * The commit-wide projectors' view operations over the whole transaction, written after every
+   * stream's own projector groups and views, on a repository that writes views.
+   */
+  views?: readonly ProjectedView[] | null | undefined
+  /**
    * The command outcome to record in the same transaction, after the fences, on an
    * {@link OutcomeRepository}. Its event IDs are replaced by the ones the transaction writes. With
    * no events it's an outcome-only commit: a rejection or an accepted no-op, still fenced.
@@ -239,6 +256,11 @@ export interface NormalizedTransaction {
   readonly fences: readonly ReadFence[]
   /** The written streams' projector groups, in the order the streams were declared. */
   readonly projections: readonly ProjectorGroup[]
+  /**
+   * The view operations: the written streams' own, in the order the streams were declared, then
+   * the transaction's.
+   */
+  readonly views: readonly ProjectedView[]
   /** The outcome to record, with the event IDs the transaction writes, or null. */
   readonly outcome: Outcome | null
 }
@@ -278,7 +300,16 @@ export function normalizeTransaction(transaction: TransactionCommit): Normalized
 
   const written = transaction.streams.filter((stream) => stream.events.length > 0)
   const projections = written.flatMap((stream) => stream.projections ?? [])
-  const streams = written.map((stream) => Object.assign({}, stream, {projections: undefined}))
+  const views = [...written.flatMap((stream) => stream.views ?? []), ...(transaction.views ?? [])]
+  // Views are projections of committed events, so a transaction that writes none carries none.
+  if (written.length === 0 && views.length > 0) {
+    throw new ProjectorOnlyCommitError(views.length)
+  }
+  checkViews(views)
+
+  const streams = written.map((stream) =>
+    Object.assign({}, stream, {projections: undefined, views: undefined}),
+  )
   streams.sort(byId)
   const writes = new Set(streams.map((stream) => stream.entityId))
   const fences = (transaction.fences ?? []).filter((fence) => !writes.has(fence.entityId))
@@ -286,7 +317,7 @@ export function normalizeTransaction(transaction: TransactionCommit): Normalized
 
   const outcome = transaction.outcome ?? null
   if (outcome === null) {
-    return {streams, fences, projections, outcome}
+    return {streams, fences, projections, views, outcome}
   }
 
   // A commit that records an outcome stores every string it names on every backend alike, so
@@ -309,6 +340,7 @@ export function normalizeTransaction(transaction: TransactionCommit): Normalized
     streams,
     fences,
     projections,
+    views,
     outcome: storedOutcome(
       outcome,
       events.map((event) => event.id),
@@ -414,6 +446,7 @@ export function validateCommit(commit: Commit): void {
     }
     operations += group.operations.length
   }
+  operations += commit.views?.length ?? 0
 
   const [first] = commit.events
   if (first === undefined) {
@@ -489,6 +522,7 @@ export function commitSizes(
     streams: [commit],
     fences: [],
     projections: commit.projections ?? [],
+    views: commit.views ?? [],
     outcome: null,
   }
 
@@ -497,7 +531,7 @@ export function commitSizes(
 
 /**
  * The size of each action a transaction carries: the two control checks, every stream's projector
- * operations, every written stream's head update, event puts and snapshot put, a check on every
+ * operations, the view operations, every written stream's head update, event puts and snapshot put, a check on every
  * fenced stream's head, then the outcome put. Every backend budgets a transaction by these sizes.
  */
 export function transactionSizes(
@@ -508,6 +542,9 @@ export function transactionSizes(
   const sizes = [controlCheckSize(FEATURES_PK), controlCheckSize(REBUILD_LOCK_PK)]
   for (const group of transaction.projections) {
     sizes.push(...group.sizes)
+  }
+  for (const view of transaction.views) {
+    sizes.push(viewOperationSize(view.op))
   }
   for (const stream of transaction.streams) {
     sizes.push(...streamSizes(stream, ttl))

@@ -52,6 +52,7 @@ export {
   commitTransaction,
   snapshotTransaction,
   transactionItems,
+  viewActions,
 } from './requests.js'
 export {
   type BatchGetItemInput,

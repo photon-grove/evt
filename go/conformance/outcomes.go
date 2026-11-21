@@ -50,6 +50,7 @@ func RunOutcomeSuite(t *testing.T, newRepo func() evt.Repository, enforcesConcur
 	t.Run("CommandIDRules", func(t *testing.T) { testCommandIDRules(t, outcomes(t)) })
 	t.Run("AmbiguousWriteRecovery", func(t *testing.T) { testAmbiguousRecovery(t, outcomes(t)) })
 	t.Run("OutcomePutRace", func(t *testing.T) { testOutcomePutRace(t, outcomes(t)) })
+	t.Run("RaceBeforeLoadReplays", func(t *testing.T) { testRaceBeforeLoad(t, outcomes(t)) })
 	t.Run("TransactionOutcomes", func(t *testing.T) { testTransactionOutcomes(t, outcomes(t)) })
 	t.Run("StaleFencePersistence", func(t *testing.T) { testStaleFencePersistence(t, outcomes(t)) })
 	t.Run("OutcomeBudget", func(t *testing.T) { testOutcomeBudget(t, outcomes(t)) })
@@ -916,6 +917,95 @@ func testOutcomePutRace(t *testing.T, repo evt.OutcomeRepository) {
 	_, err = env.run(t, &ledgerCommand{Kind: "deposit", Amount: 4}, differing)
 	require.ErrorIs(t, err, evt.ErrIdempotencyKeyReuse)
 	require.Len(t, env.events(t, env.id), 4, "the first race winner, the seed, the mover, and the rival; rejections write none")
+}
+
+func testRaceBeforeLoad(t *testing.T, repo evt.OutcomeRepository) {
+	faulty, err := test.NewFaultRepository(repo)
+	require.NoError(t, err)
+
+	env := newOutcomeEnv(t, faulty, 0)
+	rival := newOutcomeEnv(t, repo, 0)
+	rival.id, rival.ns = env.id, env.ns
+	ctx := context.Background()
+
+	// raceBeforeLoad runs the rival just before this writer's next load, after its outcome check
+	// found no row: the load's duplicate window then sees the command ID on the rival's event.
+	raced := false
+	raceBeforeLoad := func(winner func()) {
+		raced = false
+		faulty.BeforeLoad = func(context.Context, evt.EntityID) {
+			faulty.BeforeLoad = nil
+			raced = true
+
+			winner()
+		}
+	}
+
+	// The row the rival wrote answers the command: a replay, not a pre-v0.9 duplicate.
+	same := env.commandID("same")
+	raceBeforeLoad(func() {
+		_, rerr := rival.run(t, &ledgerCommand{Kind: "deposit", Amount: 2}, same)
+		require.NoError(t, rerr)
+	})
+
+	outcome, err := env.run(t, &ledgerCommand{Kind: "deposit", Amount: 2}, same)
+	require.True(t, raced)
+	require.NoError(t, err)
+	require.True(t, outcome.Replayed, "the attempt replays the winner's stored outcome")
+	require.Len(t, env.events(t, env.id), 1, "the command applied exactly once")
+
+	// A rival with another identity wins: IdempotencyKeyReuse.
+	differing := env.commandID("differing")
+	raceBeforeLoad(func() {
+		_, rerr := rival.run(t, &ledgerCommand{Kind: "deposit", Amount: 3}, differing)
+		require.NoError(t, rerr)
+	})
+
+	_, err = env.run(t, &ledgerCommand{Kind: "deposit", Amount: 4}, differing)
+	require.True(t, raced)
+	require.ErrorIs(t, err, evt.ErrIdempotencyKeyReuse)
+
+	// A transaction: the rival commits the same command after BeginCommand read the row and before
+	// the read. A rejection decided on the loaded state replays the winner's accepted outcome.
+	identity := evt.CommandIdentity{Type: "ledger:pay", Targets: []evt.EntityID{env.id}}
+	paid := env.commandID("paid")
+
+	tx, replayed, err := env.store.BeginCommand(ctx, identity, withCommand(paid))
+	require.NoError(t, err)
+	require.Nil(t, replayed)
+
+	raceBeforeLoad(func() {
+		winner, _, rerr := rival.store.BeginCommand(ctx, identity, withCommand(paid))
+		require.NoError(t, rerr)
+		require.NoError(t, winner.Read(ctx, newLedger(env.id), env.id))
+		require.NoError(t, winner.Append(env.id, &ledgerEvent{Kind: "deposited", Amount: 1}))
+		_, rerr = winner.Complete(ctx, nil)
+		require.NoError(t, rerr)
+	})
+	require.NoError(t, tx.Read(ctx, newLedger(env.id), env.id))
+	require.True(t, raced)
+
+	outcome, err = tx.Reject(ctx, evt.Rejection{Code: "insufficient-funds", Message: "balance is too low"})
+	require.NoError(t, err)
+	require.True(t, outcome.Replayed)
+	require.Equal(t, evt.OutcomeAccepted, outcome.Status, "the winner's outcome, not this attempt's rejection")
+
+	// The same race lost to another command under the same ID is IdempotencyKeyReuse.
+	reused := env.commandID("reused")
+
+	tx, _, err = env.store.BeginCommand(ctx, identity, withCommand(reused))
+	require.NoError(t, err)
+
+	raceBeforeLoad(func() {
+		_, rerr := rival.run(t, &ledgerCommand{Kind: "deposit", Amount: 1}, reused)
+		require.NoError(t, rerr)
+	})
+	require.NoError(t, tx.Read(ctx, newLedger(env.id), env.id))
+	require.True(t, raced)
+
+	_, err = tx.Complete(ctx, nil)
+	require.ErrorIs(t, err, evt.ErrIdempotencyKeyReuse)
+	require.Len(t, env.events(t, env.id), 4, "only the winners wrote")
 }
 
 func testConflictLeavesNoOutcome(t *testing.T, repo evt.OutcomeRepository) {

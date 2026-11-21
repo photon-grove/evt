@@ -61,6 +61,7 @@ const client = new DynamoDB({
 const run = Date.now().toString(36)
 const shared = `evt-ts-conformance-${run}`
 const marked = `evt-ts-marker-${run}`
+const conformanceViews = `evt-ts-views-${run}`
 const tableCount = {value: 0}
 
 const checks = new Checks()
@@ -70,9 +71,11 @@ try {
     await createTable(table)
     created.push(table)
   }
+  await createTable(conformanceViews, 'S')
+  created.push(conformanceViews)
 
   // The suite's store is initialized up front, as a deployment would, so its writers are strict.
-  const repo = new DynamoRepository(client, shared)
+  const repo = new DynamoRepository(client, shared, {viewsTable: conformanceViews})
   await repo.initialize()
   await conformance(checks, repo, headFixtures(shared))
 
@@ -315,7 +318,7 @@ async function views(tables: string[]): Promise<void> {
 // The view repository against a views table shaped like infra/local's: string pk and sk, and the
 // entityType-index the entity-type listings query.
 async function viewRepository(tables: string[]): Promise<void> {
-  const viewsTable = `evt-ts-views-${run}`
+  const viewsTable = `evt-ts-view-repository-${run}`
   await client.createTable({
     TableName: viewsTable,
     BillingMode: 'PAY_PER_REQUEST',

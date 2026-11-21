@@ -381,9 +381,9 @@ error before any write and is never split.
   window of the streams the command read is applied: a pre-v0.9 event that carries this command ID
   and was replayed since the latest snapshot is a duplicate (`DuplicateCommandError` /
   `Error::DuplicateCommand`), and no terminal outcome is written for a command that already ran.
-  TypeScript reads the outcome row again before it reports one, so an attempt of the same command
-  that committed after the pre-check is replayed (or `IdempotencyKeyReuse`) rather than reported
-  as a duplicate.
+  Go, Rust and TypeScript read the outcome row again before they report one, so an attempt of the
+  same command that committed after the pre-check is replayed (or `IdempotencyKeyReuse`) rather
+  than reported as a duplicate.
   The window only sees events after the latest snapshot; a pre-v0.9 command ID folded into a
   snapshot or compacted away is not detected (the documented upgrade limitation, no backfill)
 - A command may not name a reserved target stream (`SYSTEM#`, `command-outcome#`): the identity
@@ -726,8 +726,9 @@ transaction as the events. The byte-level rules are in the
   refuses a row two streams write (`SharedViewKeyError`).
 - The journal's partitions are the engine's. An operation whose `pk` begins `journal#`,
   `journal-counter#` or `journal-compaction#` is refused when the projector returns, live, on
-  replay and in a rebuild (Go `*ReservedViewKeyError`, Rust `Error::ReservedViewKey`, both
-  invalid arguments, never retried), unless the projector is the engine's own (the journal's,
+  replay and in a rebuild (Go `*ReservedViewKeyError`, Rust `Error::ReservedViewKey`, TypeScript
+  `ReservedViewKeyError`, all invalid arguments, never retried), unless the projector is the
+  engine's own (the journal's,
   identified by the sealed `CommitProjector::engine_metadata`; Go has none). Only the engine runs
   that projector: a Rust store or transaction that registers it is refused with `InvalidConfig`
   before it runs, as a rebuild is. So an application projector cannot overwrite its stream's
@@ -736,8 +737,12 @@ transaction as the events. The byte-level rules are in the
 - Only the in-memory replay of history-dependent projectors exists today; the state entry point and
   the state-based rebuild of current-state projectors are not implemented.
 - A repository must declare `evt.ViewWritingRepository` (its `WritesViews()` returns true; a
-  decorator returns the wrapped repository's; Rust `Repository::writes_views`) or the
-  store refuses a commit-wide projector (`ViewsUnsupportedError`); `CheckProjectorOperationsSupported`
+  decorator returns the wrapped repository's; Rust `Repository::writes_views`; TypeScript
+  `writesViews()`) or the store refuses a commit-wide projector (`ViewsUnsupportedError`, TypeScript
+  `viewsUnsupported`). TypeScript runs only current-state projectors so far: it can't declare
+  history-dependent entity types yet, so it refuses a projector that names a `history` with
+  `historyDeclarationUnsupported`, as Go and Rust refuse one on a backend that can't declare;
+  `CheckProjectorOperationsSupported`
   stays fail-closed for view operations.
 
 **Operations**

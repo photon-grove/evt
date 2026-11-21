@@ -33,6 +33,7 @@ import {
   encodeEvent,
   encodeMetadata,
   encodeSnapshot,
+  compareUtf8,
   parseJson,
 } from '@photon-grove/evt'
 import {
@@ -61,6 +62,7 @@ import {
   type Observed,
   Runner,
   SUPPORTED_SCENARIOS,
+  UNSUPPORTED_ON,
   checkScenario,
   checkStep,
   compareObserved,
@@ -68,6 +70,7 @@ import {
   expectedOutcome,
   optionalList,
 } from './runner.js'
+import {viewPartitions} from './scenarios.js'
 
 const WRITERS = ['go', 'rust']
 
@@ -87,6 +90,11 @@ interface Backend {
   observe(runner: Runner, id: string): Promise<Observed>
   /** Compares what the backend stores for a stream beyond what `observe` reads. */
   checkRows(checks: Checks, name: string, id: string, expected: JsonValue): Promise<void>
+  /**
+   * The view rows of `partitions` whose key names `base`, as the fixtures record them, by
+   * partition and then sort key bytes.
+   */
+  views(partitions: readonly string[], base: string): Promise<unknown[]>
   /** Compares a command's stored outcome row with its fixture's DynamoDB item. */
   checkOutcome(checks: Checks, name: string, commandId: string, expected: JsonValue): Promise<void>
   close(): Promise<void>
@@ -95,7 +103,7 @@ interface Backend {
 const cli = parseArgs(process.argv.slice(2))
 
 if (cli.command === 'scenarios') {
-  console.log(SUPPORTED_SCENARIOS.join(','))
+  console.log(scenarioNames(cli.backend).join(','))
 } else {
   if (cli.run === '') {
     throw new Error('--run is required')
@@ -114,7 +122,7 @@ if (cli.command === 'scenarios') {
         quiet = (await runStep(checks, backend, cli)) === 0
         break
       case 'verify':
-        await verify(checks, backend, cli.run)
+        await verify(checks, backend, cli.backend, cli.run)
         break
       default:
         throw new Error(`unknown command ${cli.command}`)
@@ -205,8 +213,9 @@ function dynamoBackend(): Backend {
     },
   })
   const table = process.env['EVT_COMPAT_DYNAMO_TABLE'] ?? 'evt-local-event-log'
+  const viewsTable = process.env['EVT_COMPAT_DYNAMO_VIEWS_TABLE'] ?? 'evt-local-entity-views'
   // Lazily initializing, as the Go and Rust drivers are, so a fresh table takes the first write.
-  const repository = new DynamoRepository(client, table, {lazyInitialization: true})
+  const repository = new DynamoRepository(client, table, {lazyInitialization: true, viewsTable})
 
   return {
     repository,
@@ -236,6 +245,20 @@ function dynamoBackend(): Backend {
     },
     // The items are compared with the stream itself.
     async checkRows() {},
+    async views(partitions, base) {
+      const rows: unknown[] = []
+      for (const pk of partitions) {
+        const items = await partition(client, viewsTable, pk)
+        const owned = items.filter((item) => {
+          const sk = item['sk'] !== undefined && 'S' in item['sk'] ? item['sk'].S : ''
+          return pk.includes(base) || sk.includes(base)
+        })
+        owned.sort((a, b) => compareUtf8(textOf(a['sk']), textOf(b['sk'])))
+        rows.push(...owned.map((item) => ({pk, sk: textOf(item['sk']), dynamoItem: item})))
+      }
+
+      return rows
+    },
     async checkOutcome(checks, name, commandId, expected) {
       const items = await partition(client, table, outcomeKey(commandId))
       checks.equal(`${name}: outcome ${commandId} item`, canonical(items), canonical([expected]))
@@ -296,6 +319,10 @@ async function postgresBackend(): Promise<Backend> {
         snapshot: snapshot && encodeSnapshot(snapshot),
         head: rows[0] === undefined ? null : BigInt(rows[0].head),
       }
+    },
+    // TypeScript doesn't write PostgreSQL views yet, so no scenario it runs here has any.
+    async views() {
+      return []
     },
     // The event and snapshot rows as stored, as the Go driver compares them: each event's
     // metadata as JSON, since jsonb normalizes its text.
@@ -386,10 +413,17 @@ function jsonColumn(text: string | null | undefined): unknown {
   return text === null || text === undefined ? null : plain(parseJson(text))
 }
 
-async function supportedScenarios(): Promise<JsonValue[]> {
+// The scenarios TypeScript supports on a backend: every one, less what the backend can't run yet.
+function scenarioNames(backend: string): string[] {
+  const unsupported = UNSUPPORTED_ON[backend] ?? []
+
+  return SUPPORTED_SCENARIOS.filter((name) => !unsupported.includes(name))
+}
+
+async function supportedScenarios(backend: string): Promise<JsonValue[]> {
   const definitions = list(field(await loadFixture('../scenarios.json'), 'scenarios'))
 
-  return SUPPORTED_SCENARIOS.map((name) => {
+  return scenarioNames(backend).map((name) => {
     const scenario = definitions.find((definition) => str(field(definition, 'name')) === name)
     if (scenario === undefined) {
       throw new Error(`scenario ${name} is not defined`)
@@ -402,7 +436,7 @@ async function supportedScenarios(): Promise<JsonValue[]> {
 
 async function runStep(checks: Checks, backend: Backend, args: Args): Promise<number> {
   let executed = 0
-  for (const scenario of await supportedScenarios()) {
+  for (const scenario of await supportedScenarios(args.backend)) {
     const name = str(field(scenario, 'name'))
     const step = list(field(scenario, 'steps'))[args.index]
     if (step === undefined || str(field(step, 'by')) !== args.as) {
@@ -423,13 +457,18 @@ async function runStep(checks: Checks, backend: Backend, args: Args): Promise<nu
   return executed
 }
 
-async function verify(checks: Checks, backend: Backend, run: string): Promise<void> {
+async function verify(
+  checks: Checks,
+  backend: Backend,
+  backendName: string,
+  run: string,
+): Promise<void> {
   const fixtures = await loadFixtureForRun('scenarios.json', run)
   const expectations = new Map(
     list(field(fixtures, 'scenarios')).map((expected) => [str(field(expected, 'name')), expected]),
   )
 
-  for (const scenario of await supportedScenarios()) {
+  for (const scenario of await supportedScenarios(backendName)) {
     const name = str(field(scenario, 'name'))
     const expected = expectations.get(name)
     if (expected === undefined) {
@@ -441,6 +480,16 @@ async function verify(checks: Checks, backend: Backend, run: string): Promise<vo
     checks.equal(`${name}: entity ID`, runner.entityId, str(field(expected, 'entityId')))
     compareObserved(checks, name, await backend.observe(runner, runner.entityId), expected)
     await backend.checkRows(checks, name, runner.entityId, expected)
+
+    // The view rows the scenario's projectors left in its own partitions.
+    const partitions = viewPartitions(scenario, runner.entityId)
+    if (partitions.length > 0) {
+      checks.equal(
+        `${name}: views`,
+        canonical(await backend.views(partitions, runner.entityId)),
+        canonical(optionalList(expected, 'views').map(plain)),
+      )
+    }
 
     // The outcome rows the scenario's commands left.
     for (const row of optionalList(expected, 'outcomes')) {
@@ -456,6 +505,11 @@ async function verify(checks: Checks, backend: Backend, run: string): Promise<vo
       await backend.checkRows(checks, label, id, sibling)
     }
   }
+}
+
+// A string attribute's text, or empty.
+function textOf(value: AttributeValue | undefined): string {
+  return value !== undefined && 'S' in value && typeof value.S === 'string' ? value.S : ''
 }
 
 // An event-log item's numeric sort key: -1 for the head, 0 for the snapshot, or the sequence.

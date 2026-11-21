@@ -11,10 +11,10 @@ held to the fixtures Go and Rust generate, byte for byte.
 npm install @photon-grove/evt
 ```
 
-So far it has the core, multi-stream transactions with read fences, command outcomes, the
-in-memory, DynamoDB and PostgreSQL backends, the view repository with its typed view codec, and the
-testing helpers. Commit-wide projectors come
-in a later release, and the
+So far it has the core, multi-stream transactions with read fences, command outcomes,
+commit-wide projectors (in memory and on DynamoDB), the in-memory, DynamoDB and PostgreSQL
+backends, the view repository with its typed view codec, and the testing helpers. Commit-wide
+projectors on PostgreSQL come in a later release, and the
 [feature matrix](https://github.com/photon-grove/evt/blob/main/docs/reference/feature-matrix.md)
 tracks each one. The
 [getting started guide](https://github.com/photon-grove/evt/blob/main/docs/guide/getting-started.md#the-same-model-in-typescript)
@@ -185,6 +185,21 @@ of `AbortSignal`, which the DOM library, `@types/node`, and Bun's and Deno's typ
   name. `MemRepository` budgets them and writes none, as Go's in-memory repository does, so code
   with projectors runs on it unchanged. A commit with operations but no events is refused with a
   `ProjectorOnlyCommitError`.
+- **Commit-wide projectors.** A store's `commitProjectors` run over everything a commit writes,
+  once per commit that writes events (`execute`, `executeWithOutcome`, transactions and a
+  rejection's events, never a plain rejection, a no-op or a replay), and their view operations
+  commit in the same transaction, after the aggregates' projector operations. A projector gets a
+  `CommitView` (each written stream, sorted by entity ID bytes, with its state after the commit as
+  its snapshot would carry it) and returns `putView(pk, sk, owner, entityType, payload)` and
+  `deleteView(pk, sk, owner)` operations, at any key. Each row belongs to its owner, a stream the
+  commit wrote, and no other stream may write or delete it. A put with `condition: 'absent'` claims
+  a key, a delete with `condition: 'present'` releases one, and a failed condition fails the whole
+  commit with a `ProjectorOperationError` naming the projector and the operation, with the
+  operation's own `conflict` error as `mapped`. Operations are checked before any write (keys up to
+  2048 and 1024 bytes, no key twice, none in the engine's journal partitions), and counted in the
+  commit budget. `MemRepository` keeps the rows (`view`, `views`), and `DynamoRepository` writes
+  them to its `viewsTable`. Only current-state projectors run for now: one that names a `history`
+  is refused. `groupCommits` regroups stored events into the commits that wrote them.
 - **Rebuilds.** While a projection rebuild holds the store, every commit fails with a
   `RebuildInProgressError`. It's retryable, so `executeWithRetry` runs the command again after its
   backoff, though a rebuild usually outlasts the default policy's attempts.
@@ -275,9 +290,10 @@ long as they agree on these:
   language only when its type and payload bytes match: Go marshals a command's map with its keys
   sorted, for example.
 
-Until the TypeScript package has commit-wide projectors, one more rule applies: don't write an
-entity type that has commit-wide projectors registered in a Go or Rust service. Its commits would
-land without their view rows.
+A TypeScript writer of an entity type that has commit-wide projectors registered in a Go or Rust
+service must register the same projectors, writing the same bytes, as every writer of the type
+does. Until the TypeScript package writes PostgreSQL views, don't write such a type on PostgreSQL:
+its commits would land without their view rows.
 
 The [known differences](https://github.com/photon-grove/evt/blob/main/docs/reference/storage-format.md#known-differences)
 between the languages are in the storage format, and

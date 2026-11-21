@@ -10,6 +10,7 @@ import {
   FenceConflictError,
   HistoryDependentProjectionError,
   OutcomeConflictError,
+  ProjectorOperationError,
   RebuildInProgressError,
   SequenceGapError,
   StreamHeadDriftError,
@@ -29,6 +30,7 @@ import {
 import {int64Argument} from '../fields.js'
 import type {Metadata} from '../metadata.js'
 import {type Outcome, checkCommandId} from '../outcome.js'
+import {REASON_CONDITION_FAILED, type ViewOperation} from '../projection.js'
 import {
   type CallOptions,
   type Commit,
@@ -46,6 +48,7 @@ import {
   rankFailures,
   transactionSizes,
 } from '../repository.js'
+import {compareUtf8} from '../utf8.js'
 
 interface Stream {
   /** The stream's events by sequence. Compaction deletes from it. */
@@ -93,6 +96,8 @@ export class MemRepository implements OutcomeRepository, StoreInitializer {
   // The command outcomes by command ID, kept as the DynamoDB item, so a read decodes and
   // validates exactly what a live backend's would.
   readonly #outcomes = new Map<string, Item>()
+  // The commit-wide view rows, by pk and then sk.
+  readonly #views = new Map<string, Map<string, ViewRow>>()
 
   async initialize(options?: CallOptions): Promise<boolean> {
     options?.signal?.throwIfAborted()
@@ -120,6 +125,31 @@ export class MemRepository implements OutcomeRepository, StoreInitializer {
     if (!isEmptyTransaction(normalized)) {
       this.#write(normalized)
     }
+  }
+
+  /** It writes commit-wide view operations, to its own rows. */
+  writesViews(): boolean {
+    return true
+  }
+
+  /** The view row at `pk` and `sk`, or null when there is none. */
+  view(pk: string, sk: string): ViewRow | null {
+    const row = this.#views.get(pk)?.get(sk)
+
+    return row === undefined ? null : {...row, payload: copy(row.payload)}
+  }
+
+  /** Every view row, by `pk` bytes and then `sk` bytes. */
+  views(): ViewRow[] {
+    const rows: ViewRow[] = []
+    for (const partition of this.#views.values()) {
+      for (const row of partition.values()) {
+        rows.push(Object.assign({}, row, {payload: copy(row.payload)}))
+      }
+    }
+    rows.sort((a, b) => compareUtf8(a.pk, b.pk) || compareUtf8(a.sk, b.sk))
+
+    return rows
   }
 
   async outcome(commandId: string, options?: CallOptions): Promise<Outcome | null> {
@@ -171,6 +201,13 @@ export class MemRepository implements OutcomeRepository, StoreInitializer {
       throw failure
     }
 
+    // The view conditions come last, each against the rows as they were before the commit.
+    for (const view of transaction.views) {
+      if (!this.#viewHolds(view.op)) {
+        throw new ProjectorOperationError(view, REASON_CONDITION_FAILED)
+      }
+    }
+
     // Copy everything before the first write, so a copy that throws leaves every stream as it was.
     const writes = transaction.streams.map((commit) => {
       const events = commit.events.map(cloneEvent)
@@ -198,8 +235,38 @@ export class MemRepository implements OutcomeRepository, StoreInitializer {
       }
       this.#streams.set(entityId, held)
     }
+    for (const {op} of transaction.views) {
+      const partition = this.#views.get(op.pk) ?? new Map<string, ViewRow>()
+      if (op.kind === 'put') {
+        partition.set(op.sk, {
+          pk: op.pk,
+          sk: op.sk,
+          entityId: op.owner,
+          entityType: op.entityType,
+          payload: copy(op.payload),
+        })
+      } else {
+        partition.delete(op.sk)
+      }
+      this.#views.set(op.pk, partition)
+    }
     if (outcome !== null && recorded !== null) {
       this.#outcomes.set(outcome.commandId, recorded)
+    }
+  }
+
+  // Whether a view operation's condition holds: every write needs the row absent or its owner's,
+  // a put that claims the key needs it absent, and a delete that releases it needs it present.
+  #viewHolds(op: ViewOperation): boolean {
+    const stored = this.#views.get(op.pk)?.get(op.sk)
+    const owned = stored === undefined || stored.entityId === op.owner
+    switch (op.condition) {
+      case 'none':
+        return owned
+      case 'absent':
+        return stored === undefined
+      case 'present':
+        return stored !== undefined && owned
     }
   }
 
@@ -417,6 +484,16 @@ function derivedHead(stream: Stream): bigint {
 // A stored head of 0 is an absent head.
 function drift(entityId: string, stored: bigint, derived: bigint): StreamHeadDriftError {
   return new StreamHeadDriftError(entityId, stored > 0n ? stored : null, derived)
+}
+
+/** A commit-wide view row: its keys, its owner stream, its entity type, and its payload. */
+export interface ViewRow {
+  readonly pk: string
+  readonly sk: string
+  /** The stream that owns the row. */
+  readonly entityId: string
+  readonly entityType: string
+  readonly payload: Uint8Array
 }
 
 /** What a conformance suite needs to make a stream drift, which no repository call can do. */

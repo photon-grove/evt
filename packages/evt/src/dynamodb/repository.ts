@@ -24,6 +24,7 @@ import {
   StreamHeadDriftError,
   StreamHeadsNotMigratedError,
   TransientError,
+  ProjectorOperationError,
 } from '../errors.js'
 import type {SerializedEvent, SerializedSnapshot} from '../event.js'
 import {
@@ -74,6 +75,7 @@ import {
   headKey,
   projectorItems,
   buildTransaction,
+  viewActions,
   snapshotTransaction,
 } from './requests.js'
 
@@ -105,7 +107,16 @@ export interface DynamoRepositoryOptions {
    * `Date.now` gives them, never seconds. `Date.now` by default.
    */
   clock?: () => number
+  /**
+   * The table commit-wide projectors' view operations are written to, in each commit's
+   * transaction, keyed by string `pk` and `sk`. Without one, a commit that carries view operations
+   * is refused with a {@link ViewsNotConfiguredError}.
+   */
+  viewsTable?: string
 }
+
+// The cancellation reasons of a view action the views table refused, beside a failed condition.
+const VIEW_REFUSALS = new Set(['ValidationError', 'ItemCollectionSizeLimitExceeded'])
 
 // A declaration is a read-modify-write; racing declarations retry this many times.
 const MAX_DECLARE_ATTEMPTS = 8
@@ -138,6 +149,7 @@ export class DynamoRepository implements OutcomeRepository, StoreInitializer {
   readonly #client: DynamoClient
   readonly #table: string
   readonly #lazy: boolean
+  readonly #viewsTable: string | undefined
   readonly #consistentRead: boolean
   readonly #retention: ReadonlyMap<string, number>
   readonly #clock: () => number
@@ -157,6 +169,12 @@ export class DynamoRepository implements OutcomeRepository, StoreInitializer {
     this.#consistentRead = options.consistentRead ?? true
     this.#retention = retentionMap(options.retention)
     this.#clock = options.clock ?? Date.now
+    this.#viewsTable = options.viewsTable
+  }
+
+  /** It writes commit-wide view operations, to its views table. */
+  writesViews(): boolean {
+    return true
   }
 
   /** The events table this repository writes. */
@@ -255,6 +273,8 @@ export class DynamoRepository implements OutcomeRepository, StoreInitializer {
     // Every backend budgets a commit the same way, so an oversized one fails before any request.
     // The projector operations are sized from the actions this repository sends, which refuses a
     // group for another backend here too.
+    // View operations need the views table, refused without one before anything else.
+    viewActions(transaction.views, this.#viewsTable)
     const sizes = projectorItems(transaction.projections).map(transactItemSize)
     const projections = [{backend: DYNAMODB_BACKEND, operations: sizes, sizes}]
     checkBudget(transactionSizes({...transaction, projections}, ttlFor))
@@ -272,8 +292,12 @@ export class DynamoRepository implements OutcomeRepository, StoreInitializer {
       checkFenceRetention(transaction, (entityType) => retention.includes(entityType))
     }
 
-    const {items, layout} = buildTransaction(this.#table, transaction, version, (commit) =>
-      this.#commitTtl(commit, ttlFor(commit.events[0]!.entityType)),
+    const {items, layout} = buildTransaction(
+      this.#table,
+      transaction,
+      version,
+      (commit) => this.#commitTtl(commit, ttlFor(commit.events[0]!.entityType)),
+      this.#viewsTable,
     )
     try {
       await this.#client.transactWriteItems({TransactItems: items}, request)
@@ -615,6 +639,12 @@ export class DynamoRepository implements OutcomeRepository, StoreInitializer {
 
     const failed = codes.indexOf(CONDITION_FAILED)
     if (failed === -1) {
+      // A view the backend refused: an item the views table can't hold.
+      const refused = layout.views.find(({index}) => VIEW_REFUSALS.has(codes[index] ?? ''))
+      if (refused !== undefined) {
+        return new ProjectorOperationError(refused.view, codes[refused.index]!, error)
+      }
+
       // Another transaction was writing one of the items, perhaps one this commit never changes
       // (a control check): nothing was written and nothing is known to be stale, so it is
       // transient, like throttling, and never a conflict, as in Go and Rust.
@@ -669,9 +699,20 @@ export class DynamoRepository implements OutcomeRepository, StoreInitializer {
       return ranked
     }
 
-    // Only a projector operation's condition failed: its own error, as Go reports it.
+    // Only a projector group's operation failed: its own error, as Go reports it.
     if (failed < layout.projectorEnd) {
       return error
+    }
+
+    // A view whose condition failed, or that the views table refused.
+    for (const {index, view} of layout.views) {
+      const code = codes[index] ?? ''
+      if (code === CONDITION_FAILED) {
+        return new ProjectorOperationError(view, code)
+      }
+      if (VIEW_REFUSALS.has(code)) {
+        return new ProjectorOperationError(view, code, error)
+      }
     }
 
     return new ConflictError(
