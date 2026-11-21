@@ -96,6 +96,15 @@ export interface ViewOperation {
    * `ProjectorOperationError` reports as its `mapped` error. Never stored.
    */
   readonly conflict?: unknown
+  /**
+   * An engine-only condition on a put (the journal's counter, ADR 0005): the row must exist, be
+   * the owner's, and hold exactly these payload bytes, valid UTF-8. Only a put with no other
+   * condition may carry it, and a commit-wide projector's operation that sets it is refused, so
+   * only the engine writes it. A repository that writes the journal applies it in the commit
+   * (DynamoDB: `entityID = :owner AND payload = :expected`) and says so with
+   * `Repository.appliesExpectedPayload`. Like every put's condition, it isn't budgeted.
+   */
+  readonly expectedPayload?: Uint8Array | null | undefined
 }
 
 const encoder = new TextEncoder()
@@ -120,6 +129,14 @@ export function putView(
     condition: options.condition ?? 'none',
     ...('conflict' in options && {conflict: options.conflict}),
   }
+}
+
+/**
+ * The engine's compare-and-set put: `op` with the condition that the stored row is the owner's
+ * and holds exactly `payload`. Internal: a projector cannot set it.
+ */
+export function expectPayload(op: ViewOperation, payload: Uint8Array): ViewOperation {
+  return {...op, expectedPayload: payload}
 }
 
 /** An operation that deletes the row at `pk` and `sk`, which only its `owner` may delete. */
@@ -251,6 +268,9 @@ export function projectViews(
 
     operations.forEach((op, operation) => {
       const item: ProjectedView = {projector: projector.name, projectorIndex, operation, op}
+      if (op.expectedPayload !== null && op.expectedPayload !== undefined) {
+        throw invalidView(item, "an expected payload is the engine's alone")
+      }
       checkOwner(item, view, history)
       if (!engine) {
         checkUnreserved(item)
@@ -306,6 +326,15 @@ function invalidReason(op: ViewOperation): string | null {
   if (op.kind === 'delete' && op.condition === 'absent') {
     return 'a delete cannot carry the "absent" condition'
   }
+  const expected = op.expectedPayload
+  if (expected !== null && expected !== undefined) {
+    if (op.kind !== 'put' || op.condition !== 'none') {
+      return 'an expected payload is valid only on a put with no other condition'
+    }
+    if (!isUtf8(expected)) {
+      return 'an expected view payload must be UTF-8'
+    }
+  }
   if (op.pk === '') {
     return 'pk is empty'
   }
@@ -342,6 +371,15 @@ function invalidReason(op: ViewOperation): string | null {
   }
 
   return null
+}
+
+function isUtf8(bytes: Uint8Array): boolean {
+  try {
+    decoder.decode(bytes)
+    return true
+  } catch {
+    return false
+  }
 }
 
 function invalidView(view: ProjectedView, reason: string): EvtError {

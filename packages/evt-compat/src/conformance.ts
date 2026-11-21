@@ -131,6 +131,12 @@ export async function conformance(
   if (repo.writesViews?.() === true) {
     cases.push(['views commit with their events, each conditioned on its owner', () => views(repo)])
   }
+  if (repo.appliesExpectedPayload?.() === true) {
+    cases.push([
+      'an expected payload replaces exactly the row the commit read',
+      () => expectedPayload(repo),
+    ])
+  }
   if (recordsOutcomes(repo)) {
     cases.push(
       [
@@ -880,6 +886,84 @@ async function views(repo: Repository): Promise<void> {
     'views without an event',
     (error) => error instanceof ProjectorOnlyCommitError,
   )
+}
+
+// The engine's compare-and-set put, the journal's counter: it replaces the owner's row only while
+// that row holds exactly the expected bytes, and a failed expectation writes nothing. Each step's
+// success shows what the step before it stored.
+async function expectedPayload(repo: Repository): Promise<void> {
+  const ns = namespace()
+  const [owner, other] = [new Stream(ns, 'owner'), new Stream(ns, 'other')]
+  const pk = `${ns}-counter`
+  const put = (stream: Stream, payload: string, expected?: string): ProjectedView => {
+    const op = putView(pk, 'COUNTER', stream.id, 'journal-counter', payload, {
+      condition: expected === undefined ? 'absent' : 'none',
+    })
+    return expected === undefined
+      ? {projector: 'counter', projectorIndex: 0, operation: 0, op}
+      : expecting(op, encoder.encode(expected))
+  }
+  const commit = (stream: Stream, sequence: number, view: ProjectedView) =>
+    repo.commit({entityId: stream.id, events: [stream.event(sequence, 1)], views: [view]})
+
+  // The first counter is claimed with an absent put, as when the commit read none.
+  await commit(owner, 1, put(owner, '{"n":1}'))
+  // Expecting what is stored replaces it.
+  await commit(owner, 2, put(owner, '{"n":2}', '{"n":1}'))
+  // A stale expectation fails, and writes nothing.
+  await expectError(
+    commit(owner, 3, put(owner, '{"n":3}', '{"n":1}')),
+    'a stale payload',
+    conditionFailed,
+  )
+  ensureEqual((await repo.events(owner.id)).length, 2, 'the failed commit wrote no event')
+  await commit(owner, 3, put(owner, '{"n":3}', '{"n":2}'))
+
+  // Another stream cannot replace the row, even with the right payload.
+  await expectError(
+    commit(other, 1, put(other, '{"n":4}', '{"n":3}')),
+    'another owner',
+    conditionFailed,
+  )
+  // An expectation on a row that is not there fails.
+  const missing = put(owner, '{}', '{}')
+  await expectError(
+    commit(owner, 4, {...missing, op: {...missing.op, pk: `${ns}-missing`}}),
+    'an absent row',
+    conditionFailed,
+  )
+
+  // Built wrong, it's refused before any write.
+  const body = encoder.encode('{}')
+  for (const [what, view] of [
+    [
+      'with the absent condition',
+      expecting(putView(pk, 'x', owner.id, 't', '{}', {condition: 'absent'}), body),
+    ],
+    ['on a delete', expecting(deleteView(pk, 'x', owner.id), body)],
+    ['not UTF-8', expecting(putView(pk, 'x', owner.id, 't', '{}'), new Uint8Array([0xff]))],
+  ] as const) {
+    await expectError(
+      commit(owner, 4, view),
+      `an expected payload ${what}`,
+      coded('invalidViewOperation'),
+    )
+  }
+  ensureEqual((await repo.events(owner.id)).length, 3, 'the refused commits wrote no event')
+}
+
+function conditionFailed(error: unknown): boolean {
+  return error instanceof ProjectorOperationError && error.reason === 'ConditionalCheckFailed'
+}
+
+// A view operation of the `counter` projector that expects the stored payload.
+function expecting(op: ViewOperation, expected: Uint8Array): ProjectedView {
+  return {
+    projector: 'counter',
+    projectorIndex: 0,
+    operation: 0,
+    op: {...op, expectedPayload: expected},
+  }
 }
 
 // A view operation of the `handles` projector.

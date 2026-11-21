@@ -129,6 +129,15 @@ export interface Repository {
    */
   writesViews?(): boolean
 
+  /**
+   * Whether it applies a view put's engine-only `expectedPayload` condition (the journal's counter
+   * compare-and-set): the row must exist, be the owner's, and hold exactly those bytes, or the
+   * commit fails with a `ProjectorOperationError`. Absent means it doesn't, and the journal refuses
+   * to commit through it, so a backend that ignored the condition cannot write a counter
+   * unconditionally. `MemRepository` and `DynamoRepository` return true. A wrapper must forward it.
+   */
+  appliesExpectedPayload?(): boolean
+
   /** Every stored event of the stream, ascending. */
   events(entityId: string, options?: CallOptions): Promise<SerializedEvent[]>
 
