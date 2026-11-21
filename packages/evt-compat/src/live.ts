@@ -43,6 +43,7 @@ import {
   encodeSnapshot,
   compareUtf8,
   isEventLog,
+  isRebuildFence,
   parseJson,
 } from '@photon-grove/evt'
 import {
@@ -72,6 +73,7 @@ import {
   Runner,
   SUPPORTED_SCENARIOS,
   type MarkerDriver,
+  type RebuildDriver,
   checkScenario,
   checkStep,
   compareObserved,
@@ -102,6 +104,8 @@ interface Backend {
   bypassHead(event: SerializedEvent): Promise<void>
   /** Declares on the store's feature manifest, as another writer would. */
   readonly marker: MarkerDriver
+  /** Counts the view rows of a partition, for a rebuild's guarded writes. */
+  viewRows(pk: string): Promise<number>
   observe(runner: Runner, id: string): Promise<Observed>
   /** Compares what the backend stores for a stream beyond what `observe` reads. */
   checkRows(checks: Checks, name: string, id: string, expected: JsonValue): Promise<void>
@@ -254,6 +258,9 @@ function dynamoBackend(): Backend {
   return {
     repository,
     marker: dynamoControls(client, table),
+    async viewRows(pk) {
+      return (await partition(client, viewsTable, pk)).length
+    },
     // The event item alone, with none of the head update a commit carries, as Go's driver puts it.
     async bypassHead(event) {
       await client.putItem({
@@ -322,6 +329,13 @@ async function postgresBackend(): Promise<Backend> {
   return {
     repository,
     marker: postgresControls(pool, repository.tables.events),
+    async viewRows(pk) {
+      const {rows} = await pool.query<{count: string}>(
+        `SELECT count(*)::text AS count FROM ${POSTGRES_VIEW_TABLE} WHERE pk = $1`,
+        [pk],
+      )
+      return Number(rows[0]?.count ?? 0)
+    },
     // The event row alone, leaving the stream's head row as it was, as Go's driver inserts it.
     async bypassHead(event) {
       await pool.query(
@@ -514,6 +528,7 @@ async function runStep(checks: Checks, backend: Backend, args: Args): Promise<nu
     const runner = new Runner(backend.repository, scenario, args.run, {
       bypassHead: (event) => backend.bypassHead(event),
       marker: backend.marker,
+      rebuild: rebuildDriver(backend),
     })
     const got = await runner.step(step)
     const want = expectedOutcome(field(step, 'expect'))
@@ -569,6 +584,20 @@ async function verify(
       compareStream(checks, label, await backend.observe(runner, id), sibling)
       await backend.checkRows(checks, label, id, sibling)
     }
+  }
+}
+
+// The rebuild fence of a live run: the repository's, with a wait that really sleeps.
+function rebuildDriver(backend: Backend): RebuildDriver {
+  const fence = backend.repository
+  if (!isRebuildFence(fence)) {
+    throw new Error('the repository has no rebuild fence')
+  }
+
+  return {
+    fence,
+    wait: (seconds) => new Promise((resolve) => setTimeout(resolve, seconds * 1000)),
+    rows: (pk) => backend.viewRows(pk),
   }
 }
 

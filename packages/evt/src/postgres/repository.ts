@@ -15,9 +15,13 @@ import {
   EvtError,
   FenceConflictError,
   HistoryDependentProjectionError,
+  IndeterminateError,
   OutcomeConflictError,
   ProjectorOperationError,
+  RebuildBeginIndeterminateError,
+  RebuildConflictError,
   RebuildInProgressError,
+  RebuildLeaseLostError,
   SequenceGapError,
   StreamHeadDriftError,
   StreamHeadsNotMigratedError,
@@ -26,6 +30,19 @@ import {
   ViewsNotConfiguredError,
 } from '../errors.js'
 import type {EventLog, StreamFilter} from '../enumerate.js'
+import {
+  MAX_REBUILD_BEGIN_ATTEMPTS,
+  type RebuildFence,
+  type RebuildGeneration,
+  type RebuildLease,
+  type RebuildLock,
+  type RebuildState,
+  checkRebuildOwner,
+  checkRebuildViewBatch,
+  fenceNow,
+  planRebuildBegin,
+  rebuildLeaseSeconds,
+} from '../rebuild-fence.js'
 import type {SerializedEvent, SerializedSnapshot} from '../event.js'
 import {
   type FeatureManifest,
@@ -140,6 +157,8 @@ export interface PgRepositoryOptions {
    * views elsewhere refuses the store. The database must be `UTF8`. Rust's `with_views_table()`.
    */
   viewsTable?: boolean
+  /** The clock rebuild leases expire by, in Unix milliseconds as `Date.now` gives them. */
+  clock?: () => number
 }
 
 /** The backend name a projector group for the PostgreSQL repository would carry. */
@@ -151,6 +170,9 @@ export const POSTGRES_BACKEND = 'postgres'
 const EVENT_COLUMNS =
   'event_id, sequence::text AS sequence, event_type, version::text AS version, entity_id, ' +
   "entity_type, encode(payload, 'hex') AS payload, metadata::text AS metadata"
+
+// A rebuild's begin found its rows moved by a writer outside the protocol: it reads and tries again.
+const MOVED = Symbol('moved')
 
 // The rows each page of an enumeration reads.
 const ENUMERATION_PAGE_SIZE = 500
@@ -171,10 +193,13 @@ const UNIQUE_VIOLATION = '23505'
  * it validated. Every commit and snapshot write reads the manifest again under a shared lock that
  * no declaration can take while the write is open, and validates it again when it changed.
  */
-export class PgRepository implements OutcomeRepository, StoreInitializer, EventLog, JournalStore {
+export class PgRepository
+  implements OutcomeRepository, StoreInitializer, EventLog, RebuildFence, JournalStore
+{
   readonly #client: PgClient
   readonly #tables: PgTables
   readonly #viewWriter: ViewWriter | undefined
+  readonly #clock: () => number
   // Whether commits write their views to the views table, which #viewRepository reads.
   readonly #viewsTable: boolean
   readonly #viewRepository: PgViewRepository
@@ -194,6 +219,7 @@ export class PgRepository implements OutcomeRepository, StoreInitializer, EventL
     this.#client = client
     this.#tables = pgTables(options.eventsTable, options.snapshotsTable)
     this.#viewWriter = options.viewWriter
+    this.#clock = options.clock ?? Date.now
     this.#viewsTable = options.viewsTable === true
     if (this.#viewsTable && this.#viewWriter !== undefined) {
       throw new EvtError(
@@ -548,6 +574,260 @@ export class PgRepository implements OutcomeRepository, StoreInitializer, EventL
 
     const eventSequence = stream.events.at(-1)!.sequence
     await this.#upsertSnapshot(run, {...snapshot, entityId, eventSequence})
+  }
+
+  async rebuildGeneration(options?: CallOptions): Promise<RebuildGeneration> {
+    options?.signal?.throwIfAborted()
+
+    return this.#readGeneration((statement, values) => this.#read(statement, values), false)
+  }
+
+  /** The generation, then the lock: two statements, not one transaction, as Go's and Rust's. */
+  async rebuildState(options?: CallOptions): Promise<RebuildState> {
+    const generation = await this.rebuildGeneration(options)
+    const lock = await this.#readLock((statement, values) => this.#read(statement, values), false)
+
+    return {generation, lock}
+  }
+
+  async beginRebuild(owner: string, leaseMs: number, options?: CallOptions): Promise<RebuildLease> {
+    options?.signal?.throwIfAborted()
+    checkRebuildOwner(owner)
+    const seconds = rebuildLeaseSeconds(leaseMs)
+    const lockTable = rebuildLockTable(this.#tables)
+    const generationTable = rebuildGenerationTable(this.#tables)
+
+    // Every lifecycle transaction holds the fence's exclusive lock, so rows move between attempts
+    // only when a writer outside the protocol changed them.
+    for (let attempt = 1; attempt <= MAX_REBUILD_BEGIN_ATTEMPTS; attempt++) {
+      let begun: {lease: RebuildLease; observed: bigint} | null = null
+      try {
+        const lease = await this.#transaction(options, true, async (run) => {
+          await run(ENGINE_LOCK_EXCLUSIVE, [rebuildLockKey(this.#tables)])
+          const generation = await this.#readGeneration(run, true)
+          const lock = await this.#readLock(run, true)
+          const now = fenceNow(this.#clock)
+          const plan = planRebuildBegin({generation, lock}, now)
+          const taken = {
+            owner,
+            generation: generation.value + plan.increment,
+            leaseExpiresAt: now + seconds,
+          }
+          begun = {lease: taken, observed: generation.value}
+          const expiry = taken.leaseExpiresAt.toString()
+          const token = taken.generation.toString()
+
+          if (plan.kind === 'takeover') {
+            const moved =
+              (
+                await run(
+                  `UPDATE ${lockTable} SET owner = $1, generation = $5::bigint, ` +
+                    'lease_expires_at = to_timestamp($2::bigint::double precision) ' +
+                    'WHERE id = 0 AND owner = $3 ' +
+                    'AND lease_expires_at < to_timestamp($4::bigint::double precision) RETURNING 1',
+                  [owner, expiry, plan.observedOwner, now.toString(), token],
+                )
+              ).length === 0 ||
+              (
+                await run(
+                  `UPDATE ${generationTable} SET value = value + 2 ` +
+                    'WHERE id = 0 AND value = $1::bigint RETURNING 1',
+                  [plan.seenOdd.toString()],
+                )
+              ).length === 0
+            if (moved) {
+              throw MOVED
+            }
+
+            return taken
+          }
+
+          try {
+            await run(
+              `INSERT INTO ${lockTable} (id, owner, generation, lease_expires_at) ` +
+                'VALUES (0, $1, $3::bigint, to_timestamp($2::bigint::double precision))',
+              [owner, expiry, token],
+            )
+          } catch (error) {
+            throw sqlState(error) === '23505' ? MOVED : error
+          }
+          const updated = await run(
+            `INSERT INTO ${generationTable} (id, value, force_released) ` +
+              'VALUES (0, $1::bigint, false) ON CONFLICT (id) DO UPDATE ' +
+              `SET value = ${generationTable}.value + $1::bigint ` +
+              `WHERE ${generationTable}.value = $2::bigint ` +
+              `OR (${generationTable}.value = $3::bigint AND ${generationTable}.force_released) ` +
+              'RETURNING 1',
+            [plan.increment.toString(), plan.seenEven.toString(), plan.seenOdd.toString()],
+          )
+          if (updated.length === 0) {
+            throw MOVED
+          }
+
+          return taken
+        })
+
+        return lease
+      } catch (error) {
+        if (error === MOVED) {
+          continue
+        }
+        if (error instanceof IndeterminateError) {
+          const known = begun as {lease: RebuildLease; observed: bigint} | null
+          if (known !== null) {
+            throw new RebuildBeginIndeterminateError(known.lease, known.observed, error.cause)
+          }
+        }
+        throw error
+      }
+    }
+
+    throw new RebuildConflictError(MAX_REBUILD_BEGIN_ATTEMPTS)
+  }
+
+  async renewRebuild(
+    lease: RebuildLease,
+    leaseMs: number,
+    options?: CallOptions,
+  ): Promise<RebuildLease> {
+    options?.signal?.throwIfAborted()
+    checkRebuildOwner(lease.owner)
+    const seconds = rebuildLeaseSeconds(leaseMs)
+    const expiry = fenceNow(this.#clock) + seconds
+    const renewed = await this.#read(
+      `UPDATE ${rebuildLockTable(this.#tables)} ` +
+        'SET lease_expires_at = to_timestamp($2::bigint::double precision) ' +
+        'WHERE id = 0 AND owner = $1 AND generation = $3::bigint RETURNING 1',
+      [lease.owner, expiry.toString(), lease.generation.toString()],
+    )
+    if (renewed.length === 0) {
+      throw new RebuildLeaseLostError(lease.owner)
+    }
+
+    return {...lease, leaseExpiresAt: expiry}
+  }
+
+  async endRebuild(lease: RebuildLease, options?: CallOptions): Promise<RebuildGeneration> {
+    options?.signal?.throwIfAborted()
+    checkRebuildOwner(lease.owner)
+
+    return this.#release(lease.owner, lease.generation, options)
+  }
+
+  async forceReleaseRebuild(owner: string, options?: CallOptions): Promise<RebuildGeneration> {
+    options?.signal?.throwIfAborted()
+    checkRebuildOwner(owner)
+
+    return this.#release(owner, null, options)
+  }
+
+  /**
+   * Writes the batch in one transaction that first locks the lock row and checks the lease holds
+   * it unexpired, so a takeover waits for the batch. Its statements run as a commit's do.
+   */
+  async writeRebuildViews(
+    lease: RebuildLease,
+    views: readonly ProjectedView[],
+    options?: CallOptions,
+  ): Promise<void> {
+    options?.signal?.throwIfAborted()
+    checkRebuildOwner(lease.owner)
+    checkRebuildViewBatch(views)
+    const built = this.#buildViews(views)
+    if (this.#viewsTable) {
+      await this.#ensureStreamHeads(options)
+      await this.#ensureViewsDeclared(options)
+    }
+
+    await this.#transaction(options, {indeterminate: false, views: true}, async (run) => {
+      const lock = await this.#readLock(run, true)
+      const held =
+        lock !== null &&
+        lock.owner === lease.owner &&
+        lock.generation === lease.generation &&
+        lock.leaseExpiresAt > fenceNow(this.#clock)
+      if (!held) {
+        throw new RebuildLeaseLostError(lease.owner)
+      }
+      this.#refuseForeignViews(await this.#readManifest(run))
+      await execViews(run, built)
+    })
+  }
+
+  // Ends a lease (with its fencing generation) or force-releases an owner's (without), in one
+  // transaction under the fence's exclusive lock. A force-release keeps no lock row: the odd
+  // generation it leaves refuses commits.
+  async #release(
+    owner: string,
+    generation: bigint | null,
+    options?: CallOptions,
+  ): Promise<RebuildGeneration> {
+    const lockTable = rebuildLockTable(this.#tables)
+    const generationTable = rebuildGenerationTable(this.#tables)
+
+    return this.#transaction(options, false, async (run) => {
+      await run(ENGINE_LOCK_EXCLUSIVE, [rebuildLockKey(this.#tables)])
+      const seen = await this.#readGeneration(run, true)
+      if (seen.value % 2n === 0n || (generation !== null && seen.value !== generation)) {
+        throw new RebuildLeaseLostError(owner)
+      }
+
+      const deleted =
+        generation === null
+          ? await run(`DELETE FROM ${lockTable} WHERE id = 0 AND owner = $1 RETURNING 1`, [owner])
+          : await run(
+              `DELETE FROM ${lockTable} WHERE id = 0 AND owner = $1 ` +
+                'AND generation = $2::bigint RETURNING 1',
+              [owner, generation.toString()],
+            )
+      if (deleted.length === 0) {
+        throw new RebuildLeaseLostError(owner)
+      }
+
+      const increment = generation === null ? 2n : 1n
+      const forceReleased = generation === null
+      const updated = await run(
+        `UPDATE ${generationTable} SET value = value + $1::bigint, ` +
+          'force_released = $2::boolean WHERE id = 0 AND value = $3::bigint RETURNING 1',
+        [increment.toString(), forceReleased.toString(), seen.value.toString()],
+      )
+      if (updated.length === 0) {
+        throw new RebuildLeaseLostError(owner)
+      }
+
+      return {value: seen.value + increment, forceReleased}
+    })
+  }
+
+  // The generation row, 0 never force-released when there is none, locked to COMMIT with `lock`.
+  async #readGeneration(run: Statement, lock: boolean): Promise<RebuildGeneration> {
+    const rows = await run(
+      'SELECT value::text AS value, force_released::text AS force_released ' +
+        `FROM ${rebuildGenerationTable(this.#tables)} WHERE id = 0${lock ? ' FOR UPDATE' : ''}`,
+    )
+    const row = rows[0]
+
+    return row === undefined
+      ? {value: 0n, forceReleased: false}
+      : {value: BigInt(text(row, 'value')), forceReleased: text(row, 'force_released') === 'true'}
+  }
+
+  // The lock row, or null, locked to COMMIT with `lock`.
+  async #readLock(run: Statement, lock: boolean): Promise<RebuildLock | null> {
+    const rows = await run(
+      'SELECT owner, generation::text AS generation, ' +
+        'EXTRACT(EPOCH FROM lease_expires_at)::bigint::text AS lease_expires_at ' +
+        `FROM ${rebuildLockTable(this.#tables)} WHERE id = 0${lock ? ' FOR UPDATE' : ''}`,
+    )
+    const row = rows[0]
+
+    return row === undefined
+      ? null
+      : {
+          owner: text(row, 'owner'),
+          generation: BigInt(text(row, 'generation')),
+          leaseExpiresAt: Number(text(row, 'lease_expires_at')),
+        }
   }
 
   /** Each entity's events come whole, in one batch. */

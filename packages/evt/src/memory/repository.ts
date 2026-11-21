@@ -12,6 +12,7 @@ import {
   OutcomeConflictError,
   ProjectorOperationError,
   RebuildInProgressError,
+  RebuildLeaseLostError,
   SequenceGapError,
   StreamHeadDriftError,
   StreamHeadsNotMigratedError,
@@ -49,7 +50,20 @@ import {
 } from '../journal/scope.js'
 import type {Metadata} from '../metadata.js'
 import {type Outcome, checkCommandId} from '../outcome.js'
-import {REASON_CONDITION_FAILED, type ViewOperation} from '../projection.js'
+import {type ProjectedView, REASON_CONDITION_FAILED, type ViewOperation} from '../projection.js'
+import {
+  type RebuildFence,
+  type RebuildGeneration,
+  type RebuildLease,
+  type RebuildLock,
+  type RebuildState as RebuildRows,
+  checkRebuildOwner,
+  checkRebuildViewBatch,
+  fenceNow,
+  holdsRebuildLock,
+  planRebuildBegin,
+  rebuildLeaseSeconds,
+} from '../rebuild-fence.js'
 import {
   type CallOptions,
   type Commit,
@@ -78,26 +92,40 @@ interface Stream {
   head: bigint
 }
 
-/** The state of the rebuild fence's two rows that a commit's lock check reads. */
-export interface RebuildState {
+/** The rebuild fence's rows as a conformance suite sets them, in the commit check's terms. */
+export interface RebuildFixture {
   /** The generation counter: odd while a rebuild holds the store or after a force-release. */
   generation: bigint
   /**
-   * The lock row: a rebuild's lease, the item a force-release leaves in its place, or none. A
-   * commit is refused while either exists, and while the generation is odd.
+   * The lock row: a rebuild's lease (owner `conformance`, five minutes on the repository's clock),
+   * the item a force-release leaves in its place (which flags the generation), or none. A commit
+   * is refused while a lease is held and while the generation is odd.
    */
   lock: 'held' | 'forceReleased' | null
+}
+
+/**
+ * @deprecated The fence's fixture rows, renamed {@link RebuildFixture}. The package root's
+ * `RebuildState` is the fence's state, a different type.
+ */
+export type RebuildState = RebuildFixture
+
+/** Options of a {@link MemRepository}. */
+export interface MemRepositoryOptions {
+  /** The clock rebuild leases expire by, in Unix milliseconds as `Date.now` gives them. */
+  clock?: () => number
 }
 
 // The store-wide control rows: the feature marker and the rebuild fence.
 interface Controls {
   manifest: FeatureManifest | null
-  rebuild: RebuildState
+  rebuild: {generation: RebuildGeneration; lock: RebuildLock | null}
 }
 
 // Read a repository's private state, for the fixtures. The class's static block sets them.
 let streamsOf: (repo: MemRepository) => Map<string, Stream>
 let controlsOf: (repo: MemRepository) => Controls
+let clockOf: (repo: MemRepository) => () => number
 let viewsOf: (repo: MemRepository) => Map<string, Map<string, ViewRow>>
 
 /**
@@ -111,14 +139,113 @@ let viewsOf: (repo: MemRepository) => Map<string, Map<string, ViewRow>>
  * on its feature manifest, so {@link initialize} is needed only where code treats every backend
  * alike.
  */
-export class MemRepository implements OutcomeRepository, StoreInitializer, EventLog {
+export class MemRepository implements OutcomeRepository, StoreInitializer, EventLog, RebuildFence {
   readonly #streams = new Map<string, Stream>()
-  readonly #controls: Controls = {manifest: null, rebuild: {generation: 0n, lock: null}}
+  readonly #controls: Controls = {
+    manifest: null,
+    rebuild: {generation: {value: 0n, forceReleased: false}, lock: null},
+  }
+  readonly #clock: () => number
   // The command outcomes by command ID, kept as the DynamoDB item, so a read decodes and
   // validates exactly what a live backend's would.
   readonly #outcomes = new Map<string, Item>()
   // The commit-wide view rows, by pk and then sk.
   readonly #views = new Map<string, Map<string, ViewRow>>()
+
+  constructor(options: MemRepositoryOptions = {}) {
+    this.#clock = options.clock ?? Date.now
+  }
+
+  async rebuildState(options?: CallOptions): Promise<RebuildRows> {
+    options?.signal?.throwIfAborted()
+    const {generation, lock} = this.#controls.rebuild
+
+    return {generation: {...generation}, lock: lock && {...lock}}
+  }
+
+  async rebuildGeneration(options?: CallOptions): Promise<RebuildGeneration> {
+    options?.signal?.throwIfAborted()
+
+    return {...this.#controls.rebuild.generation}
+  }
+
+  async beginRebuild(owner: string, leaseMs: number, options?: CallOptions): Promise<RebuildLease> {
+    options?.signal?.throwIfAborted()
+    checkRebuildOwner(owner)
+    const seconds = rebuildLeaseSeconds(leaseMs)
+    const rebuild = this.#controls.rebuild
+    const now = fenceNow(this.#clock)
+    const plan = planRebuildBegin(rebuild, now)
+    const generation = rebuild.generation.value + plan.increment
+    // An acquire or a takeover leaves the force-release flag as it was: only an end clears it.
+    rebuild.generation = {...rebuild.generation, value: generation}
+    rebuild.lock = {owner, generation, leaseExpiresAt: now + seconds}
+
+    return {...rebuild.lock}
+  }
+
+  async renewRebuild(
+    lease: RebuildLease,
+    leaseMs: number,
+    options?: CallOptions,
+  ): Promise<RebuildLease> {
+    options?.signal?.throwIfAborted()
+    checkRebuildOwner(lease.owner)
+    const seconds = rebuildLeaseSeconds(leaseMs)
+    const rebuild = this.#controls.rebuild
+    if (!holdsRebuildLock(lease, rebuild.lock)) {
+      throw new RebuildLeaseLostError(lease.owner)
+    }
+    rebuild.lock = {...rebuild.lock!, leaseExpiresAt: fenceNow(this.#clock) + seconds}
+
+    return {...rebuild.lock}
+  }
+
+  async endRebuild(lease: RebuildLease, options?: CallOptions): Promise<RebuildGeneration> {
+    options?.signal?.throwIfAborted()
+    checkRebuildOwner(lease.owner)
+    const rebuild = this.#controls.rebuild
+    if (!holdsRebuildLock(lease, rebuild.lock)) {
+      throw new RebuildLeaseLostError(lease.owner)
+    }
+    rebuild.lock = null
+    rebuild.generation = {value: rebuild.generation.value + 1n, forceReleased: false}
+
+    return {...rebuild.generation}
+  }
+
+  async forceReleaseRebuild(owner: string, options?: CallOptions): Promise<RebuildGeneration> {
+    options?.signal?.throwIfAborted()
+    checkRebuildOwner(owner)
+    const rebuild = this.#controls.rebuild
+    if (rebuild.lock === null || rebuild.lock.owner !== owner) {
+      throw new RebuildLeaseLostError(owner)
+    }
+    rebuild.lock = null
+    rebuild.generation = {value: rebuild.generation.value + 2n, forceReleased: true}
+
+    return {...rebuild.generation}
+  }
+
+  async writeRebuildViews(
+    lease: RebuildLease,
+    views: readonly ProjectedView[],
+    options?: CallOptions,
+  ): Promise<void> {
+    options?.signal?.throwIfAborted()
+    checkRebuildOwner(lease.owner)
+    checkRebuildViewBatch(views)
+    const lock = this.#controls.rebuild.lock
+    if (!holdsRebuildLock(lease, lock) || lock!.leaseExpiresAt <= fenceNow(this.#clock)) {
+      throw new RebuildLeaseLostError(lease.owner)
+    }
+    for (const view of views) {
+      if (!this.#viewHolds(view.op)) {
+        throw new ProjectorOperationError(view, REASON_CONDITION_FAILED)
+      }
+    }
+    this.#applyViews(views)
+  }
 
   async initialize(options?: CallOptions): Promise<boolean> {
     options?.signal?.throwIfAborted()
@@ -213,7 +340,7 @@ export class MemRepository implements OutcomeRepository, StoreInitializer, Event
     const retention = this.#controls.manifest?.retention ?? []
     checkFenceRetention(transaction, (entityType) => retention.includes(entityType))
     const {rebuild} = this.#controls
-    if (rebuild.lock !== null || rebuild.generation % 2n !== 0n) {
+    if (rebuild.lock !== null || rebuild.generation.value % 2n !== 0n) {
       throw new RebuildInProgressError()
     }
 
@@ -275,7 +402,15 @@ export class MemRepository implements OutcomeRepository, StoreInitializer, Event
       }
       this.#streams.set(entityId, held)
     }
-    for (const {op} of transaction.views) {
+    this.#applyViews(transaction.views)
+    if (outcome !== null && recorded !== null) {
+      this.#outcomes.set(outcome.commandId, recorded)
+    }
+  }
+
+  // Writes view operations whose conditions held.
+  #applyViews(views: readonly ProjectedView[]): void {
+    for (const {op} of views) {
       const partition = this.#views.get(op.pk) ?? new Map<string, ViewRow>()
       if (op.kind === 'put') {
         partition.set(op.sk, {
@@ -289,9 +424,6 @@ export class MemRepository implements OutcomeRepository, StoreInitializer, Event
         partition.delete(op.sk)
       }
       this.#views.set(op.pk, partition)
-    }
-    if (outcome !== null && recorded !== null) {
-      this.#outcomes.set(outcome.commandId, recorded)
     }
   }
 
@@ -547,6 +679,7 @@ export class MemRepository implements OutcomeRepository, StoreInitializer, Event
   static {
     streamsOf = (repo) => repo.#streams
     controlsOf = (repo) => repo.#controls
+    clockOf = (repo) => repo.#clock
     viewsOf = (repo) => repo.#views
   }
 
@@ -747,7 +880,9 @@ export interface ControlFixtures {
   /** Changes the manifest in one declaration, bumping its version by one, and returns it. */
   declare(change: (draft: ManifestDraft) => void): FeatureManifest
   /** Sets the rebuild fence's rows, as a rebuild's lifecycle would. */
-  setRebuild(state: RebuildState): void
+  setRebuild(state: RebuildFixture): void
+  /** Sets the rebuild fence's rows exactly. */
+  setRebuildState(state: RebuildRows): void
 }
 
 /**
@@ -781,7 +916,18 @@ export function controlFixtures(repo: MemRepository): ControlFixtures {
     },
     setRebuild(state) {
       int64Argument(state.generation, 'generation')
-      controls.rebuild = {...state}
+      const value = state.generation
+      controls.rebuild = {
+        generation: {value, forceReleased: state.lock === 'forceReleased'},
+        lock:
+          state.lock === 'held'
+            ? {owner: 'conformance', generation: value, leaseExpiresAt: fenceNow(clockOf(repo)) + 300}
+            : null,
+      }
+    },
+    setRebuildState(state) {
+      int64Argument(state.generation.value, 'generation')
+      controls.rebuild = {generation: {...state.generation}, lock: state.lock && {...state.lock}}
     },
   }
 }

@@ -2196,9 +2196,10 @@ so the rule needs no flag there.
 
 ### Rebuild lifecycle API
 
-Every backend (in-memory, DynamoDB, PostgreSQL) in both languages exposes the same operations over
-the two rows (v0.9). The names below are Go's, with Rust's in parentheses. The semantics, the
-errors, and the stored bytes are shared.
+Every backend (in-memory, DynamoDB, PostgreSQL) in every language exposes the same operations over
+the two rows (v0.9). The names below are Go's, with Rust's in parentheses; TypeScript's are Rust's
+in camel case on the repository (`rebuildState`, `beginRebuild`, and so on, the `RebuildFence`
+interface). The semantics, the errors, and the stored bytes are shared.
 
 | Operation                                            | Effect                                                                                         |
 | ---------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
@@ -2212,7 +2213,8 @@ errors, and the stored bytes are shared.
 
 Values. A *generation* is its `value` (an absent item reads as `0`) and its `forceReleased`
 flag (`false` when absent). It is *settled* when `value` is even and *unsettled* when odd. A *lock*
-is its `owner` and `leaseExpiresAt`. A *state* is a generation and an optional lock. The item a
+is its `owner`, its fencing `generation` (the odd generation that took it) and `leaseExpiresAt`.
+A *state* is a generation and an optional lock. The item a
 force-release leaves holds no lock: `State` reports none. A rebuild is
 *in progress* when the lock row exists. `State` reads the generation first and the lock second.
 The two reads are not one snapshot, so a caller that must decide on the generation uses
@@ -2226,8 +2228,10 @@ language's invalid-argument error before any request. Every operation reads the 
 once, in whole Unix seconds, as `:now`. A lease taken at `:now` expires at `:now + :lease`, and the
 lease has *expired* when `leaseExpiresAt < :now`: a lease is still held at the second it expires.
 The clock is the writer's own, so clock skew between a rebuild worker and a taker-over shortens or
-lengthens a lease by the skew. Choose leases far longer than the skew. Both languages let a test
-inject the clock (Go `WithClock`, Rust's repository clock).
+lengthens a lease by the skew. Choose leases far longer than the skew. Every language lets a test
+inject the clock (Go `WithClock`, Rust's repository clock, TypeScript's `clock` option in Unix
+milliseconds). TypeScript takes a lease in milliseconds, rounded up to whole seconds like the
+others.
 
 `Begin`. It reads the state, then decides:
 
@@ -2303,8 +2307,9 @@ owner (the rebuild it meant to release has already ended or been replaced), and 
 flagged generation. It never runs the rebuild's cleanup, and it does not let commits through:
 every commit is refused with `RebuildInProgress` until a later rebuild ends.
 
-Errors. The names are Go's, with Rust's variant in parentheses. All are typed in both
-languages and none is a conflict or a stale-fence rejection.
+Errors. The names are Go's, with Rust's variant in parentheses; TypeScript's are the Go names with an
+`Error` suffix (`RebuildLeaseLostError`, code `rebuildLeaseLost`). All are typed in every language
+and none is a conflict or a stale-fence rejection.
 
 | Error                                                | When                                                                                                                              |
 | ---------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
@@ -2325,8 +2330,8 @@ projector operations produce) followed by the guard as the 100th action:
 
 ```text
 ConditionCheck (SYSTEM#REBUILD, sk = 0)
-    ConditionExpression: #owner = :me AND leaseExpiresAt > :now
-    ExpressionAttributeNames: {"#owner": "owner"}
+    ConditionExpression: #owner = :me AND #generation = :generation AND leaseExpiresAt > :now
+    ExpressionAttributeNames: {"#owner": "owner", "#generation": "generation"}
 ```
 
 A batch of more than 99 operations fails with `CommitTooLarge` before any write, and an empty
@@ -2340,7 +2345,8 @@ and an unexpired lease, then runs the view statements the repository's view writ
 ### Rebuild epochs
 
 A reader that needs derived state to be consistent fences its read against the generation. The
-protocol is the reader epoch check above, in three shapes every backend and both languages share:
+protocol is the reader epoch check above, in three shapes every backend and every language shares
+(TypeScript: `observeRebuildEpoch`, `verifyRebuildEpoch`, `readAtRebuildEpoch`):
 
 - Observe. Read the generation. An odd one fails with `RebuildUnavailable`, naming the
   generation and whether it is flagged `forceReleased`. An even one is an *epoch*, the value the
