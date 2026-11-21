@@ -190,6 +190,34 @@ describe('DynamoRepository', () => {
     expect(isRetryable(error)).toBe(true)
   })
 
+  test.each([
+    {name: 'on the outcome put', at: 4, outcomeRow: true},
+    {name: 'on the stream head', at: 2, outcomeRow: false},
+  ])(
+    'a transaction conflict $name says whether it was the outcome row',
+    async ({at, outcomeRow}) => {
+      // Controls, head, event, then the outcome put last.
+      const codes = ['None', 'None', 'None', 'None', 'None']
+      codes[at] = 'TransactionConflict'
+      const client = new Scripted(manifest(1n), cancelled(...codes))
+      const outcome = {
+        commandId: 'cmd',
+        status: 'accepted' as const,
+        digest: 'digest',
+        response: null,
+        eventIds: [],
+        rejection: null,
+        identity: null,
+      }
+      const error = await new DynamoRepository(client, 'events')
+        .commitTransaction({streams: [{entityId: 'a', events: [event(1)]}], fences: [], outcome})
+        .catch((thrown: unknown) => thrown)
+
+      expect(error).toBeInstanceOf(TransientError)
+      expect(error).toMatchObject({transactionConflict: true, outcomeRow})
+    },
+  )
+
   test('a throttled transaction is transient', async () => {
     const client = new Scripted(manifest(1n), cancelled('None', 'None', 'ThrottlingError', 'None'))
     const error = await commitOne(client).catch((thrown: unknown) => thrown)

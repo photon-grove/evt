@@ -554,6 +554,11 @@ async function pass(ms: number): Promise<void> {
 }
 
 // A repository whose outcome reads after its first commit behave as `read` says.
+// A DynamoDB transaction conflict on a commit's outcome put.
+function conflict(): TransientError {
+  return new TransientError('transaction conflict', {transactionConflict: true, outcomeRow: true})
+}
+
 function readingAfterCommit(
   inner: OutcomeRepository,
   commitError: unknown,
@@ -686,6 +691,57 @@ describe('recovery reads', () => {
       as('c1'),
     )
     expect(result.replayed).toBe(true)
+  })
+
+  test('a conflict on the outcome put polls the row for 150 ms, never past the window', async () => {
+    const inner = new MemRepository()
+    let reads = 0
+    const late = (appears: number) => () => {
+      reads++
+      return reads < appears ? Promise.resolve(null) : inner.outcome('c1')
+    }
+
+    // The winner's row appears on the third read: at 0, 50 and 150 ms.
+    const {sleep, slept} = waits()
+    const found = await outcomeStore(readingAfterCommit(inner, conflict(), late(3), true), {
+      ...once,
+      sleep,
+    }).executeWithOutcome(ledger, 'l', {type: 'add', amount: 1}, as('c1'))
+    expect(found.replayed).toBe(true)
+    expect(slept).toEqual([50, 100])
+
+    // Absent after the poll, the conflict stands; a shorter recovery window bounds it.
+    reads = 0
+    const short = waits()
+    const error = conflict()
+    const absent = await failure(
+      outcomeStore(readingAfterCommit(new MemRepository(), error, late(99)), {
+        ...once,
+        sleep: short.sleep,
+        recoveryWaitMs: 60,
+      }).executeWithOutcome(ledger, 'l', {type: 'add', amount: 1}, as('c2')),
+    )
+    expect(absent).toBe(error)
+    expect(short.slept).toEqual([50, 10])
+  })
+
+  test('any other transaction conflict reads the row once', async () => {
+    let reads = 0
+    const error = new TransientError('transaction conflict', {transactionConflict: true})
+    const repository = readingAfterCommit(new MemRepository(), error, async () => {
+      reads++
+      return null
+    })
+    const result = await failure(
+      outcomeStore(repository, once).executeWithOutcome(
+        ledger,
+        'l',
+        {type: 'add', amount: 1},
+        as('c1'),
+      ),
+    )
+    expect(result).toBe(error)
+    expect(reads).toBe(1)
   })
 
   test("recovery doesn't depend on the caller's signal", async () => {

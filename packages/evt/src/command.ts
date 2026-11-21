@@ -57,6 +57,12 @@ export const DEFAULT_RECOVERY_WAIT_MS = 10_000
 // between recovery reads: 50 ms, doubling to 1 s. Go and Rust use the same.
 const RECOVERY_GRACE_MS = 1000
 const RECOVERY_FIRST_DELAY_MS = 50
+
+// How long settle polls the outcome row after a DynamoDB transaction conflict on the outcome put:
+// reads at 0, 50 and 150 ms, never past the recovery window. The winner's transaction was
+// committing when the loser was cancelled, and a winner that fails leaves no row, so the poll stays
+// short rather than waiting out the window.
+const OUTCOME_ROW_CONFLICT_WINDOW_MS = 150
 const RECOVERY_MAX_DELAY_MS = 1000
 
 // The longest recovery window a timer can bound with its grace period: runtimes fire a timer past
@@ -387,6 +393,22 @@ export async function settle(
     }
   }
 
+  // A DynamoDB transaction conflict on the outcome put: only another attempt of the same command
+  // writes that item, and its transaction was still committing, so one read right away can miss
+  // its row. Poll briefly; absent after that, the error stands.
+  if (error instanceof TransientError && error.outcomeRow) {
+    const window = Math.min(config.recoveryWaitMs, OUTCOME_ROW_CONFLICT_WINDOW_MS)
+    const polled = await pollForRow(repository, commandId, config, window)
+    if (polled.kind === 'found') {
+      return sameCommand(polled.outcome, digest)
+    }
+    // A malformed row is corruption, not a conflict to retry past.
+    if (polled.kind === 'corrupt') {
+      throw polled.error
+    }
+    throw error
+  }
+
   if (mayHaveLostTheRace(error)) {
     const read = await readBounded(repository, commandId, config.recoveryWaitMs)
     if (read.kind === 'found') {
@@ -451,17 +473,16 @@ type Polled =
   | {kind: 'unreadable'; error?: unknown}
 
 /**
- * Polls for the outcome row with exponential backoff until it appears or the recovery window has
- * been slept through. The whole poll, reads included, gets the window plus the grace period, so
+ * Polls for the outcome row with exponential backoff until it appears or the window (the recovery
+ * window unless a shorter one is given) has been slept through. The whole poll, reads included, gets the window plus the grace period, so
  * neither a read that never answers nor a run of slow ones holds recovery past it.
  */
 async function pollForRow(
   repository: OutcomeRepository,
   commandId: string,
   config: OutcomeConfig,
+  window = config.recoveryWaitMs,
 ): Promise<Polled> {
-  const window = config.recoveryWaitMs
-
   // Set once the deadline answered for the poll, so a read that stalled and then resolves late
   // doesn't go on reading and sleeping after the caller has its answer.
   let stopped = false
