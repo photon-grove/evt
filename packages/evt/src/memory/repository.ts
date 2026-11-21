@@ -49,6 +49,8 @@ import {
   transactionSizes,
 } from '../repository.js'
 import {compareUtf8} from '../utf8.js'
+import type {PageOptions, ViewPage, ViewRepository, ViewRow} from '../views.js'
+import {MemViewRepository, viewRowsOf} from './views.js'
 
 interface Stream {
   /** The stream's events by sequence. Compaction deletes from it. */
@@ -89,15 +91,20 @@ let controlsOf: (repo: MemRepository) => Controls
  * A fresh store is initialized by its first commit or snapshot write, which declares stream-heads
  * on its feature manifest, so {@link initialize} is needed only where code treats every backend
  * alike.
+ *
+ * It is also the {@link ViewRepository} over its own commit-wide view rows, so a handler can
+ * commit and then read its own rows through one repository. A row written outside a commit is one
+ * a later commit's owner check reads.
  */
-export class MemRepository implements OutcomeRepository, StoreInitializer {
+export class MemRepository implements OutcomeRepository, StoreInitializer, ViewRepository {
   readonly #streams = new Map<string, Stream>()
   readonly #controls: Controls = {manifest: null, rebuild: {generation: 0n, lock: null}}
   // The command outcomes by command ID, kept as the DynamoDB item, so a read decodes and
   // validates exactly what a live backend's would.
   readonly #outcomes = new Map<string, Item>()
-  // The commit-wide view rows, by pk and then sk.
-  readonly #views = new Map<string, Map<string, ViewRow>>()
+  // The view repository over the commit-wide view rows, and those rows, by pk and then sk.
+  readonly #viewRepository = new MemViewRepository()
+  readonly #views = viewRowsOf(this.#viewRepository)
 
   async initialize(options?: CallOptions): Promise<boolean> {
     options?.signal?.throwIfAborted()
@@ -150,6 +157,54 @@ export class MemRepository implements OutcomeRepository, StoreInitializer {
     rows.sort((a, b) => compareUtf8(a.pk, b.pk) || compareUtf8(a.sk, b.sk))
 
     return rows
+  }
+
+  async getView(pk: string, options?: CallOptions): Promise<ViewRow | null> {
+    return this.#viewRepository.getView(pk, options)
+  }
+
+  async getViewAt(pk: string, sk: string, options?: CallOptions): Promise<ViewRow | null> {
+    return this.#viewRepository.getViewAt(pk, sk, options)
+  }
+
+  async putView(row: ViewRow, options?: CallOptions): Promise<void> {
+    return this.#viewRepository.putView(row, options)
+  }
+
+  async putViews(rows: readonly ViewRow[], options?: CallOptions): Promise<void> {
+    return this.#viewRepository.putViews(rows, options)
+  }
+
+  async deleteView(pk: string, sk: string, options?: CallOptions): Promise<void> {
+    return this.#viewRepository.deleteView(pk, sk, options)
+  }
+
+  async batchGetViews(pks: readonly string[], options?: CallOptions): Promise<ViewRow[]> {
+    return this.#viewRepository.batchGetViews(pks, options)
+  }
+
+  async batchGetViewsAt(
+    pks: readonly string[],
+    sk: string,
+    options?: CallOptions,
+  ): Promise<ViewRow[]> {
+    return this.#viewRepository.batchGetViewsAt(pks, sk, options)
+  }
+
+  async listViewsByPk(pk: string, options?: CallOptions): Promise<ViewRow[]> {
+    return this.#viewRepository.listViewsByPk(pk, options)
+  }
+
+  async listViewsByPkPaged(pk: string, options?: PageOptions): Promise<ViewPage> {
+    return this.#viewRepository.listViewsByPkPaged(pk, options)
+  }
+
+  async listViewsByEntityType(entityType: string, options?: CallOptions): Promise<ViewRow[]> {
+    return this.#viewRepository.listViewsByEntityType(entityType, options)
+  }
+
+  async listViewsByEntityTypePaged(entityType: string, options?: PageOptions): Promise<ViewPage> {
+    return this.#viewRepository.listViewsByEntityTypePaged(entityType, options)
   }
 
   async outcome(commandId: string, options?: CallOptions): Promise<Outcome | null> {
@@ -244,11 +299,16 @@ export class MemRepository implements OutcomeRepository, StoreInitializer {
           entityId: op.owner,
           entityType: op.entityType,
           payload: copy(op.payload),
+          ttl: 0,
         })
       } else {
         partition.delete(op.sk)
       }
-      this.#views.set(op.pk, partition)
+      if (partition.size === 0) {
+        this.#views.delete(op.pk)
+      } else {
+        this.#views.set(op.pk, partition)
+      }
     }
     if (outcome !== null && recorded !== null) {
       this.#outcomes.set(outcome.commandId, recorded)
@@ -484,16 +544,6 @@ function derivedHead(stream: Stream): bigint {
 // A stored head of 0 is an absent head.
 function drift(entityId: string, stored: bigint, derived: bigint): StreamHeadDriftError {
   return new StreamHeadDriftError(entityId, stored > 0n ? stored : null, derived)
-}
-
-/** A commit-wide view row: its keys, its owner stream, its entity type, and its payload. */
-export interface ViewRow {
-  readonly pk: string
-  readonly sk: string
-  /** The stream that owns the row. */
-  readonly entityId: string
-  readonly entityType: string
-  readonly payload: Uint8Array
 }
 
 /** What a conformance suite needs to make a stream drift, which no repository call can do. */

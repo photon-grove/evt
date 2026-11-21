@@ -6,8 +6,8 @@ export {
   type ManifestDraft,
   MemRepository,
   type RebuildState,
-  type ViewRow,
   controlFixtures,
   headFixtures,
 } from './repository.js'
 export {MemViewRepository} from './views.js'
+export type {ViewRow} from '../views.js'

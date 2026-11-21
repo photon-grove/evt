@@ -1,6 +1,7 @@
 // The in-memory view repository: the reference the conformance suite checks the DynamoDB one
 // against, and a test double for code that reads views. Every read, the entity-type listing
-// included, sees every write that has returned.
+// included, sees every write that has returned. `MemRepository` keeps its commit-wide view rows in
+// one of these, so a commit and a view read see the same rows, as Rust's `MemRepository` does.
 
 import type {CallOptions} from '../repository.js'
 import {compareUtf8} from '../utf8.js'
@@ -20,6 +21,13 @@ import {
   viewTtl,
 } from '../views.js'
 
+/** View rows by `pk` and then `sk`. */
+export type ViewRows = Map<string, Map<string, ViewRow>>
+
+// Reads a repository's rows, for the MemRepository that writes them. The class's static block
+// sets it.
+let rowsOf: (repo: MemViewRepository) => ViewRows
+
 /**
  * A {@link ViewRepository} in memory. Rows are kept as written, `ttl` included, and never
  * expire. A partition lists ascending by `sk` bytes and an entity type by `pk` bytes, then `sk`
@@ -27,8 +35,11 @@ import {
  * cursors have.
  */
 export class MemViewRepository implements ViewRepository {
-  // The rows by pk and then sk.
-  readonly #rows = new Map<string, Map<string, ViewRow>>()
+  readonly #rows: ViewRows = new Map()
+
+  static {
+    rowsOf = (repo) => repo.#rows
+  }
 
   async getView(pk: string, options?: CallOptions): Promise<ViewRow | null> {
     return this.getViewAt(pk, '', options)
@@ -152,6 +163,14 @@ export class MemViewRepository implements ViewRepository {
       ['sk', row.sk],
     ])
   }
+}
+
+/**
+ * The rows `repo` reads and writes, which `MemRepository`'s commit path writes too. Not exported
+ * from the package.
+ */
+export function viewRowsOf(repo: MemViewRepository): ViewRows {
+  return rowsOf(repo)
 }
 
 // Takes one page off the ordered rows. The cursor is the last row's key, and only when a row

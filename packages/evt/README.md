@@ -97,12 +97,15 @@ A `ViewRepository` reads and writes view rows outside the commit path, as Go's
 `ttl` in Unix seconds), `putViews`, `deleteView`, `batchGetViews`, and listings by partition key and
 by entity type, whole or a page at a time. `DynamoViewRepository` works on the views table the
 [DynamoDB guide](https://github.com/photon-grove/evt/blob/main/docs/guide/dynamodb.md#entity-views-table)
-describes, and `MemViewRepository` keeps rows in memory:
+describes, and `MemViewRepository` keeps rows in memory. A repository that writes commit-wide views
+also reads them: `MemRepository` is itself a `ViewRepository` over the rows its commits write, and
+`DynamoRepository.viewRepository()` returns a `DynamoViewRepository` over its `viewsTable` (a
+`ViewsNotConfiguredError` without one), as Rust's `DynamoRepository::view_repository` does:
 
 ```ts
 import {DynamoDB} from '@aws-sdk/client-dynamodb'
 import {ViewCodec} from '@photon-grove/evt'
-import {DynamoViewRepository} from '@photon-grove/evt/dynamodb'
+import {DynamoRepository, DynamoViewRepository} from '@photon-grove/evt/dynamodb'
 
 interface Balance {
   accountId: string
@@ -116,6 +119,10 @@ const balances = new ViewCodec<Balance>(views, 'balance').single(
 )
 await balances.put('acct-1', {accountId: 'acct-1', cents: 500})
 const balance = await balances.get('acct-1') // null when there is no row
+
+// Commit, then read the rows the commit wrote through the same repository.
+const repo = new DynamoRepository(new DynamoDB({}), 'events', {viewsTable: 'views'})
+const committed = await repo.viewRepository().getView('balance#acct-1')
 ```
 
 Point reads and partition listings are strongly consistent on DynamoDB, so a handler reads its

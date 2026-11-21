@@ -1,10 +1,23 @@
 // The view repository conformance cases, the TypeScript port of Rust's `view_repository_cases`
-// (crates/evt/src/conformance/view_repository.rs): point reads and writes, listings by partition
-// and entity type, cursors, batch writes and reads, and the refusals. Each case namespaces its keys
-// and entity type, so a durable table can be shared across runs. Each step needs the one before
-// it, so the steps await in loops on purpose.
+// and `committed_view_cases` (crates/evt/src/conformance/view_repository.rs): point reads and
+// writes, listings by partition and entity type, cursors, batch writes and reads, the refusals,
+// and the rows the commit path wrote. Each case namespaces its keys and entity type, so a durable
+// table can be shared across runs. Each step needs the one before it, so the steps await in loops
+// on purpose.
 /* oxlint-disable no-await-in-loop */
-import type {ViewPage, ViewRepository, ViewRow} from '@photon-grove/evt'
+import {
+  type ProjectedView,
+  type Repository,
+  type SerializedEvent,
+  type ViewOperation,
+  type ViewPage,
+  type ViewRepository,
+  type ViewRow,
+  deleteView,
+  emptyMetadata,
+  eventId,
+  putView,
+} from '@photon-grove/evt'
 
 import type {Checks} from './harness.js'
 
@@ -37,6 +50,30 @@ export async function viewRepositoryConformance(
 
   for (const [name, run] of cases) {
     await checks.case(`${label} views: ${name}`, () => run(repo))
+  }
+}
+
+/**
+ * Runs the cases that tie the commit path to the view repository: a row a commit wrote through
+ * `writer` is read, listed and listed by entity type through `reader`, owner included; and a
+ * partition page read straight after each commit (put, overwrite, delete) reflects it, the
+ * read-your-writes a request handler relies on. `reader` must read the table `writer` writes
+ * view operations to. A local emulator is always consistent, so on DynamoDB the read-your-writes
+ * case passes even without `ConsistentRead`; a unit test pins the request itself.
+ */
+export async function committedViewConformance(
+  checks: Checks,
+  label: string,
+  writer: Repository,
+  reader: ViewRepository,
+): Promise<void> {
+  const cases: [string, (writer: Repository, reader: ViewRepository) => Promise<void>][] = [
+    ['rows written by a commit are read by the view repository', committedRows],
+    ['a partition page read straight after a commit reflects it', committedPageReadYourWrites],
+  ]
+
+  for (const [name, run] of cases) {
+    await checks.case(`${label} views: ${name}`, () => run(writer, reader))
   }
 }
 
@@ -398,6 +435,96 @@ async function nul(repo: ViewRepository): Promise<void> {
     await refuses(call(), 'invalidArgument', `lone surrogate: ${what}`)
   }
   equal(showAll(await repo.listViewsByPk(pk)), '[]', 'nothing was written')
+}
+
+async function committedRows(writer: Repository, reader: ViewRepository): Promise<void> {
+  const ns = namespace()
+  const owner = `${ns}-owner`
+  const [pk, entityType] = [`${ns}-committed`, `${ns}-kind`]
+  const payload = '{"claimed":true}'
+  const put = (sk: string) => putView(pk, sk, owner, entityType, payload)
+
+  await writer.commit({
+    entityId: owner,
+    events: [event(ns, owner, 1)],
+    views: [projected(put('one')), projected(put('two'), 1)],
+  })
+
+  const want: ViewRow = {
+    pk,
+    sk: 'one',
+    entityId: owner,
+    entityType,
+    payload: encoder.encode(payload),
+    ttl: 0,
+  }
+  equal(show(await reader.getViewAt(pk, 'one')), show(want), 'the committed row, owner as entityID')
+  equal(
+    keys(await reader.listViewsByPk(pk)).join(', '),
+    `${pk}/one, ${pk}/two`,
+    'the committed partition',
+  )
+  equal(
+    String((await reader.listViewsByEntityType(entityType)).length),
+    '2',
+    'the committed rows by entity type',
+  )
+
+  // A delete on the commit path is seen by the reader.
+  await writer.commit({
+    entityId: owner,
+    events: [event(ns, owner, 2)],
+    views: [projected(deleteView(pk, 'one', owner))],
+  })
+  equal(show(await reader.getViewAt(pk, 'one')), 'null', 'the committed delete')
+}
+
+async function committedPageReadYourWrites(
+  writer: Repository,
+  reader: ViewRepository,
+): Promise<void> {
+  const ns = namespace()
+  const owner = `${ns}-owner`
+  const [pk, entityType] = [`${ns}-ryw`, `${ns}-kind`]
+  const put = (payload: string) => projected(putView(pk, 'row', owner, entityType, payload))
+  const payloads = async () => {
+    const page: ViewPage = await reader.listViewsByPkPaged(pk, {limit: 10})
+
+    return JSON.stringify(page.views.map((viewRow) => decoder.decode(viewRow.payload)))
+  }
+
+  await writer.commit({entityId: owner, events: [event(ns, owner, 1)], views: [put('{"v":1}')]})
+  equal(await payloads(), JSON.stringify(['{"v":1}']), 'the page after the put')
+
+  await writer.commit({entityId: owner, events: [event(ns, owner, 2)], views: [put('{"v":2}')]})
+  equal(await payloads(), JSON.stringify(['{"v":2}']), 'the page after the overwrite')
+
+  await writer.commit({
+    entityId: owner,
+    events: [event(ns, owner, 3)],
+    views: [projected(deleteView(pk, 'row', owner))],
+  })
+  equal(await payloads(), '[]', 'the page after the delete')
+}
+
+function projected(op: ViewOperation, operation = 0): ProjectedView {
+  return {projector: 'p', projectorIndex: 0, operation, op}
+}
+
+// A stored event of the namespace's own entity type.
+function event(ns: string, entityId: string, sequence: number): SerializedEvent {
+  const at = BigInt(sequence)
+
+  return {
+    id: eventId(entityId, at),
+    sequence: at,
+    type: 'ledger:added',
+    version: 1,
+    entityId,
+    entityType: `${ns}-ledger`,
+    payload: encoder.encode('{}'),
+    metadata: {...emptyMetadata(), timestamp: '2026-01-02T03:04:05Z'},
+  }
 }
 
 async function refuses(promise: Promise<unknown>, code: string, what: string): Promise<void> {
