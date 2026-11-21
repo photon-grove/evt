@@ -9,7 +9,7 @@ import {
 
 import {conformance, markerConformance} from './conformance.js'
 import {Checks} from './harness.js'
-import {viewRepositoryConformance} from './view-conformance.js'
+import {committedViewConformance, viewRepositoryConformance} from './view-conformance.js'
 
 const checks = new Checks()
 const repo = new MemRepository()
@@ -21,5 +21,10 @@ const marked = new MemRepository()
 await markerConformance(checks, marked, controlFixtures(marked))
 
 await viewRepositoryConformance(checks, 'memory', new MemViewRepository())
+
+// The repository is the view repository over the rows its commits write.
+const viewing = new MemRepository()
+await viewRepositoryConformance(checks, 'memory repository', viewing)
+await committedViewConformance(checks, 'memory repository', viewing, viewing)
 
 checks.report()

@@ -25,6 +25,7 @@ import {
   StreamHeadsNotMigratedError,
   TransientError,
   ProjectorOperationError,
+  ViewsNotConfiguredError,
 } from '../errors.js'
 import type {SerializedEvent, SerializedSnapshot} from '../event.js'
 import {
@@ -68,6 +69,11 @@ import {FEATURES_PK, manifestFromItem, markerItem} from './marker.js'
 import {OUTCOME_SORT_KEY, outcomeFromItem, outcomeKey} from './outcome.js'
 import {DYNAMODB_BACKEND, transactItemSize} from './views.js'
 import {
+  type DynamoViewClient,
+  DynamoViewRepository,
+  type DynamoViewRepositoryOptions,
+} from './view-repository.js'
+import {
   type CommitTtl,
   type StreamLayout,
   type TransactionLayout,
@@ -109,8 +115,9 @@ export interface DynamoRepositoryOptions {
   clock?: () => number
   /**
    * The table commit-wide projectors' view operations are written to, in each commit's
-   * transaction, keyed by string `pk` and `sk`. Without one, a commit that carries view operations
-   * is refused with a {@link ViewsNotConfiguredError}.
+   * transaction, keyed by string `pk` and `sk`, and the table
+   * {@link DynamoRepository.viewRepository} reads. Without one, a commit that carries view
+   * operations, and `viewRepository`, are refused with a {@link ViewsNotConfiguredError}.
    */
   viewsTable?: string
 }
@@ -180,6 +187,25 @@ export class DynamoRepository implements OutcomeRepository, StoreInitializer {
   /** The events table this repository writes. */
   get eventsTable(): string {
     return this.#table
+  }
+
+  /**
+   * A {@link DynamoViewRepository} over this repository's views table and client, so a handler
+   * can commit and then read its own rows: point reads and partition listings are strongly
+   * consistent (unless `consistentRead: false`), so they see every row a returned commit wrote.
+   * Refused with a {@link ViewsNotConfiguredError} when no views table is configured, and with a
+   * `TypeError` when the client has no `batchWriteItem` or `batchGetItem` (the AWS SDK's
+   * aggregated `DynamoDB` client has both).
+   */
+  viewRepository(options?: DynamoViewRepositoryOptions): DynamoViewRepository {
+    if (this.#viewsTable === undefined || this.#viewsTable === '') {
+      throw new ViewsNotConfiguredError(DYNAMODB_BACKEND)
+    }
+    if (!isViewClient(this.#client)) {
+      throw new TypeError('a view repository needs a client with batchWriteItem and batchGetItem')
+    }
+
+    return new DynamoViewRepository(this.#client, this.#viewsTable, options)
   }
 
   /**
@@ -1276,4 +1302,11 @@ function isConditionalCheckFailed(error: unknown): boolean {
 
 function isNamed(error: unknown, name: string): boolean {
   return typeof error === 'object' && error !== null && (error as {name?: unknown}).name === name
+}
+
+// Whether a repository's client also makes the batch calls a view repository needs.
+function isViewClient(client: DynamoClient): client is DynamoClient & DynamoViewClient {
+  const view = client as Partial<DynamoViewClient>
+
+  return typeof view.batchWriteItem === 'function' && typeof view.batchGetItem === 'function'
 }
