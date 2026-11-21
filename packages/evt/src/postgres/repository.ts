@@ -1117,7 +1117,7 @@ export class PgRepository
   }
 
   /** The journal's declarations on this store's manifest. Internal. */
-  readonly [JOURNAL_MARKER]: JournalMarker & CompactionMarker = {
+  readonly [JOURNAL_MARKER]: JournalMarker = {
     declareJournal: async (types, options) => {
       options?.signal?.throwIfAborted()
       checkJournalWriter(this)
@@ -1597,13 +1597,6 @@ function withPostgresViews(manifest: FeatureManifest | null): FeatureManifest {
     historyDependent: manifest?.historyDependent ?? [],
     retention: manifest?.retention ?? [],
   }
-}
-
-// The journal compaction hooks of the journal's marker capability. They come with journal
-// compaction's port in the journal module, which will declare them on JournalMarker itself.
-interface CompactionMarker {
-  checkCompactionMarker(options?: CallOptions): Promise<void>
-  declareCompaction(options?: CallOptions): Promise<void>
 }
 
 // A stored head of 0 is an absent head.

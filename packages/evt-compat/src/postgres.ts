@@ -613,13 +613,15 @@ async function journalCases(): Promise<void> {
       ensure(decode(read?.payload) === '{"owner":"o"}', `the row: ${decode(read?.payload)}`)
       ensure((await log.readCompactionRow('t', 'LEASE')) === null, 'another scope has none')
 
-      // Any handle checks the marker for compaction. Nothing declares compaction until it is
-      // ported to PostgreSQL, and a store that declares it is refused.
+      // Any handle checks the marker for compaction, a compacted store's included. Nothing
+      // declares compaction until it is ported to PostgreSQL.
       const marker = log[JOURNAL_MARKER]
       await marker.checkCompactionMarker()
       await refuses(marker.declareCompaction(), UnsupportedFeatureError, 'declaring compaction')
       await controls(log).declare((draft) => draft.features.set('journal-compaction', 1))
-      await refuses(marker.checkCompactionMarker(), UnsupportedFeatureError, 'a compacted store')
+      await marker.checkCompactionMarker()
+      await controls(log).declare((draft) => draft.features.set('journal-compaction', 2))
+      await refuses(marker.checkCompactionMarker(), UnsupportedFeatureError, 'another version')
     },
   )
 
