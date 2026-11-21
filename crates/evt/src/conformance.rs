@@ -24,6 +24,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::ops::RangeInclusive;
+use std::pin::Pin;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::task::{Poll, Waker};
@@ -714,6 +715,19 @@ impl<E: std::error::Error> From<E> for Failure {
 }
 
 type CaseResult = Result<(), Failure>;
+
+/// Builds a case's future on the heap, in a stack frame of its own.
+///
+/// Case groups like [`outcome_cases`] await their cases through this so their stack use does not
+/// grow with the number of cases. In a debug build an `async fn`'s poll frame keeps a separate
+/// slot for every future it builds, and `Box::pin(case(repo)).await` builds the case's future in
+/// that frame before moving it to the heap, so each case added to a group grew the group's frame
+/// by that case's size. Here the future is built inside `build`, whose frame is gone before the
+/// future is polled, and the group's frame keeps only the box's pointer. The box keeps the
+/// future's own type, so a group's future stays `Send` whenever its cases' futures are.
+fn boxed_case<F: Future>(build: impl FnOnce() -> F) -> Pin<Box<F>> {
+    Box::pin(build())
+}
 
 macro_rules! ensure {
     ($cond:expr, $($message:tt)+) => {
@@ -4456,6 +4470,9 @@ impl<R: Repository> Repository for FaultInjectingRepository<R> {
 /// outcomes. `other` must be a second handle over the same storage: the cases check that a second
 /// writer sees the first one's outcomes. Like [`feature_marker_cases`], it panics after running
 /// every case if any failed.
+///
+/// Its stack use is that of its deepest case, not the sum of its cases, so it runs on a default
+/// test thread in debug builds.
 pub async fn outcome_cases<R: Repository>(repo: &R, other: &R) {
     let mut failures = Vec::new();
 
@@ -4469,140 +4486,136 @@ pub async fn outcome_cases<R: Repository>(repo: &R, other: &R) {
 
     record(
         "a repeated command returns its stored outcome, across writers and snapshots",
-        Box::pin(outcome_replay(repo, other)).await,
+        boxed_case(|| outcome_replay(repo, other)).await,
     );
     record(
         "a reused command ID with another identity is IdempotencyKeyReuse",
-        Box::pin(outcome_key_reuse(repo)).await,
+        boxed_case(|| outcome_key_reuse(repo)).await,
     );
     record(
         "a domain rejection is persisted once and replayed verbatim",
-        Box::pin(outcome_rejection(repo)).await,
+        boxed_case(|| outcome_rejection(repo)).await,
     );
     record(
         "a pre-outcome command ID is a duplicate, never a recorded rejection",
-        Box::pin(outcome_legacy_duplicate(repo)).await,
+        boxed_case(|| outcome_legacy_duplicate(repo)).await,
     );
     record(
         "an internal handler failure is an error and writes no outcome",
-        Box::pin(outcome_internal_failure(repo)).await,
+        boxed_case(|| outcome_internal_failure(repo)).await,
     );
     record(
         "a zero-event command is an accepted no-op that stores its response",
-        Box::pin(outcome_noop(repo)).await,
+        boxed_case(|| outcome_noop(repo)).await,
     );
     record(
         "a transaction persists a rejection after checking its fences",
-        Box::pin(outcome_transaction_reject(repo)).await,
+        boxed_case(|| outcome_transaction_reject(repo)).await,
     );
     record(
         "a rejection's numbers read back the same on every backend",
-        Box::pin(outcome_rejection_numbers(repo)).await,
+        boxed_case(|| outcome_rejection_numbers(repo)).await,
     );
     record(
         "command ID and outcome bounds are refused before any write",
-        Box::pin(outcome_limits(repo)).await,
+        boxed_case(|| outcome_limits(repo)).await,
     );
     record(
         "ambiguous writes are settled by re-reading the outcome row",
-        Box::pin(outcome_ambiguous(repo)).await,
+        boxed_case(|| outcome_ambiguous(repo)).await,
     );
-    // The races run in a function of their own, like the client-expected versions below, so
-    // this one's future (and its poll frame in debug builds) stays within a test thread's stack.
-    for (name, result) in Box::pin(race_cases(repo)).await {
+    for (name, result) in boxed_case(|| race_cases(repo)).await {
         record(name, result);
     }
     record(
         "an outcome read validates the command ID like a write",
-        Box::pin(outcome_read_validation(repo)).await,
+        boxed_case(|| outcome_read_validation(repo)).await,
     );
     record(
         "U+0000 is refused in digests, command IDs, and rejections before any write",
-        Box::pin(outcome_nul_refused(repo)).await,
+        boxed_case(|| outcome_nul_refused(repo)).await,
     );
     record(
         "a command may not declare a reserved target stream",
-        Box::pin(outcome_reserved_targets(repo)).await,
+        boxed_case(|| outcome_reserved_targets(repo)).await,
     );
     record(
         "a failed caller-stamped fence persists a stale-fence rejection",
-        Box::pin(outcome_stale_fence(repo)).await,
+        boxed_case(|| outcome_stale_fence(repo)).await,
     );
     record(
         "a transaction may write streams its identity does not name",
-        Box::pin(outcome_write_set_is_not_identity(repo)).await,
+        boxed_case(|| outcome_write_set_is_not_identity(repo)).await,
     );
     record(
         "a command's outcome resolves by identity: the same identity, another payload, another principal",
-        Box::pin(outcome_resolve_by_identity(repo, other)).await,
+        boxed_case(|| outcome_resolve_by_identity(repo, other)).await,
     );
     record(
         "an engine-filled conflict re-prepares the command and only the committing attempt writes",
-        Box::pin(retry_engine_filled(repo)).await,
+        boxed_case(|| retry_engine_filled(repo)).await,
     );
     record(
         "a caller-stamped fence conflict fails fast without preparing again",
-        Box::pin(retry_caller_fenced(repo)).await,
+        boxed_case(|| retry_caller_fenced(repo)).await,
     );
     record(
         "exhausted retries persist a stale-fence rejection that replays identically",
-        Box::pin(retry_exhausted(repo)).await,
+        boxed_case(|| retry_exhausted(repo)).await,
     );
-    // Client-expected versions run in a function of their own, so this one's future (and its
-    // poll frame in debug builds) stays within a test thread's stack.
-    for (name, result) in Box::pin(expected_version_cases(repo)).await {
+    for (name, result) in boxed_case(|| expected_version_cases(repo)).await {
         record(name, result);
     }
     record(
         "a write set that changes between attempts is still one command identity",
-        Box::pin(retry_write_set_changes(repo)).await,
+        boxed_case(|| retry_write_set_changes(repo)).await,
     );
     record(
         "the single-aggregate shortcut re-prepares and records a stale-fence rejection",
-        Box::pin(retry_single_aggregate(repo)).await,
+        boxed_case(|| retry_single_aggregate(repo)).await,
     );
     record(
         "the identity digest is computed once, however many attempts a command takes",
-        Box::pin(retry_digest_once(repo)).await,
+        boxed_case(|| retry_digest_once(repo)).await,
     );
     record(
         "a deadline ends the retries and is treated as exhausted attempts",
-        Box::pin(retry_deadline(repo)).await,
+        boxed_case(|| retry_deadline(repo)).await,
     );
     record(
         "a stream outside the identity is still refused when it is reserved",
-        Box::pin(retry_reserved_stream(repo)).await,
+        boxed_case(|| retry_reserved_stream(repo)).await,
     );
     record(
         "a failed commit leaves no outcome row",
-        Box::pin(outcome_atomicity(repo)).await,
+        boxed_case(|| outcome_atomicity(repo)).await,
     );
     record(
         "the outcome row counts against the commit budget",
-        Box::pin(outcome_budget(repo)).await,
+        boxed_case(|| outcome_budget(repo)).await,
     );
     record(
         "a rejection that carries events commits them atomically with its row and replays without them",
-        Box::pin(rejection_events(repo)).await,
+        boxed_case(|| rejection_events(repo)).await,
     );
     record(
         "a transaction rejects with its staged events, or discards them",
-        Box::pin(rejection_events_transaction(repo)).await,
+        boxed_case(|| rejection_events_transaction(repo)).await,
     );
     record(
         "a rejection with events obeys the commit rules of an accepted commit",
-        Box::pin(rejection_events_rules(repo)).await,
+        boxed_case(|| rejection_events_rules(repo)).await,
     );
     record(
         "a conflict re-prepares a rejection with events, and exhaustion records none of its events",
-        Box::pin(rejection_events_retry(repo)).await,
+        boxed_case(|| rejection_events_retry(repo)).await,
     );
     record(
         "a stale caller-stamped fence beside a rejection's events persists the stale-fence rejection alone",
-        Box::pin(rejection_events_caller_fence(repo)).await,
+        boxed_case(|| rejection_events_caller_fence(repo)).await,
     );
 
-    for (name, result) in Box::pin(identity::identity_cases(repo)).await {
+    for (name, result) in boxed_case(|| identity::identity_cases(repo)).await {
         record(name, result);
     }
 
@@ -5630,15 +5643,15 @@ async fn race_cases<R: Repository>(repo: &R) -> Vec<(&'static str, CaseResult)> 
     vec![
         (
             "a lost outcome put resolves through the winner's row and writes nothing",
-            Box::pin(outcome_race(repo)).await,
+            boxed_case(|| outcome_race(repo)).await,
         ),
         (
             "an attempt that committed after the outcome check is replayed, not a duplicate",
-            Box::pin(outcome_race_before_load(repo)).await,
+            boxed_case(|| outcome_race_before_load(repo)).await,
         ),
         (
             "a winner of the same command that moved a fenced stream resolves to its outcome",
-            Box::pin(outcome_fence_race(repo)).await,
+            boxed_case(|| outcome_fence_race(repo)).await,
         ),
     ]
 }
@@ -6454,47 +6467,47 @@ async fn expected_version_cases<R: Repository>(repo: &R) -> Vec<(&'static str, C
 
     results.push((
         "a matching client-expected head commits",
-        Box::pin(expected_head_matches(repo)).await,
+        boxed_case(|| expected_head_matches(repo)).await,
     ));
     results.push((
         "a stale client-expected head records the stale-version rejection",
-        Box::pin(expected_head_stale(repo)).await,
+        boxed_case(|| expected_head_stale(repo)).await,
     ));
     results.push((
         "a domain rejection wins over a stale client-expected head",
-        Box::pin(expected_head_domain_rejection_wins(repo)).await,
+        boxed_case(|| expected_head_domain_rejection_wins(repo)).await,
     ));
     results.push((
         "an expectation on a stream the command never read is refused",
-        Box::pin(expected_head_unread(repo)).await,
+        boxed_case(|| expected_head_unread(repo)).await,
     ));
     results.push((
         "the engine's stale rejection codes are configurable",
-        Box::pin(stale_codes_configurable(repo)).await,
+        boxed_case(|| stale_codes_configurable(repo)).await,
     ));
     results.push((
         "an expected stream that moves during the commit ends in stale-version",
-        Box::pin(expected_head_moves_during_commit(repo)).await,
+        boxed_case(|| expected_head_moves_during_commit(repo)).await,
     ));
     results.push((
         "every stale expected stream is listed, sorted by ID",
-        Box::pin(expected_heads_listed_sorted(repo)).await,
+        boxed_case(|| expected_heads_listed_sorted(repo)).await,
     ));
     results.push((
         "a rejection with events ignores client-expected heads",
-        Box::pin(expected_head_reject_with_events(repo)).await,
+        boxed_case(|| expected_head_reject_with_events(repo)).await,
     ));
     results.push((
         "a begun command records stale-version from commit_with_outcome",
-        Box::pin(expected_head_manual_flow(repo)).await,
+        boxed_case(|| expected_head_manual_flow(repo)).await,
     ));
     results.push((
         "expect validates its head and needs outcomes",
-        Box::pin(expect_validation(repo)).await,
+        boxed_case(|| expect_validation(repo)).await,
     ));
     results.push((
         "exhausted retries take the replaced stale-fence code",
-        Box::pin(exhausted_retries_take_the_stale_fence_code(repo)).await,
+        boxed_case(|| exhausted_retries_take_the_stale_fence_code(repo)).await,
     ));
 
     results
