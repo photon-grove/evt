@@ -75,6 +75,8 @@ import type {ProjectedView} from './projection.js'
  *   empty or oversized scope, or a malformed allocation in an event's metadata. Nothing was
  *   written.
  * - `journalRowTooLarge`: a journal row is over the configured size cap. Nothing was written.
+ * - `expectedPayloadUnsupported`: the journal was asked to commit through a repository that
+ *   doesn't apply the expected-payload view condition its counters need. Nothing was written.
  */
 export type EvtErrorCode =
   | 'invalidJson'
@@ -119,6 +121,7 @@ export type EvtErrorCode =
   | 'commitOrder'
   | 'invalidJournal'
   | 'journalRowTooLarge'
+  | 'expectedPayloadUnsupported'
 
 export class EvtError extends Error {
   override readonly name: string = 'EvtError'

@@ -12,6 +12,21 @@ export {
 } from './config.js'
 export {PROJECTOR_NAME, PositionTaken, journalProjector} from './projector.js'
 export {
+  type JournalBackend,
+  JournalRepository,
+  type JournalRepositoryOptions,
+} from './repository.js'
+export {
+  JOURNAL_COMPACTION_FEATURE,
+  JOURNAL_COMPACTION_VERSION,
+  JOURNAL_FEATURE,
+  JOURNAL_MARKER,
+  JOURNAL_VERSION,
+  JOURNAL_WRITER_TARGET,
+  type JournalDeclared,
+  type JournalMarker,
+} from '../features.js'
+export {
   type Gap,
   type JournalPage,
   type JournalStore,

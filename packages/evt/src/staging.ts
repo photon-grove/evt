@@ -12,7 +12,13 @@ import {
 import {EvtError} from './errors.js'
 import {type SerializedEvent, eventId} from './event.js'
 import type {Metadata} from './metadata.js'
-import {type CommitProjector, type ProjectedView, commitStream, projectViews} from './projection.js'
+import {
+  type CommitProjector,
+  type ProjectedView,
+  commitStream,
+  isEngineProjector,
+  projectViews,
+} from './projection.js'
 import type {CallOptions, NewSnapshot, ProjectorGroup, Repository} from './repository.js'
 import {compareUtf8} from './utf8.js'
 import {MAX_COMMIT_ITEM_BYTES, snapshotCommitSize, snapshotEventsDue} from './snapshots.js'
@@ -200,6 +206,18 @@ export function readyProjectors(
 ): void {
   if (projectors.length === 0) {
     return
+  }
+
+  // The engine's own projectors (the journal's) run only inside the engine, which replaces any
+  // allocation a caller forged before they see it: registered here, given the caller's metadata,
+  // one could plan a journal row no counter or stored event backs.
+  const engine = projectors.find(isEngineProjector)
+  if (engine !== undefined) {
+    throw new EvtError(
+      'invalidArgument',
+      `commit-wide projector ${JSON.stringify(engine.name)} reads engine metadata (the ` +
+        "journal's); journal commits with a JournalRepository",
+    )
   }
 
   const name = repository.constructor.name || 'repository'

@@ -14,11 +14,13 @@ import {
   stringifyJson,
 } from '@photon-grove/evt'
 import {markerItem, viewRowItem} from '@photon-grove/evt/dynamodb'
+import {MemRepository} from '@photon-grove/evt/memory'
 import {
   ALLOCATION_KEY,
   COUNTER_SORT_KEY,
   DEFAULT_MAX_ROW_BYTES,
   Journal,
+  JournalRepository,
   MAX_SCOPE_BYTES,
   POSITION_WIDTH,
   allocations,
@@ -77,6 +79,7 @@ export async function journalVectors(checks: Checks): Promise<void> {
   }
 
   commitVectors(checks, field(fixture, 'commit'))
+  await liveCommitVectors(checks, field(fixture, 'commit'))
 
   const marker = field(fixture, 'marker')
   checks.run('journal marker', () => {
@@ -210,6 +213,44 @@ function sortedTexts(values: unknown[]): string[] {
   texts.sort()
 
   return texts
+}
+
+// The fixture's commits, made again through a journal over the in-memory repository: two events
+// of one stream, then one of another, into a world scope and a place scope of each stream. The
+// stored events, rows and counters must be the fixture's, byte for byte.
+async function liveCommitVectors(checks: Checks, commit: JsonValue): Promise<void> {
+  await checks.case('journal commit through the journal repository', async () => {
+    const memory = new MemRepository()
+    const journal = new Journal(['account'], (event) => [
+      'world:7',
+      `world:7/${event.entityId === 'acct-1' ? 'place:3' : 'place:4'}`,
+    ])
+    const journaled = new JournalRepository(memory, journal)
+    const drafted = list(field(commit, 'events')).map((event) => {
+      const decoded = decodeEvent(stringifyJson(event))
+      // The fixture's events as drafted: no allocation yet.
+      decoded.metadata = {...decoded.metadata, extensions: new Map()}
+      return decoded
+    })
+    await journaled.commit({entityId: 'acct-1', events: drafted.slice(0, 2)})
+    await journaled.commit({entityId: 'acct-2', events: drafted.slice(2)})
+
+    const stored = [...(await memory.events('acct-1')), ...(await memory.events('acct-2'))]
+    const want = list(field(commit, 'events'))
+    if (canonical(stored.map((event) => parseJson(encodeEvent(event)))) !== canonical(want)) {
+      throw new Error('the stored events differ from the fixture')
+    }
+
+    const live = memory.views().filter((row) => row.pk.startsWith('journal'))
+    const items = sortedTexts(live.map((row) => viewRowItem(row)))
+    const fixture = sortedTexts([
+      ...list(field(commit, 'rows')).map((row) => plain(field(row, 'dynamoItem'))),
+      ...list(field(commit, 'counters')).map((row) => plain(field(row, 'dynamoItem'))),
+    ])
+    if (items.join('\n') !== fixture.join('\n')) {
+      throw new Error(`the live rows differ from the fixture:\n${items.join('\n')}`)
+    }
+  })
 }
 
 function metadataWith(value: string): SerializedEvent['metadata'] {

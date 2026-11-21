@@ -11,6 +11,7 @@ import {
 } from './errors.js'
 import {DOCUMENT, int64, invalid} from './fields.js'
 import {type JsonValue, parseJson, stringifyJson} from './json.js'
+import type {CallOptions} from './repository.js'
 import {compareUtf8} from './utf8.js'
 
 /** The feature every writer models and requires: per-stream head items (ADR 0007). */
@@ -31,6 +32,54 @@ export const SUPPORTED_FEATURES: readonly FeaturePair[] = Object.freeze([
 // What validation reads. Private, so no caller can add a pair to it.
 const supported = new Map(SUPPORTED_FEATURES.map((pair) => [pair.name, pair.version]))
 
+/** The journal's feature (ADR 0005), which only a journal writer accepts. */
+export const JOURNAL_FEATURE = 'journal'
+
+/** The stored-format version of {@link JOURNAL_FEATURE} this package reads and writes. */
+export const JOURNAL_VERSION = 1
+
+/** Journal compaction's feature, which only a journal writer accepts. */
+export const JOURNAL_COMPACTION_FEATURE = 'journal-compaction'
+
+/** The stored-format version of {@link JOURNAL_COMPACTION_FEATURE} this package writes. */
+export const JOURNAL_COMPACTION_VERSION = 1
+
+// The pairs a journal writer accepts besides the supported ones.
+const journalPairs = new Map([
+  [JOURNAL_FEATURE, JOURNAL_VERSION],
+  [JOURNAL_COMPACTION_FEATURE, JOURNAL_COMPACTION_VERSION],
+])
+
+// The repository handles a journal repository wraps (ADR 0005, #178). Every writer of a journal
+// table must commit through the journal, or its events are missing from their scopes with no gap
+// to show it, so acceptance is per handle: every other handle refuses a store that declares the
+// journal. Private, so only the journal adds to it.
+const journalWriters = new WeakSet<object>()
+
+/**
+ * The internal hook of a wrapper that sits under a journal: the repository it wraps, which a
+ * journal writer's acceptance passes down to.
+ */
+export const JOURNAL_WRITER_TARGET: unique symbol = Symbol('evt.journalWriterTarget')
+
+/**
+ * Makes a repository handle a journal writer: it accepts a store that declares the journal or
+ * journal compaction, which every other handle refuses. A wrapper's acceptance passes down to the
+ * repository it wraps. Internal: the journal's repository calls it.
+ */
+export function acceptJournal(repository: object): void {
+  journalWriters.add(repository)
+  const target = (repository as {[JOURNAL_WRITER_TARGET]?: () => object})[JOURNAL_WRITER_TARGET]
+  if (typeof target === 'function') {
+    acceptJournal(target.call(repository))
+  }
+}
+
+/** Whether a repository handle is a journal writer. */
+export function isJournalWriter(repository: object): boolean {
+  return journalWriters.has(repository)
+}
+
 /** The parsed marker row. A store with no marker row has no manifest. */
 export interface FeatureManifest {
   /** Bumped by exactly one on every declaration. */
@@ -45,12 +94,14 @@ export interface FeatureManifest {
 
 /**
  * Refuses a manifest that declares a pair this package doesn't model, listing every such pair,
- * with an {@link UnsupportedFeatureError}.
+ * with an {@link UnsupportedFeatureError}. A journal writer (`journaling`) also accepts the
+ * journal's pairs.
  */
-export function checkSupported(manifest: FeatureManifest | null): void {
+export function checkSupported(manifest: FeatureManifest | null, journaling = false): void {
   const unsupported: FeaturePair[] = []
   for (const [name, version] of sortedFeatures(manifest?.features ?? new Map())) {
-    if (supported.get(name) !== version) {
+    const accepted = supported.get(name) ?? (journaling ? journalPairs.get(name) : undefined)
+    if (accepted !== version) {
       unsupported.push({name, version})
     }
   }
@@ -69,8 +120,8 @@ export function declaresStreamHeads(manifest: FeatureManifest | null): boolean {
  * Refuses a write to a store whose manifest declares an unsupported pair, or doesn't declare
  * stream-heads, without declaring anything.
  */
-export function checkWritable(manifest: FeatureManifest | null): void {
-  checkSupported(manifest)
+export function checkWritable(manifest: FeatureManifest | null, journaling = false): void {
+  checkSupported(manifest, journaling)
   if (!declaresStreamHeads(manifest)) {
     throw new StreamHeadsNotMigratedError()
   }
@@ -117,6 +168,87 @@ export function withHistoryDependent(
     version: (manifest?.version ?? 0n) + 1n,
     features: new Map(manifest?.features),
     historyDependent: entityTypeSet([...(manifest?.historyDependent ?? []), ...types]),
+    retention: manifest?.retention ?? [],
+  }
+}
+
+/**
+ * The internal capability of a repository the journal can write through: its own declarations on
+ * the store's feature manifest. Symbol-keyed, so it's no part of the repository's public API.
+ */
+export const JOURNAL_MARKER: unique symbol = Symbol('evt.journalMarker')
+
+/** What {@link JOURNAL_MARKER} names. */
+export interface JournalMarker {
+  /**
+   * Validates the store as a commit would (an uninitialized store is refused, or, initializing
+   * lazily, declared, before anything else), then declares the journal feature and the entity
+   * types history-dependent in one declaration, and resolves to what it wrote: nothing when the
+   * manifest declares it all. A manifest that declares the journal at another version is refused
+   * with an `UnsupportedFeatureError`.
+   */
+  declareJournal(types: readonly string[], options?: CallOptions): Promise<JournalDeclared>
+  /** Takes back what a declaration wrote, in one declaration. Best effort: the caller ignores failures. */
+  retractJournal(declared: JournalDeclared, options?: CallOptions): Promise<void>
+}
+
+/** Whether a declaration wrote anything. */
+export function declaredAnything(declared: JournalDeclared): boolean {
+  return declared.journal || declared.history.length > 0
+}
+
+/** What one journal declaration wrote, which a commit refused as uninitialized takes back. */
+export interface JournalDeclared {
+  /** The journal feature, declared by this declaration. */
+  readonly journal: boolean
+  /** The entity types this declaration added to the historyDependent set. */
+  readonly history: readonly string[]
+}
+
+/** What a journal declaration would write to `manifest`: nothing when it declares it all. */
+export function journalDeclaration(
+  manifest: FeatureManifest | null,
+  types: readonly string[],
+): JournalDeclared {
+  return {
+    journal: manifest?.features.get(JOURNAL_FEATURE) !== JOURNAL_VERSION,
+    history: missingHistoryDependent(manifest, types),
+  }
+}
+
+/** The manifest with a journal declaration applied, its version bumped once. */
+export function withJournal(
+  manifest: FeatureManifest | null,
+  declared: JournalDeclared,
+): FeatureManifest {
+  const features = new Map(manifest?.features)
+  if (declared.journal) {
+    features.set(JOURNAL_FEATURE, JOURNAL_VERSION)
+  }
+
+  return {
+    version: (manifest?.version ?? 0n) + 1n,
+    features,
+    historyDependent: entityTypeSet([...(manifest?.historyDependent ?? []), ...declared.history]),
+    retention: manifest?.retention ?? [],
+  }
+}
+
+/** The manifest with a journal declaration taken back, its version bumped once. */
+export function withoutJournal(
+  manifest: FeatureManifest | null,
+  declared: JournalDeclared,
+): FeatureManifest {
+  const features = new Map(manifest?.features)
+  if (declared.journal) {
+    features.delete(JOURNAL_FEATURE)
+  }
+  const history = new Set(declared.history)
+
+  return {
+    version: (manifest?.version ?? 0n) + 1n,
+    features,
+    historyDependent: (manifest?.historyDependent ?? []).filter((type) => !history.has(type)),
     retention: manifest?.retention ?? [],
   }
 }

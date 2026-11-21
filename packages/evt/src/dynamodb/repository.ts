@@ -25,6 +25,7 @@ import {
   StreamHeadsNotMigratedError,
   TransientError,
   ProjectorOperationError,
+  ViewsNotConfiguredError,
 } from '../errors.js'
 import type {SerializedEvent, SerializedSnapshot} from '../event.js'
 import {
@@ -33,9 +34,25 @@ import {
   STREAM_HEADS_VERSION,
   checkSupported,
   declaresStreamHeads,
+  JOURNAL_MARKER,
+  type JournalDeclared,
+  type JournalMarker,
+  declaredAnything,
+  isJournalWriter,
+  journalDeclaration,
+  withJournal,
+  withoutJournal,
   missingHistoryDependent,
 } from '../features.js'
 import {int64Argument} from '../fields.js'
+import {type JournalRow, journalRowFromView, readCounter} from '../journal/row.js'
+import {
+  COUNTER_SORT_KEY,
+  counterPartitionKey,
+  parseRowSortKey,
+  rowPartitionKey,
+  rowSortKey,
+} from '../journal/scope.js'
 import {type Outcome, checkCommandId} from '../outcome.js'
 import {
   type CallOptions,
@@ -67,6 +84,7 @@ import {
 } from './item.js'
 import {FEATURES_PK, manifestFromItem, markerItem} from './marker.js'
 import {OUTCOME_SORT_KEY, outcomeFromItem, outcomeKey} from './outcome.js'
+import {viewKey, viewRowFromItem} from './view-repository.js'
 import {DYNAMODB_BACKEND, transactItemSize} from './views.js'
 import {
   type CommitTtl,
@@ -200,7 +218,7 @@ export class DynamoRepository implements OutcomeRepository, StoreInitializer {
     return this.#exclusive(async () => {
       try {
         const manifest = await this.#readManifest(request)
-        checkSupported(manifest)
+        checkSupported(manifest, isJournalWriter(this))
         if (declaresStreamHeads(manifest)) {
           return false
         }
@@ -210,7 +228,7 @@ export class DynamoRepository implements OutcomeRepository, StoreInitializer {
 
         // Another initializer may have declared a feature this package doesn't model.
         const {manifest: declared, wrote} = await this.#declareOnEmptyStore(request)
-        checkSupported(declared)
+        checkSupported(declared, isJournalWriter(this))
 
         return wrote
       } finally {
@@ -236,7 +254,7 @@ export class DynamoRepository implements OutcomeRepository, StoreInitializer {
       const declared = await this.#declare((draft) => {
         // Another writer may have declared a feature this package doesn't model since.
         const stored = {...draft, version: 0n}
-        checkSupported(stored)
+        checkSupported(stored, isJournalWriter(this))
         const missing = missingHistoryDependent(stored, types)
         draft.historyDependent.push(...missing)
 
@@ -463,6 +481,163 @@ export class DynamoRepository implements OutcomeRepository, StoreInitializer {
     }
   }
 
+  /** A scope's journal counter, read strongly consistently from the views table: 0 when none. */
+  async readCounter(scope: string, options?: CallOptions): Promise<bigint> {
+    options?.signal?.throwIfAborted()
+    const output = await this.#client.getItem(
+      {
+        TableName: this.#journalTable(),
+        Key: viewKey(counterPartitionKey(scope), COUNTER_SORT_KEY),
+        ConsistentRead: true,
+      },
+      requestOptions(options),
+    )
+    const item = output.Item as Item | undefined
+
+    return item === undefined || Object.keys(item).length === 0
+      ? 0n
+      : readCounter(scope, viewRowFromItem(item))
+  }
+
+  /** Several scopes' journal counters, in the order given. */
+  async readCounters(scopes: readonly string[], options?: CallOptions): Promise<bigint[]> {
+    return Promise.all(scopes.map((scope) => this.readCounter(scope, options)))
+  }
+
+  /** The highest position with a journal row in the scope: 0 when it has none. */
+  async readLastPosition(scope: string, options?: CallOptions): Promise<bigint> {
+    options?.signal?.throwIfAborted()
+    const pk = rowPartitionKey(scope)
+    const page = await this.#client.query(
+      {
+        TableName: this.#journalTable(),
+        KeyConditionExpression: 'pk = :pk',
+        ExpressionAttributeValues: {':pk': {S: pk}},
+        ConsistentRead: true,
+        ScanIndexForward: false,
+        Limit: 1,
+      },
+      requestOptions(options),
+    )
+    const item = page.Items?.[0] as Item | undefined
+    if (item === undefined) {
+      return 0n
+    }
+    const row = viewRowFromItem(item)
+    const position = parseRowSortKey(row.sk)
+    if (position === null) {
+      throw new EvtError('invalidRecord', `journal row ${pk}/${row.sk} has no position`)
+    }
+
+    return position
+  }
+
+  /**
+   * Up to `limit` journal rows of the scope above `after`, ascending, with strongly consistent
+   * queries that follow the last evaluated key until they have the rows or reach the end.
+   */
+  async readRows(
+    scope: string,
+    after: bigint,
+    limit: number,
+    options?: CallOptions,
+  ): Promise<JournalRow[]> {
+    options?.signal?.throwIfAborted()
+    const table = this.#journalTable()
+    const request = requestOptions(options)
+    const rows: JournalRow[] = []
+    let start: Item | undefined
+    // Each page continues from the last.
+    while (rows.length < limit) {
+      const page: Page = await this.#client.query(
+        {
+          TableName: table,
+          KeyConditionExpression: 'pk = :pk AND sk > :after',
+          ExpressionAttributeValues: {
+            ':pk': {S: rowPartitionKey(scope)},
+            ':after': {S: rowSortKey(after)},
+          },
+          ConsistentRead: true,
+          Limit: limit - rows.length,
+          ...(start && {ExclusiveStartKey: start}),
+        },
+        request,
+      )
+      for (const item of page.Items ?? []) {
+        rows.push(journalRowFromView(scope, viewRowFromItem(item as Item)))
+      }
+      start = page.LastEvaluatedKey as Item | undefined
+      if (start === undefined) {
+        break
+      }
+    }
+
+    return rows.slice(0, limit)
+  }
+
+  /** The journal's declarations on this store's manifest. Internal. */
+  readonly [JOURNAL_MARKER]: JournalMarker = {
+    declareJournal: (types, options) => {
+      options?.signal?.throwIfAborted()
+      const request = requestOptions(options)
+
+      return this.#exclusive(async () => {
+        // Validated as a commit validates it: an uninitialized store is refused before anything is
+        // declared, or, initializing lazily, declared.
+        await this.#validate(true, request)
+        let declared: JournalDeclared = {journal: false, history: []}
+        const result = await this.#declare((draft) => {
+          // Another writer may have declared a feature this package doesn't model since.
+          const stored = {...draft, version: 0n}
+          checkSupported(stored, true)
+          declared = journalDeclaration(stored, types)
+          if (!declaredAnything(declared)) {
+            return false
+          }
+          const next = withJournal(stored, declared)
+          draft.features = new Map(next.features)
+          draft.historyDependent = [...next.historyDependent]
+
+          return true
+        }, request)
+        if (result.wrote) {
+          // The declaration moved the version: the next write reads it again.
+          this.#validated = null
+        }
+
+        return result.wrote ? declared : {journal: false, history: []}
+      })
+    },
+    retractJournal: async (declared, options) => {
+      if (!declaredAnything(declared)) {
+        return
+      }
+      const request = requestOptions(options)
+      await this.#exclusive(async () => {
+        try {
+          await this.#declare((draft) => {
+            const next = withoutJournal({...draft, version: 0n}, declared)
+            draft.features = new Map(next.features)
+            draft.historyDependent = [...next.historyDependent]
+
+            return true
+          }, request)
+        } finally {
+          this.#validated = null
+        }
+      })
+    },
+  }
+
+  // The views table the journal reads, which a journal needs.
+  #journalTable(): string {
+    if (this.#viewsTable === undefined || this.#viewsTable === '') {
+      throw new ViewsNotConfiguredError(DYNAMODB_BACKEND)
+    }
+
+    return this.#viewsTable
+  }
+
   async compactBelow(entityId: string, through: bigint, options?: CallOptions): Promise<number> {
     options?.signal?.throwIfAborted()
     checkNotReserved(entityId)
@@ -519,7 +694,7 @@ export class DynamoRepository implements OutcomeRepository, StoreInitializer {
     entityId: string,
     snapshot: SerializedSnapshot | null,
   ): TransactItem {
-    checkSupported(manifest)
+    checkSupported(manifest, isJournalWriter(this))
     if (manifest === null || !declaresStreamHeads(manifest)) {
       throw this.#lazy ? new StreamHeadsNotMigratedError() : new StoreNotInitializedError()
     }
@@ -610,7 +785,7 @@ export class DynamoRepository implements OutcomeRepository, StoreInitializer {
     }
 
     let manifest = await this.#readManifest(request)
-    checkSupported(manifest)
+    checkSupported(manifest, isJournalWriter(this))
     if (!declaresStreamHeads(manifest)) {
       if (!this.#lazy) {
         throw new StoreNotInitializedError()
@@ -624,7 +799,7 @@ export class DynamoRepository implements OutcomeRepository, StoreInitializer {
 
       // Another writer may have declared a feature this package doesn't model.
       const declared = await this.#declareOnEmptyStore(request)
-      checkSupported(declared.manifest)
+      checkSupported(declared.manifest, isJournalWriter(this))
       manifest = declared.manifest
     }
 
