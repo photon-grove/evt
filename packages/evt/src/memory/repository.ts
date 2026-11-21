@@ -134,6 +134,11 @@ export class MemRepository implements OutcomeRepository, StoreInitializer {
     return true
   }
 
+  /** It applies a view put's expected-payload condition. */
+  appliesExpectedPayload(): boolean {
+    return true
+  }
+
   /**
    * Adds the entity types to the feature manifest's historyDependent set in one declaration, so
    * {@link compactBelow} refuses them. Types already declared are left alone, and a store that
@@ -276,6 +281,11 @@ export class MemRepository implements OutcomeRepository, StoreInitializer {
   #viewHolds(op: ViewOperation): boolean {
     const stored = this.#views.get(op.pk)?.get(op.sk)
     const owned = stored === undefined || stored.entityId === op.owner
+    // The engine's compare-and-set: the owner's row, holding exactly the bytes it read.
+    const expected = op.expectedPayload
+    if (expected !== null && expected !== undefined) {
+      return stored !== undefined && owned && sameBytes(stored.payload, expected)
+    }
     switch (op.condition) {
       case 'none':
         return owned
@@ -639,4 +649,8 @@ function cloneSnapshot(snapshot: SerializedSnapshot): SerializedSnapshot {
 // A copy of the bytes. Not slice(): a Node Buffer's slice is a view of the same memory.
 function copy(bytes: Uint8Array): Uint8Array {
   return new Uint8Array(bytes)
+}
+
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  return a.length === b.length && a.every((byte, index) => byte === b[index])
 }

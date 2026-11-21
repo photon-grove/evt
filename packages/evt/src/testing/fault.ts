@@ -61,6 +61,10 @@ export class FaultRepository implements OutcomeRepository {
     return this.inner.writesViews?.() === true
   }
 
+  appliesExpectedPayload(): boolean {
+    return this.inner.appliesExpectedPayload?.() === true
+  }
+
   outcome(commandId: string, options?: CallOptions): Promise<Outcome | null> {
     return this.inner.outcome(commandId, options)
   }
