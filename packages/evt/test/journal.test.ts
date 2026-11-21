@@ -3,12 +3,15 @@
 // pins the bytes, through packages/evt-compat.
 import {describe, expect, test} from 'vitest'
 
+import {defineAggregate, defineEvents} from '../src/aggregate.ts'
+import {json} from '../src/codec.ts'
 import {EvtError} from '../src/errors.ts'
 import type {SerializedEvent} from '../src/event.ts'
 import {Journal, JournalRowTooLargeError, allocate} from '../src/journal/config.ts'
 import {PositionTaken, journalProjector} from '../src/journal/projector.ts'
 import {type JournalPage, assemble} from '../src/journal/read.ts'
 import {replay} from '../src/journal/replay.ts'
+import {JournalRepository} from '../src/journal/repository.ts'
 import {
   type JournalRow,
   counterView,
@@ -28,6 +31,7 @@ import {
   rowSortKey,
   setAllocations,
 } from '../src/journal/scope.ts'
+import {MemRepository} from '../src/memory/repository.ts'
 import {emptyMetadata} from '../src/metadata.ts'
 import {
   type CommitProjector,
@@ -36,6 +40,7 @@ import {
   projectViews,
   putView,
 } from '../src/projection.ts'
+import {Store} from '../src/store.ts'
 import {utf8Length} from '../src/utf8.ts'
 
 function code(run: () => unknown): string | undefined {
@@ -429,5 +434,64 @@ describe("the journal's projector", () => {
       project: () => [putView('journal#world:1', '00000000000000000008', 'a', 'journal', '{}')],
     }
     expect(code(() => projectViews([forger], view))).toBe('reservedViewKey')
+  })
+})
+
+describe('a store over the journal', () => {
+  const account = defineAggregate({
+    type: 'account',
+    events: defineEvents({'account:noted': {version: 1, codec: json<{note: string}>()}}),
+    state: json<{notes: number}>(),
+    initial: () => ({notes: 0}),
+    handle: (_state, note: string) => ({
+      kind: 'accept',
+      events: [{type: 'account:noted', data: {note}}],
+    }),
+    apply: (state) => ({notes: state.notes + 1}),
+    identify: (note: string) => ({
+      commandType: 'account:note',
+      payload: json<string>().encode(note),
+    }),
+  })
+  const journal = new Journal(['account'], (stored) => [`account:${stored.entityId}`], {
+    maxRowBytes: 2_000,
+  })
+
+  test('hands back the allocations the commit stored, from every entry point', async () => {
+    const repository = new JournalRepository(new MemRepository(), journal)
+    const store = new Store(repository, {snapshotInterval: 0})
+
+    const executed = await store.execute(account, 'a', 'one')
+    expect(executed.kind === 'committed' && allocations(executed.events[0]!.metadata)).toEqual([
+      {scope: 'account:a', position: 1n},
+    ])
+
+    const tx = store.transaction()
+    tx.append(await tx.read(account, 'b'), [{type: 'account:noted', data: {note: 'two'}}])
+    const committed = await tx.commit()
+    expect(committed.kind === 'committed' && allocations(committed.events[0]!.metadata)).toEqual([
+      {scope: 'account:b', position: 1n},
+    ])
+    expect(await repository.highWatermark('account:a')).toBe(1n)
+  })
+
+  test("records a row over the cap as the command's rejection, which a replay returns", async () => {
+    const repository = new JournalRepository(new MemRepository(), journal)
+    const store = new Store(repository, {snapshotInterval: 0, outcomes: {}})
+    const options = {metadata: {commandId: 'big-1'}}
+
+    const refused = await store.executeWithOutcome(account, 'a', 'x'.repeat(3_000), options)
+    expect(refused.outcome.status).toBe('rejected')
+    expect(refused.outcome.rejection?.code).toBe('journal-row-too-large')
+    expect(await repository.events('a')).toEqual([])
+
+    const replayed = await store.executeWithOutcome(account, 'a', 'x'.repeat(3_000), options)
+    expect(replayed.replayed).toBe(true)
+    expect(replayed.outcome.rejection?.code).toBe('journal-row-too-large')
+  })
+
+  test("refuses the journal's projector as an application projector", async () => {
+    const store = new Store(new MemRepository(), {commitProjectors: [journalProjector(journal)]})
+    await expect(store.execute(account, 'a', 'one')).rejects.toThrow(/engine metadata/)
   })
 })
