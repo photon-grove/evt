@@ -23,6 +23,7 @@ import {
   manifestPayload,
   releasedPayload,
 } from '../src/journal/compaction.ts'
+import {beginCompaction, compactWithLease, readLease} from '../src/journal/compact.ts'
 import {Journal, JournalRowTooLargeError, allocate} from '../src/journal/config.ts'
 import {PositionTaken, journalProjector} from '../src/journal/projector.ts'
 import {type JournalPage, assemble, highWatermarkAtEpoch, pageAtEpoch} from '../src/journal/read.ts'
@@ -713,6 +714,44 @@ describe('epoch-checked reads', () => {
     )
     await expect(highWatermarkAtEpoch(memory, 'account:a')).rejects.toBeInstanceOf(
       RebuildUnavailableError,
+    )
+  })
+})
+
+describe('compaction leases', () => {
+  test('a run that fails after renewing its lease releases the lease it renewed', async () => {
+    let now = 1_000
+    const memory = new MemRepository({clock: () => now * 1000})
+    const repository = new JournalRepository(memory, new Journal(['account'], () => ['world:7']))
+    // One commit at a time, so each takes the next position.
+    await repository.commit({entityId: 'a', events: [opened('a')]})
+    await repository.commit({entityId: 'b', events: [opened('b')]})
+    await repository.commit({entityId: 'c', events: [opened('c')]})
+
+    const write = memory.writeCompaction.bind(memory)
+    let writes = 0
+    memory.writeCompaction = async (epoch, batch, options) => {
+      if (batch.some((each) => each.kind === 'put' && each.row.sk.startsWith('audit#'))) {
+        throw new Error('the audit write failed')
+      }
+      const written = await write(epoch, batch, options)
+      // After the acquire, time passes: the run's first write renews the lease.
+      if (++writes === 1) {
+        now += 6
+      }
+      return written
+    }
+
+    await expect(compactWithLease(memory, 'world:7', 3n, 'compactor', 10_000)).rejects.toThrow(
+      /the audit write failed/,
+    )
+    expect((await readLease(memory, 'world:7'))?.kind).toBe('released')
+  })
+
+  test('refuses a lease whose expiry no reader could decode', async () => {
+    const memory = new MemRepository()
+    await expect(beginCompaction(memory, 'world:7', 'compactor', Number.MAX_VALUE)).rejects.toThrow(
+      /a lease is one second to/,
     )
   })
 })

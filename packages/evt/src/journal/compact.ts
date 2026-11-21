@@ -18,6 +18,7 @@ import {
   type CompactionManifest,
   type CompactionStore,
   type CompactionWrite,
+  type JournalCompactionStore,
   type Expect,
   JournalSnapshotMovedError,
   LEASE_SORT_KEY,
@@ -58,8 +59,19 @@ export const MAX_COMPACTION_OWNER_BYTES = 512
 
 // How many times an acquire reads and puts the lease against racing acquirers.
 const MAX_LEASE_ATTEMPTS = 8
+// The longest lease: a year, so its expiry stays a whole number of seconds every reader decodes.
+const MAX_LEASE_MS = 366 * 24 * 60 * 60 * 1000
 // Row deletes per transaction: the lease check takes the last action.
 const DELETE_BATCH = MAX_COMPACTION_WRITES - 1
+
+/** Options for {@link compact}. */
+export interface CompactOptions extends CallOptions {
+  /**
+   * Called with the lease each time the run renews it, so a caller that releases its lease after
+   * a failed run releases the one the run held last.
+   */
+  readonly renewed?: ((lease: CompactionLease) => void) | undefined
+}
 
 /** What a compaction run did. */
 export interface CompactionReport {
@@ -118,7 +130,7 @@ export class CompactionLeaseLostError extends EvtError {
  * or not matching is a `JournalSnapshotMovedError`: read the manifest again.
  */
 export async function readChunk(
-  store: CompactionStore,
+  store: JournalCompactionStore,
   manifest: CompactionManifest,
   index: number,
   options?: CallOptions,
@@ -149,7 +161,7 @@ export async function readChunk(
 
 /** The audit row of a compaction through `checkpoint`, or null. */
 export async function readAudit(
-  store: CompactionStore,
+  store: JournalCompactionStore,
   scope: string,
   checkpoint: bigint,
   options?: CallOptions,
@@ -161,7 +173,7 @@ export async function readAudit(
 
 /** The scope's lease row, held or released, or null when it never had one. */
 export async function readLease(
-  store: CompactionStore,
+  store: JournalCompactionStore,
   scope: string,
   options?: CallOptions,
 ): Promise<LeaseRow | null> {
@@ -184,8 +196,11 @@ function leaseSeconds(owner: string, leaseMs: number): number {
   if (owner.includes('\0')) {
     throw new EvtError('invalidArgument', 'a compaction owner must not contain U+0000')
   }
-  if (!Number.isFinite(leaseMs) || leaseMs < 1000) {
-    throw new EvtError('invalidArgument', `a lease is at least one second; got ${leaseMs} ms`)
+  if (!Number.isFinite(leaseMs) || leaseMs < 1000 || leaseMs > MAX_LEASE_MS) {
+    throw new EvtError(
+      'invalidArgument',
+      `a lease is one second to ${MAX_LEASE_MS} ms; got ${leaseMs} ms`,
+    )
   }
 
   return Math.ceil(leaseMs / 1000)
@@ -340,16 +355,19 @@ class Run {
   readonly epoch: bigint
   readonly options: CallOptions | undefined
 
+  readonly #renewed: ((lease: CompactionLease) => void) | undefined
+
   constructor(
     store: CompactionStore,
     lease: CompactionLease,
     epoch: bigint,
-    options: CallOptions | undefined,
+    options: CompactOptions | undefined,
   ) {
     this.store = store
     this.lease = lease
     this.epoch = epoch
     this.options = options
+    this.#renewed = options?.renewed
   }
 
   // Sends writes with a check of the lease's exact payload, fenced on the epoch.
@@ -394,6 +412,7 @@ class Run {
     const seconds = this.lease.leaseSeconds
     if (seconds > 0 && this.lease.leaseExpiresAt - now < Math.floor((seconds + 1) / 2)) {
       this.lease = await renewCompaction(this.store, this.lease, seconds * 1000, this.options)
+      this.#renewed?.(this.lease)
     }
   }
 
@@ -413,13 +432,14 @@ class Run {
  * builds the chunks above the floor (a preflight first, which writes nothing and refuses a missing
  * row or an oversized manifest), swaps the manifest, deletes the rows at or below `through`, and
  * writes the audit row. Every step is idempotent: a run that stops is finished by compacting
- * again. The lease is renewed in place as the run goes, so `lease` ends as the one it holds.
+ * again. The run renews its lease as it goes, and resolves to the one it holds at the end;
+ * `options.renewed` reports each renewal, for a caller that releases the lease after a failure.
  */
 export async function compact(
   store: CompactionBackend,
   lease: CompactionLease,
   through: bigint,
-  options?: CallOptions,
+  options?: CompactOptions,
 ): Promise<{report: CompactionReport; lease: CompactionLease}> {
   const {scope, owner, token} = lease
   const epoch = await store.observeRebuildEpoch(options)
@@ -517,7 +537,12 @@ export async function compactWithLease(
   let held = await beginCompaction(store, scope, owner, leaseMs, options)
   let report: CompactionReport
   try {
-    const result = await compact(store, held, through, options)
+    const result = await compact(store, held, through, {
+      ...options,
+      renewed: (lease) => {
+        held = lease
+      },
+    })
     report = result.report
     held = result.lease
   } catch (error) {

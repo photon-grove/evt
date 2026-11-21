@@ -4,6 +4,7 @@
 
 export {
   COMPACTION_OWNER,
+  type CompactOptions,
   type CompactionBackend,
   CompactionLeaseHeldError,
   CompactionLeaseLostError,
