@@ -58,6 +58,7 @@ const client = new DynamoDB({
 const run = Date.now().toString(36)
 const shared = `evt-ts-conformance-${run}`
 const marked = `evt-ts-marker-${run}`
+const conformanceViews = `evt-ts-views-${run}`
 const tableCount = {value: 0}
 
 const checks = new Checks()
@@ -67,9 +68,11 @@ try {
     await createTable(table)
     created.push(table)
   }
+  await createTable(conformanceViews, 'S')
+  created.push(conformanceViews)
 
   // The suite's store is initialized up front, as a deployment would, so its writers are strict.
-  const repo = new DynamoRepository(client, shared)
+  const repo = new DynamoRepository(client, shared, {viewsTable: conformanceViews})
   await repo.initialize()
   await conformance(checks, repo, headFixtures(shared))
 

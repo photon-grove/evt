@@ -62,7 +62,8 @@ import {
   retryDelay,
   sleep,
 } from './retry.js'
-import {commitSnapshot, projectCommit, serializeEvents} from './staging.js'
+import {commitSnapshot, projectCommit, projectStreams, serializeEvents} from './staging.js'
+import type {CommitProjector, ProjectedView} from './projection.js'
 import {
   type ReadFailures,
   Transaction,
@@ -96,6 +97,13 @@ export interface StoreOptions {
    * this package ships is.
    */
   outcomes?: OutcomeOptions | true | undefined
+  /**
+   * The commit-wide projectors, whose view operations every commit that writes events carries,
+   * in this order. The repository must write views, as every one this package ships does (the
+   * DynamoDB one with a views table). Only current-state projectors run for now: one that names
+   * a `history` is refused.
+   */
+  commitProjectors?: readonly CommitProjector[] | undefined
 }
 
 /** An aggregate loaded from its stream, with the position it was loaded at. */
@@ -147,6 +155,7 @@ export class Store {
   readonly #snapshotInterval: number
   readonly #commitId: () => string
   readonly #outcomes: OutcomeConfig | null
+  readonly #commitProjectors: readonly CommitProjector[]
 
   constructor(repository: Repository, options: StoreOptions = {}) {
     const interval = options.snapshotInterval ?? DEFAULT_SNAPSHOT_INTERVAL
@@ -163,6 +172,7 @@ export class Store {
     this.#snapshotInterval = interval
     this.#commitId = options.commitId ?? commitIds(this.#clock)
 
+    this.#commitProjectors = [...(options.commitProjectors ?? [])]
     const outcomes = options.outcomes
     this.#outcomes =
       outcomes === undefined ? null : new OutcomeConfig(outcomes === true ? {} : outcomes)
@@ -253,13 +263,13 @@ export class Store {
       return {kind: 'committed', state: loaded, events: []}
     }
 
-    const {state, events, snapshot, projections} = this.#stage(
+    const {state, events, snapshot, projections, views} = this.#stage(
       aggregate,
       loaded,
       decision.events,
       metadata,
     )
-    await this.repository.commit({entityId, events, snapshot, projections}, options)
+    await this.repository.commit({entityId, events, snapshot, projections, views}, options)
 
     return {kind: 'committed', state, events}
   }
@@ -438,6 +448,7 @@ export class Store {
       snapshotInterval: (aggregate) => this.snapshotInterval(aggregate),
       metadata: (partial) => this.#metadata(partial),
       outcomes: this.#outcomes,
+      commitProjectors: this.#commitProjectors,
       ...extra,
     })
   }
@@ -675,14 +686,14 @@ export class Store {
       return {entityId, events: [], outcome}
     }
 
-    const {events, snapshot, projections} = this.#stage(
+    const {events, snapshot, projections, views} = this.#stage(
       aggregate,
       loaded,
       decided,
       pending.metadata,
     )
 
-    return {entityId, events, snapshot, projections, outcome}
+    return {entityId, events, snapshot, projections, views, outcome}
   }
 
   #outcomeConfig(): OutcomeConfig {
@@ -758,6 +769,7 @@ export class Store {
     events: SerializedEvent[]
     snapshot: NewSnapshot | null
     projections: ProjectorGroup[]
+    views: ProjectedView[]
   } {
     const entityId = loaded.entityId
     const {events, state} = serializeEvents(
@@ -787,6 +799,14 @@ export class Store {
       events,
       snapshot,
       projections: projectCommit(aggregate, entityId, state, events, snapshot),
+      views: projectStreams(this.#commitProjectors, this.repository, [
+        {
+          entityId,
+          entityType: aggregate.type,
+          events,
+          state: () => snapshot?.payload ?? aggregate.state.encode(state),
+        },
+      ]),
     }
   }
 

@@ -21,7 +21,7 @@ rust_driver="target/debug/evt-compat"
 ts_driver=(node packages/evt-compat/dist/live.js)
 pnpm --silent --filter @photon-grove/evt run build
 pnpm --silent --filter @photon-grove/evt-compat run build
-ts_scenarios="$("${ts_driver[@]}" scenarios)"
+ts_scenarios="$("${ts_driver[@]}" scenarios --backend "$backend")"
 if [ -z "$ts_scenarios" ]; then
   echo "the TypeScript driver lists no scenarios" >&2
   exit 1

@@ -52,4 +52,5 @@ export {
   commitTransaction,
   snapshotTransaction,
   transactionItems,
+  viewActions,
 } from './requests.js'

@@ -32,7 +32,15 @@ import {
   type TransactionalRepository,
   checkNotReserved,
 } from './repository.js'
-import {commitSnapshot, copyMetadata, projectCommit, serializeEvents} from './staging.js'
+import {
+  commitSnapshot,
+  copyMetadata,
+  projectCommit,
+  projectStreams,
+  readyProjectors,
+  serializeEvents,
+} from './staging.js'
+import type {CommitProjector, ProjectedView} from './projection.js'
 import type {ExecuteOptions, Loaded} from './store.js'
 import {compareUtf8} from './utf8.js'
 
@@ -60,6 +68,8 @@ export interface TransactionContext {
    * installs instead of validating the identity and computing its digest again.
    */
   readonly frozen?: PendingCommand | undefined
+  /** The store's commit-wide projectors, which every commit that writes events runs. */
+  readonly commitProjectors?: readonly CommitProjector[] | undefined
   /** Where the transaction notes a failed read, so the store's retry can tell it apart. */
   readonly readFailures?: ReadFailures | undefined
 }
@@ -113,6 +123,8 @@ interface Prepared {
   readonly streams: Commit[]
   readonly fences: ReadFence[]
   readonly events: SerializedEvent[]
+  /** The commit-wide projectors' view operations over every written stream. */
+  readonly views: ProjectedView[]
 }
 
 /** A fence the caller stamps on a stream the transaction doesn't read. */
@@ -378,14 +390,19 @@ export class Transaction {
     this.#checkCommittable()
     this.#done = true
 
+    // The repository must serve the projectors before anything else is decided, as in Rust.
+    if ([...this.#streams.values()].some((stream) => stream.events.length > 0)) {
+      readyProjectors(this.#context.commitProjectors ?? [], this.#context.repository)
+    }
+
     const metadata = this.#context.metadata(options.metadata)
     const commandId = metadata.commandId
     if (commandId !== null && commandId !== '' && this.#seen(commandId)) {
       return {kind: 'duplicate', commandId}
     }
 
-    const {streams, fences, events} = this.#prepare(metadata)
-    await this.#context.repository.commitTransaction({streams, fences}, options)
+    const {streams, fences, events, views} = this.#prepare(metadata)
+    await this.#context.repository.commitTransaction({streams, fences, views}, options)
 
     return {kind: 'committed', events}
   }
@@ -495,7 +512,7 @@ export class Transaction {
     }))
     fences.push(...this.#callerFences())
 
-    return this.#record(pending, outcome, {streams: [], fences, events: []}, options)
+    return this.#record(pending, outcome, {streams: [], fences, events: [], views: []}, options)
   }
 
   /**
@@ -524,11 +541,11 @@ export class Transaction {
   ): Promise<CommandOutcome> {
     const config = this.#outcomeConfig()
     const repository = this.#context.repository as OutcomeRepository
-    const {streams, fences, events} = prepared
+    const {streams, fences, events, views} = prepared
 
     try {
       return await recordCommit(repository, pending, config, outcome, events, () =>
-        repository.commitTransaction({streams, fences, outcome}, options),
+        repository.commitTransaction({streams, fences, views, outcome}, options),
       )
     } catch (error) {
       // Only the caller knows what it read, so a stale fence of its own is the command's answer.
@@ -628,7 +645,26 @@ export class Transaction {
     const written = [...commits]
     written.sort((a, b) => compareUtf8(a.entityId, b.entityId))
 
-    return {streams: commits, fences, events: written.flatMap((commit) => commit.events)}
+    const views = projectStreams(
+      this.#context.commitProjectors ?? [],
+      this.#context.repository,
+      streams.flatMap((stream) =>
+        stream.events.length === 0
+          ? []
+          : [
+              {
+                entityId: stream.loaded.entityId,
+                entityType: stream.aggregate.type,
+                events: stream.events,
+                state: () =>
+                  commits.find((commit) => commit.entityId === stream.loaded.entityId)?.snapshot
+                    ?.payload ?? stream.aggregate.state.encode(stream.state),
+              },
+            ],
+      ),
+    )
+
+    return {streams: commits, fences, events: written.flatMap((commit) => commit.events), views}
   }
 
   // Every stream the client expected at a head other than the one this transaction read.

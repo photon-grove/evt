@@ -697,8 +697,9 @@ transaction as the events. The byte-level rules are in the
   refuses a row two streams write (`SharedViewKeyError`).
 - The journal's partitions are the engine's. An operation whose `pk` begins `journal#`,
   `journal-counter#` or `journal-compaction#` is refused when the projector returns, live, on
-  replay and in a rebuild (Go `*ReservedViewKeyError`, Rust `Error::ReservedViewKey`, both
-  invalid arguments, never retried), unless the projector is the engine's own (the journal's,
+  replay and in a rebuild (Go `*ReservedViewKeyError`, Rust `Error::ReservedViewKey`, TypeScript
+  `ReservedViewKeyError`, all invalid arguments, never retried), unless the projector is the
+  engine's own (the journal's,
   identified by the sealed `CommitProjector::engine_metadata`; Go has none). Only the engine runs
   that projector: a Rust store or transaction that registers it is refused with `InvalidConfig`
   before it runs, as a rebuild is. So an application projector cannot overwrite its stream's
@@ -707,8 +708,12 @@ transaction as the events. The byte-level rules are in the
 - Only the in-memory replay of history-dependent projectors exists today; the state entry point and
   the state-based rebuild of current-state projectors are not implemented.
 - A repository must declare `evt.ViewWritingRepository` (its `WritesViews()` returns true; a
-  decorator returns the wrapped repository's; Rust `Repository::writes_views`) or the
-  store refuses a commit-wide projector (`ViewsUnsupportedError`); `CheckProjectorOperationsSupported`
+  decorator returns the wrapped repository's; Rust `Repository::writes_views`; TypeScript
+  `writesViews()`) or the store refuses a commit-wide projector (`ViewsUnsupportedError`, TypeScript
+  `viewsUnsupported`). TypeScript runs only current-state projectors so far: it can't declare
+  history-dependent entity types yet, so it refuses a projector that names a `history` with
+  `historyDeclarationUnsupported`, as Go and Rust refuse one on a backend that can't declare;
+  `CheckProjectorOperationsSupported`
   stays fail-closed for view operations.
 
 **Operations**

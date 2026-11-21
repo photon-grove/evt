@@ -12,6 +12,7 @@ import {
   encodeManifest,
   eventId,
   normalizeTransaction,
+  viewOperationSize,
 } from '@photon-grove/evt'
 import {
   type CommitTtl,
@@ -23,10 +24,12 @@ import {
   markerItem,
   snapshotTransaction,
   transactionItems,
+  transactItemSize,
 } from '@photon-grove/evt/dynamodb'
 import {pgTables, schemaDdl} from '@photon-grove/evt/postgres'
 
 import {milliseconds} from './codec.js'
+import {stepViews} from './runner.js'
 import {type Checks, canonical, field, int, list, loadFixture, num, plain, str} from './harness.js'
 
 export async function markerVectors(checks: Checks): Promise<void> {
@@ -146,6 +149,73 @@ export async function headVectors(checks: Checks): Promise<void> {
       checks.equal(name, canonical(got), want)
     })
   }
+}
+
+// The commitViews vectors: a transaction's view operations go to the views table after the
+// control checks, and before the written streams and the fences.
+export async function commitViewVectors(checks: Checks): Promise<void> {
+  const vectors = list(field(await loadFixture('feature-marker.json'), 'commitViews'))
+  checks.equal('feature-marker commitViews present', vectors.length > 0, true)
+
+  for (const vector of vectors) {
+    const name = `feature-marker commitViews ${str(field(vector, 'name'))}`
+    checks.run(name, () => {
+      const request = field(vector, 'request')
+      const fences = request instanceof Map ? request.get('fences') : undefined
+      const views = stepViews('', request)
+      const transaction = normalizeTransaction({
+        streams: list(field(request, 'streams')).map(headCommit),
+        fences: (fences === undefined ? [] : list(fences)).map((fence) => ({
+          entityId: str(field(fence, 'entityId')),
+          entityType: 'account',
+          head: int(field(fence, 'head')),
+          provenance: 'engine' as const,
+        })),
+        views,
+      })
+      const viewsTable = str(field(request, 'viewsTable'))
+      const items = transactionItems(
+        str(field(request, 'eventsTable')),
+        transaction,
+        1n,
+        () => undefined,
+        viewsTable,
+      )
+      checks.equal(
+        name,
+        canonical(items.map(normalize)),
+        canonical(list(field(vector, 'output')).map(plain)),
+      )
+
+      // Go lists the budgeted sizes as the control checks' fixed ones, the streams' and fences' in
+      // its own order, then the views' in theirs: the streams' and fences' are compared sorted.
+      const want = list(field(vector, 'sizes')).map(num)
+      const viewSizes = views.map((view) => viewOperationSize(view.op))
+      const others = items
+        .slice(2)
+        .filter((item) => (item.Put ?? item.Delete)?.TableName !== viewsTable)
+        .map(transactItemSize)
+      checks.equal(`${name} control sizes`, canonical(want.slice(0, 2)), canonical([20, 19]))
+      checks.equal(
+        `${name} sizes`,
+        canonical(ascending(others)),
+        canonical(ascending(want.slice(2, 2 + others.length))),
+      )
+      checks.equal(
+        `${name} view sizes`,
+        canonical(viewSizes),
+        canonical(want.slice(2 + others.length)),
+      )
+    })
+  }
+}
+
+// Sizes in ascending order, in a copy.
+function ascending(sizes: readonly number[]): number[] {
+  const sorted = [...sizes]
+  sorted.sort((a, b) => a - b)
+
+  return sorted
 }
 
 // The `ttl` an item of the entity type gets from the vector's clock and retention, if it has one.

@@ -3,6 +3,7 @@
 // details has its own subclass, so `instanceof` narrows to its fields.
 
 import type {Outcome} from './outcome.js'
+import type {ProjectedView} from './projection.js'
 
 /**
  * What went wrong:
@@ -55,6 +56,21 @@ import type {Outcome} from './outcome.js'
  *   principal, or one that records no identity to match.
  * - `duplicateCommand`: an event written before outcomes existed already carries the command ID,
  *   so the command ran, but no outcome row says how. Nothing was written.
+ * - `invalidViewOperation`: a commit-wide projector's view operation is malformed, or names an
+ *   owner the commit didn't write. Nothing was written.
+ * - `viewKeyTooLong`: a view operation's `pk` is over 2048 UTF-8 bytes or its `sk` over 1024.
+ * - `duplicateViewKey`: two view operations of one commit name the same row.
+ * - `reservedViewKey`: a view operation's `pk` is in a partition the engine keeps for itself.
+ * - `projector`: a commit-wide projector threw. Nothing was written.
+ * - `projectorOperation`: a view operation's condition failed, or the backend refused its write.
+ *   Nothing was written, and running the command again can't fix it.
+ * - `viewsNotConfigured`: a commit carries view operations, and the repository has nowhere to
+ *   write them, such as a DynamoDB repository without a views table.
+ * - `viewsUnsupported`: a store has commit-wide projectors, and its repository doesn't write view
+ *   operations.
+ * - `historyDeclarationUnsupported`: a history-dependent projector needs its entity types declared
+ *   in the store's feature manifest, which this package can't do yet.
+ * - `commitOrder`: stored commits have no order every stream agrees with.
  */
 export type EvtErrorCode =
   | 'invalidJson'
@@ -87,6 +103,16 @@ export type EvtErrorCode =
   | 'ambiguousWrite'
   | 'outcomePrincipalMismatch'
   | 'duplicateCommand'
+  | 'invalidViewOperation'
+  | 'viewKeyTooLong'
+  | 'duplicateViewKey'
+  | 'reservedViewKey'
+  | 'projector'
+  | 'projectorOperation'
+  | 'viewsNotConfigured'
+  | 'viewsUnsupported'
+  | 'historyDeclarationUnsupported'
+  | 'commitOrder'
 
 export class EvtError extends Error {
   override readonly name: string = 'EvtError'
@@ -584,6 +610,163 @@ export class DuplicateCommandError extends EvtError {
     super('duplicateCommand', `command ${commandId} already ran, and records no outcome`)
     this.commandId = commandId
   }
+}
+
+/** A view operation's key is over its limit: `pk` 2048 UTF-8 bytes, `sk` 1024. */
+export class ViewKeyTooLongError extends EvtError {
+  override readonly name = 'ViewKeyTooLongError'
+  override readonly code = 'viewKeyTooLong'
+  readonly field: 'pk' | 'sk'
+  readonly length: number
+  readonly max: number
+  readonly projector: string
+  readonly operation: number
+
+  constructor(
+    field: 'pk' | 'sk',
+    length: number,
+    max: number,
+    projector: string,
+    operation: number,
+  ) {
+    super(
+      'viewKeyTooLong',
+      `view key too long: projector ${JSON.stringify(projector)} operation ${operation}: ` +
+        `${field} is ${length} bytes, the limit is ${max}`,
+    )
+    this.field = field
+    this.length = length
+    this.max = max
+    this.projector = projector
+    this.operation = operation
+  }
+}
+
+/** Two view operations of one commit name the same row. */
+export class DuplicateViewKeyError extends EvtError {
+  override readonly name = 'DuplicateViewKeyError'
+  override readonly code = 'duplicateViewKey'
+  readonly pk: string
+  readonly sk: string
+
+  constructor(pk: string, sk: string, first: ProjectedView, second: ProjectedView) {
+    super(
+      'duplicateViewKey',
+      `duplicate view key ${JSON.stringify(pk)}/${JSON.stringify(sk)}: projector ` +
+        `${JSON.stringify(second.projector)} operation ${second.operation} repeats projector ` +
+        `${JSON.stringify(first.projector)} operation ${first.operation}`,
+    )
+    this.pk = pk
+    this.sk = sk
+  }
+}
+
+/** A view operation's partition key is in one the engine keeps for its own rows. */
+export class ReservedViewKeyError extends EvtError {
+  override readonly name = 'ReservedViewKeyError'
+  override readonly code = 'reservedViewKey'
+  readonly pk: string
+
+  constructor(pk: string, projector: string, operation: number) {
+    super(
+      'reservedViewKey',
+      `reserved view key: projector ${JSON.stringify(projector)} operation ${operation}: ` +
+        `${JSON.stringify(pk)} is in a partition the engine reserves`,
+    )
+    this.pk = pk
+  }
+}
+
+/** A commit-wide projector threw. Its error is the `cause`. Nothing was written. */
+export class ProjectorError extends EvtError {
+  override readonly name = 'ProjectorError'
+  override readonly code = 'projector'
+  readonly projector: string
+
+  constructor(projector: string, cause: unknown) {
+    super(
+      'projector',
+      `projector failed: commit projector ${JSON.stringify(projector)}: ${messageOf(cause)}`,
+      {cause},
+    )
+    this.projector = projector
+  }
+}
+
+/**
+ * A view operation's condition failed, or the backend refused its write. It names the projector
+ * and the operation. `mapped` is the operation's own error for a failed condition
+ * (`ConditionalCheckFailed`), and `cause` the backend's error, when there is one. It isn't a
+ * conflict and isn't transient: running the command again can't fix it, so it records no outcome.
+ * Nothing was written.
+ */
+export class ProjectorOperationError extends EvtError {
+  override readonly name = 'ProjectorOperationError'
+  override readonly code = 'projectorOperation'
+  readonly projector: string
+  readonly projectorIndex: number
+  readonly operation: number
+  readonly kind: 'put' | 'delete'
+  readonly pk: string
+  readonly sk: string
+  /** The backend's reason: a DynamoDB cancellation code, `ConditionalCheckFailed`, or a SQLSTATE. */
+  readonly reason: string
+  readonly mapped: unknown
+
+  constructor(view: ProjectedView, reason: string, cause?: unknown) {
+    const mapped = reason === 'ConditionalCheckFailed' ? view.op.conflict : undefined
+    super(
+      'projectorOperation',
+      `${viewRef(view)}: ${view.op.kind} of ${JSON.stringify(view.op.pk)}/` +
+        `${JSON.stringify(view.op.sk)} failed: ${reason}`,
+      cause === undefined ? undefined : {cause},
+    )
+    this.projector = view.projector
+    this.projectorIndex = view.projectorIndex
+    this.operation = view.operation
+    this.kind = view.op.kind
+    this.pk = view.op.pk
+    this.sk = view.op.sk
+    this.reason = reason
+    this.mapped = mapped
+  }
+}
+
+/** A commit carries view operations, and the repository has nowhere to write them. */
+export class ViewsNotConfiguredError extends EvtError {
+  override readonly name = 'ViewsNotConfiguredError'
+  override readonly code = 'viewsNotConfigured'
+  readonly backend: string
+
+  constructor(backend: string) {
+    super(
+      'viewsNotConfigured',
+      `the ${backend} repository has no views table or view writer configured`,
+    )
+    this.backend = backend
+  }
+}
+
+/** Stored commits have no order every stream agrees with. */
+export class CommitOrderError extends EvtError {
+  override readonly name = 'CommitOrderError'
+  override readonly code = 'commitOrder'
+  readonly commits: readonly string[]
+
+  constructor(commits: readonly string[]) {
+    super(
+      'commitOrder',
+      `commits [${commits.join(', ')}] cannot be ordered consistently with their streams' sequences`,
+    )
+    this.commits = commits
+  }
+}
+
+function viewRef(view: ProjectedView): string {
+  return (
+    `projector ${JSON.stringify(view.projector)} (#${view.projectorIndex}) ` +
+    `operation ${view.operation}`
+  )
 }
 
 /**

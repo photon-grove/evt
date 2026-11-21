@@ -6,6 +6,7 @@ export {
   type ManifestDraft,
   MemRepository,
   type RebuildState,
+  type ViewRow,
   controlFixtures,
   headFixtures,
 } from './repository.js'
