@@ -78,12 +78,15 @@ export {
   JOURNAL_VERSION,
 } from '../features.js'
 export {
+  type EpochStore,
   type Gap,
   type JournalPage,
   type JournalStore,
   MAX_PAGE_ROWS,
   highWatermark,
+  highWatermarkAtEpoch,
   page,
+  pageAtEpoch,
 } from './read.js'
 export {type JournalState, replay, stateViews} from './replay.js'
 export {

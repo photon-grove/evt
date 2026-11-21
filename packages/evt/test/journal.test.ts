@@ -5,14 +5,31 @@ import {describe, expect, test} from 'vitest'
 
 import {defineAggregate, defineEvents} from '../src/aggregate.ts'
 import {json} from '../src/codec.ts'
-import {EvtError} from '../src/errors.ts'
+import {EvtError, RebuildUnavailableError} from '../src/errors.ts'
 import type {SerializedEvent} from '../src/event.ts'
+import {
+  ChunkBuilder,
+  JournalGoneError,
+  MAX_CHUNK_BYTES,
+  MAX_CHUNK_ROWS,
+  auditSortKey,
+  chunkSortKey,
+  compactionPartitionKey,
+  decodeChunk,
+  decodeLease,
+  decodeManifest,
+  leasePayload,
+  manifestGone,
+  manifestPayload,
+  releasedPayload,
+} from '../src/journal/compaction.ts'
 import {Journal, JournalRowTooLargeError, allocate} from '../src/journal/config.ts'
 import {PositionTaken, journalProjector} from '../src/journal/projector.ts'
-import {type JournalPage, assemble} from '../src/journal/read.ts'
+import {type JournalPage, assemble, highWatermarkAtEpoch, pageAtEpoch} from '../src/journal/read.ts'
 import {replay} from '../src/journal/replay.ts'
 import {JournalRepository} from '../src/journal/repository.ts'
 import {
+  MAX_ROW_BYTES,
   type JournalRow,
   counterView,
   journalRowFromView,
@@ -541,5 +558,161 @@ describe('journal acceptance', () => {
     const pair = String.raw`[{"scope":"a😀","position":1}]`
     const metadata = {...emptyMetadata(), extensions: new Map([[ALLOCATION_KEY, pair]])}
     expect(allocations(metadata)).toEqual([{scope: 'a\u{1F600}', position: 1n}])
+  })
+})
+
+function text(bytes: Uint8Array): string {
+  return new TextDecoder().decode(bytes)
+}
+
+// A row of world:7 whose event payload is padded to about `padding` bytes.
+function padded(position: bigint, padding: number): JournalRow {
+  const stored: SerializedEvent = {
+    ...ledger(`acct-1:${position}`),
+    entityId: 'acct-1',
+    entityType: 'account',
+    sequence: position,
+    payload: new TextEncoder().encode(`{"note":"${'x'.repeat(padding)}"}`),
+  }
+  setAllocations(stored, [{scope: 'world:7', position}])
+
+  return {scope: 'world:7', position, owner: 'acct-1', event: stored}
+}
+
+describe('compaction rows', () => {
+  test('keys and payloads have the documented shape', () => {
+    expect(compactionPartitionKey('world:7')).toBe('journal-compaction#world:7')
+    expect(chunkSortKey(3)).toBe('chunk#00000000000000000003')
+    expect(auditSortKey(12n)).toBe('audit#00000000000000000012')
+
+    const lease = {
+      scope: 'world:7',
+      owner: 'compactor-1',
+      token: 2n,
+      leaseExpiresAt: 1_700_000_060,
+      leaseSeconds: 0,
+    }
+    expect(text(leasePayload(lease))).toBe(
+      '{"scope":"world:7","token":2,"owner":"compactor-1","leaseExpiresAt":1700000060}',
+    )
+    expect(text(releasedPayload('world:7', 2n))).toBe('{"scope":"world:7","token":2}')
+    expect(decodeLease('world:7', leasePayload(lease))).toEqual({kind: 'held', lease})
+    expect(decodeLease('world:7', releasedPayload('world:7', 2n))).toEqual({
+      kind: 'released',
+      scope: 'world:7',
+      token: 2n,
+    })
+    const halfHeld = new TextEncoder().encode('{"scope":"world:7","token":2,"owner":"a"}')
+    expect(code(() => decodeLease('world:7', halfHeld))).toBe('invalidRecord')
+    expect(code(() => decodeLease('other', leasePayload(lease)))).toBe('invalidRecord')
+  })
+
+  test("a manifest round-trips, and its digest is its payload's hash", async () => {
+    const manifest = {scope: 'world:7', checkpoint: 4n, chunks: ['a'.repeat(64)]}
+    const payload = manifestPayload(manifest)
+    expect(new TextDecoder().decode(payload)).toBe(
+      `{"scope":"world:7","checkpoint":4,"chunks":["${'a'.repeat(64)}"]}`,
+    )
+    expect(decodeManifest('world:7', payload)).toEqual(manifest)
+    const gone = await manifestGone(manifest, 2n)
+    expect([gone.checkpoint, gone.chunkCount, gone.after, gone.resumeAfter]).toEqual([
+      4n,
+      1,
+      2n,
+      4n,
+    ])
+    expect(JournalGoneError.HTTP_STATUS).toBe(410)
+    for (const bad of [
+      '{"scope":"world:7","checkpoint":0,"chunks":["aa"]}',
+      '{"scope":"world:7","checkpoint":4,"chunks":[]}',
+      '{"scope":"world:7","checkpoint":4,"chunks":["AB"]}',
+      `{"scope":"x","checkpoint":4,"chunks":["${'a'.repeat(64)}"]}`,
+    ]) {
+      expect({
+        bad,
+        code: code(() => decodeManifest('world:7', new TextEncoder().encode(bad))),
+      }).toEqual({
+        bad,
+        code: 'invalidRecord',
+      })
+    }
+  })
+
+  test('a chunk embeds the stored rows, decodes back, and resumes to the same bytes', () => {
+    const builder = new ChunkBuilder('world:7', 0, 1n)
+    for (const position of [1n, 2n, 3n]) {
+      expect(builder.push(padded(position, 1))).toBeNull()
+    }
+    const chunk = builder.build()
+    const written = text(chunk.payload)
+    expect(
+      written.startsWith(
+        '{"scope":"world:7","index":0,"from":1,"through":3,"rows":[{"scope":"world:7","position":1,',
+      ),
+    ).toBe(true)
+    expect(decodeChunk('world:7', chunk.payload).rows.map((row) => row.position)).toEqual([
+      1n,
+      2n,
+      3n,
+    ])
+    expect(ChunkBuilder.resume('world:7', chunk.payload).build()).toEqual(chunk)
+
+    const lying = new TextEncoder().encode(written.replace('"through":3', '"through":4'))
+    expect(code(() => decodeChunk('world:7', lying))).toBe('invalidRecord')
+    const gapped = new ChunkBuilder('world:7', 0, 1n)
+    gapped.push(padded(1n, 1))
+    expect(code(() => gapped.push(padded(3n, 1)))).toBe('invalidJournal')
+  })
+
+  test('chunks close at the row cap and at the byte cap', () => {
+    const rows = new ChunkBuilder('world:7', 0, 1n)
+    const closed = []
+    for (let position = 1n; position <= BigInt(MAX_CHUNK_ROWS) + 1n; position++) {
+      const chunk = rows.push(padded(position, 1))
+      if (chunk !== null) {
+        closed.push(chunk)
+      }
+    }
+    expect(closed.map((chunk) => [chunk.from, chunk.through])).toEqual([
+      [1n, BigInt(MAX_CHUNK_ROWS)],
+    ])
+
+    // Rows of about 133,000 bytes (the payload is base64): two fit, the third closes the chunk.
+    const bytes = new ChunkBuilder('world:7', 0, 1n)
+    expect(bytes.push(padded(1n, 100_000))).toBeNull()
+    expect(bytes.push(padded(2n, 100_000))).toBeNull()
+    const full = bytes.push(padded(3n, 100_000))
+    expect(full && [full.from, full.through]).toEqual([1n, 2n])
+    expect(full!.payload.length).toBeLessThanOrEqual(MAX_CHUNK_BYTES)
+
+    // A row near the journal's largest cap fits a chunk alone.
+    const widest = padded(1n, 277_000)
+    const size = rowSize('world:7', 1n, widest.event)
+    expect(size).toBeGreaterThanOrEqual(369_000)
+    expect(size).toBeLessThanOrEqual(MAX_ROW_BYTES)
+    const alone = new ChunkBuilder('world:7', 0, 1n)
+    alone.push(widest)
+    expect(alone.build().payload.length).toBeLessThanOrEqual(MAX_CHUNK_BYTES)
+  })
+})
+
+describe('epoch-checked reads', () => {
+  test('refuse an odd generation, and serve a settled one', async () => {
+    const memory = new MemRepository()
+    const repository = new JournalRepository(
+      memory,
+      new Journal(['account'], (stored) => [`account:${stored.entityId}`]),
+    )
+    await repository.commit({entityId: 'a', events: [opened('a')]})
+    expect(await highWatermarkAtEpoch(memory, 'account:a')).toBe(1n)
+    expect((await pageAtEpoch(memory, 'account:a', 0n, 10)).rows).toHaveLength(1)
+
+    controlFixtures(memory).setRebuild({generation: 1n, lock: 'held'})
+    await expect(pageAtEpoch(memory, 'account:a', 0n, 10)).rejects.toBeInstanceOf(
+      RebuildUnavailableError,
+    )
+    await expect(highWatermarkAtEpoch(memory, 'account:a')).rejects.toBeInstanceOf(
+      RebuildUnavailableError,
+    )
   })
 })
