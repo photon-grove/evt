@@ -283,6 +283,12 @@ of `AbortSignal`, which the DOM library, `@types/node`, and Bun's and Deno's typ
   and reads it back with `outcome()`, strongly consistent. `FaultRepository` in
   `@photon-grove/evt/testing` makes a commit apply and then fail, or fail without applying, to
   test recovery.
+- **Commit receipts.** The events `execute`, `executeWithOutcome`, `executeTransaction` and a
+  transaction's `commit` hand back are the events as the repository stored them, from its
+  receipt, by entity ID bytes then sequence. A repository that rewrites events as it commits
+  implements `commitWithReceipt` and `commitTransactionWithReceipt`, and a wrapper must forward
+  them. The root helpers of the same names call them, or commit and return the commit's own events
+  for a repository without them, as every backend here is.
 - **Sequences** are `bigint`s, because Go and Rust store them as 64-bit integers.
 
 Errors are `EvtError`s with a `code`. `isConflict` and `isRetryable` tell them apart.

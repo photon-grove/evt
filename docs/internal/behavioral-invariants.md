@@ -837,7 +837,10 @@ declaration; `evt-doctor migrate-heads` refuses it as well). The stored shapes a
   `JournalRepository` overrides both to return the attempt that committed, allocations included.
   `Executed::events`, `CommandOutcome::events` and `Transaction::commit` hand back those events, so
   every returned allocation equals the row a `page` read finds at that position. Wrappers must
-  forward both methods. A replayed or recovered outcome returns no events.
+  forward both methods. A replayed or recovered outcome returns no events. TypeScript has the same
+  contract as optional `commitWithReceipt` / `commitTransactionWithReceipt` repository methods,
+  with the defaults in the root helpers of the same names; its store, transactions and outcome
+  paths hand back the receipt's events.
 - **Rows and counters commit with the events.** Journal rows come from a history-dependent
   commit-wide projector: owned by the event's stream, written only if absent, owner never changes.
   Counters (the highest position per scope) are shared by every stream of a scope, so they are

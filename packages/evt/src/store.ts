@@ -54,6 +54,7 @@ import {
   type Repository,
   type TransactionalRepository,
   checkNotReserved,
+  commitWithReceipt,
 } from './repository.js'
 import {
   DEFAULT_RETRY_POLICY,
@@ -281,9 +282,13 @@ export class Store {
       metadata,
     )
     await this.#declareHistory(options)
-    await this.repository.commit({entityId, events, snapshot, projections, views}, options)
+    const receipt = await commitWithReceipt(
+      this.repository,
+      {entityId, events, snapshot, projections, views},
+      options,
+    )
 
-    return {kind: 'committed', state, events}
+    return {kind: 'committed', state, events: [...receipt.events]}
   }
 
   /**
@@ -678,13 +683,8 @@ export class Store {
     }
 
     try {
-      const outcome = await recordCommit(
-        repository,
-        pending,
-        config,
-        commit.outcome!,
-        commit.events,
-        () => repository.commit(commit, options),
+      const outcome = await recordCommit(repository, pending, config, commit.outcome!, () =>
+        commitWithReceipt(repository, commit, options),
       )
       return {kind: 'done', outcome}
     } catch (error) {

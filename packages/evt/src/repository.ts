@@ -115,6 +115,15 @@ export interface Repository {
   commit(commit: Commit, options?: CallOptions): Promise<void>
 
   /**
+   * Commits like {@link commit}, and resolves to the events as stored ({@link CommitReceipt}). A
+   * repository that stores events exactly as given, as every backend this package ships does,
+   * leaves it out, and {@link commitWithReceipt} returns the commit's own events. One that rewrites
+   * events as it commits, such as a journal's, implements it. A wrapper must forward it, or its
+   * callers get the events as they were built.
+   */
+  commitWithReceipt?(commit: Commit, options?: CallOptions): Promise<CommitReceipt>
+
+  /**
    * Whether it writes a commit's view operations. A store refuses commit-wide projectors on a
    * repository that doesn't say so, which would drop their rows.
    */
@@ -238,6 +247,75 @@ export interface TransactionCommit {
 export interface TransactionalRepository extends Repository {
   /** Appends to every stream and checks every fence atomically. */
   commitTransaction(transaction: TransactionCommit, options?: CallOptions): Promise<void>
+
+  /**
+   * Commits like {@link commitTransaction}, and resolves to the events as stored, in persisted
+   * order ({@link CommitReceipt}). Leaving it out and the forwarding rule are as for
+   * {@link Repository.commitWithReceipt}; {@link commitTransactionWithReceipt} supplies the
+   * default.
+   */
+  commitTransactionWithReceipt?(
+    transaction: TransactionCommit,
+    options?: CallOptions,
+  ): Promise<CommitReceipt>
+}
+
+/**
+ * What a repository stored for one commit: its events exactly as they were written, which can
+ * differ from the events the commit was built with. A journal writes each event's allocations into
+ * its metadata as it commits, so only the receipt carries them.
+ *
+ * The events are in the order the commit persists them: by entity ID bytes, then sequence. A
+ * commit that writes no event (an outcome-only commit, a fence-only transaction) has none. The
+ * store hands back the same events as the result of `execute`, of a command outcome, and of a
+ * transaction's commit.
+ */
+export interface CommitReceipt {
+  /** The committed events, as stored. */
+  readonly events: readonly SerializedEvent[]
+}
+
+/**
+ * Commits through `repository` and resolves to the events as stored: through its own
+ * {@link Repository.commitWithReceipt} when it has one, and otherwise by committing and returning
+ * the commit's own events.
+ */
+export async function commitWithReceipt(
+  repository: Repository,
+  commit: Commit,
+  options?: CallOptions,
+): Promise<CommitReceipt> {
+  if (typeof repository.commitWithReceipt === 'function') {
+    return repository.commitWithReceipt(commit, options)
+  }
+
+  const events = [...commit.events]
+  await repository.commit(commit, options)
+
+  return {events}
+}
+
+/**
+ * Commits a transaction through `repository` and resolves to the events as stored, in persisted
+ * order: through its own {@link TransactionalRepository.commitTransactionWithReceipt} when it has
+ * one, and otherwise by committing and returning the transaction's own events, its streams by
+ * entity ID bytes.
+ */
+export async function commitTransactionWithReceipt(
+  repository: TransactionalRepository,
+  transaction: TransactionCommit,
+  options?: CallOptions,
+): Promise<CommitReceipt> {
+  if (typeof repository.commitTransactionWithReceipt === 'function') {
+    return repository.commitTransactionWithReceipt(transaction, options)
+  }
+
+  const streams = transaction.streams.filter((stream) => stream.events.length > 0)
+  streams.sort(byId)
+  const events = streams.flatMap((stream) => stream.events)
+  await repository.commitTransaction(transaction, options)
+
+  return {events}
 }
 
 /**

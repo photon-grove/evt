@@ -4,12 +4,22 @@
 import {EvtError, IndeterminateError} from '../errors.js'
 import type {SerializedEvent, SerializedSnapshot} from '../event.js'
 import type {Outcome} from '../outcome.js'
-import type {CallOptions, Commit, OutcomeRepository, TransactionCommit} from '../repository.js'
+import {
+  type CallOptions,
+  type Commit,
+  type CommitReceipt,
+  type OutcomeRepository,
+  type Repository,
+  type TransactionCommit,
+  type TransactionalRepository,
+  commitTransactionWithReceipt,
+  commitWithReceipt,
+} from '../repository.js'
 
 /**
  * Wraps an {@link OutcomeRepository} and lets a test intercept its next commit (`commit` or
- * `commitTransaction`): {@link applyThenFail} applies it and then throws an
- * {@link IndeterminateError}, and {@link failWithoutApplying} drops it and throws one. Each arms
+ * `commitTransaction`, or either with a receipt): {@link applyThenFail} applies it and then throws
+ * an {@link IndeterminateError}, and {@link failWithoutApplying} drops it and throws one. Each arms
  * one commit and disarms itself. Everything else, the outcome read included, is the wrapped
  * repository's.
  */
@@ -53,8 +63,37 @@ export class FaultRepository implements OutcomeRepository {
     return this.#intercept(() => this.inner.commit(commit, options))
   }
 
+  /**
+   * Forwards to the wrapped repository's own receipt method. When it has none, the commit goes
+   * through {@link commit}, so a subclass that overrides only `commit` still sees the store's
+   * commits. Over a repository with receipt methods, such as a journal's, the store commits through
+   * them alone: a subclass that intercepts commits must override them too.
+   */
+  commitWithReceipt(commit: Commit, options?: CallOptions): Promise<CommitReceipt> {
+    if (typeof this.inner.commitWithReceipt !== 'function') {
+      return commitWithReceipt({commit: (c, o) => this.commit(c, o)} as Repository, commit, options)
+    }
+
+    return this.#intercept(() => commitWithReceipt(this.inner, commit, options))
+  }
+
   commitTransaction(transaction: TransactionCommit, options?: CallOptions): Promise<void> {
     return this.#intercept(() => this.inner.commitTransaction(transaction, options))
+  }
+
+  /** Forwards like {@link commitWithReceipt}, through {@link commitTransaction} as its fallback. */
+  commitTransactionWithReceipt(
+    transaction: TransactionCommit,
+    options?: CallOptions,
+  ): Promise<CommitReceipt> {
+    if (typeof this.inner.commitTransactionWithReceipt !== 'function') {
+      const through = {
+        commitTransaction: (t: TransactionCommit, o?: CallOptions) => this.commitTransaction(t, o),
+      }
+      return commitTransactionWithReceipt(through as TransactionalRepository, transaction, options)
+    }
+
+    return this.#intercept(() => commitTransactionWithReceipt(this.inner, transaction, options))
   }
 
   writesViews(): boolean {
@@ -93,7 +132,7 @@ export class FaultRepository implements OutcomeRepository {
     return this.inner.compactBelow(entityId, through, options)
   }
 
-  async #intercept(write: () => Promise<void>): Promise<void> {
+  async #intercept<T>(write: () => Promise<T>): Promise<T> {
     const fault = this.#fault
     if (fault === null) {
       return write()
