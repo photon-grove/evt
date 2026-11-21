@@ -81,14 +81,17 @@ export interface RebuildFixture {
   /** The generation counter: odd while a rebuild holds the store or after a force-release. */
   generation: bigint
   /**
-   * The lock row: a rebuild's lease (owner `conformance`, five minutes), the item a force-release
-   * leaves in its place, or none. A commit is refused while either exists, and while the
-   * generation is odd.
+   * The lock row: a rebuild's lease (owner `conformance`, five minutes on the repository's clock),
+   * the item a force-release leaves in its place (which flags the generation), or none. A commit
+   * is refused while a lease is held and while the generation is odd.
    */
   lock: 'held' | 'forceReleased' | null
 }
 
-/** @deprecated The fence's fixture rows: use {@link RebuildFixture}. */
+/**
+ * @deprecated The fence's fixture rows, renamed {@link RebuildFixture}. The package root's
+ * `RebuildState` is the fence's state, a different type.
+ */
 export type RebuildState = RebuildFixture
 
 /** Options of a {@link MemRepository}. */
@@ -106,6 +109,7 @@ interface Controls {
 // Read a repository's private state, for the fixtures. The class's static block sets them.
 let streamsOf: (repo: MemRepository) => Map<string, Stream>
 let controlsOf: (repo: MemRepository) => Controls
+let clockOf: (repo: MemRepository) => () => number
 
 /**
  * An in-memory {@link Repository}. Every call copies what it stores and what it returns, so a
@@ -575,6 +579,7 @@ export class MemRepository implements OutcomeRepository, StoreInitializer, Event
   static {
     streamsOf = (repo) => repo.#streams
     controlsOf = (repo) => repo.#controls
+    clockOf = (repo) => repo.#clock
   }
 
   // Refuses a write to a store whose manifest declares an unsupported pair, and declares
@@ -788,7 +793,7 @@ export function controlFixtures(repo: MemRepository): ControlFixtures {
         generation: {value, forceReleased: state.lock === 'forceReleased'},
         lock:
           state.lock === 'held'
-            ? {owner: 'conformance', generation: value, leaseExpiresAt: fenceNow(Date.now) + 300}
+            ? {owner: 'conformance', generation: value, leaseExpiresAt: fenceNow(clockOf(repo)) + 300}
             : null,
       }
     },

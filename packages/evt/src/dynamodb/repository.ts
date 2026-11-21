@@ -134,8 +134,8 @@ export interface DynamoRepositoryOptions {
    */
   retention?: Readonly<Record<string, number>> | ReadonlyMap<string, number>
   /**
-   * The clock that stamps `ttl`s and decides which have passed, in Unix milliseconds as
-   * `Date.now` gives them, never seconds. `Date.now` by default.
+   * The clock that stamps `ttl`s and decides which have passed, and that rebuild leases expire by,
+   * in Unix milliseconds as `Date.now` gives them, never seconds. `Date.now` by default.
    */
   clock?: () => number
   /**

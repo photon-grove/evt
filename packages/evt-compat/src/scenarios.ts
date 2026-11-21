@@ -221,6 +221,11 @@ export function viewRows(repository: MemRepository, scenario: JsonValue, base: s
 }
 
 /** The view partitions a scenario writes, by bytes: its steps' views' and the ledger's. */
+// Whether a step is a rebuild's guarded write.
+function rebuildWrites(step: JsonValue): boolean {
+  return str(field(step, 'op')) === 'rebuild' && optionalString(step, 'action') === 'writeViews'
+}
+
 export function viewPartitions(scenario: JsonValue, base: string): string[] {
   const partitions = new Set<string>()
   for (const step of list(field(scenario, 'steps'))) {
@@ -235,7 +240,7 @@ export function viewPartitions(scenario: JsonValue, base: string): string[] {
   }
   // A rebuild's guarded writes go to the scenario's rebuild partition.
   const steps = list(field(scenario, 'steps'))
-  if (steps.some((step) => str(field(step, 'op')) === 'rebuild')) {
+  if (steps.some(rebuildWrites)) {
     partitions.add(`rebuild-${base}`)
   }
 

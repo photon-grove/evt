@@ -7,6 +7,7 @@ import {
   RebuildBeginIndeterminateError,
   RebuildConflictError,
   RebuildEpochChangedError,
+  RebuildLeaseLostError,
   RebuildLockHeldError,
   RebuildStateInvalidError,
   RebuildUnavailableError,
@@ -14,6 +15,8 @@ import {
   isRetryable,
 } from '../src/errors.ts'
 import {MemRepository} from '../src/memory/repository.ts'
+import type {PgClient, PgResult} from '../src/postgres/client.ts'
+import {PgRepository} from '../src/postgres/repository.ts'
 import {type ProjectedView, putView} from '../src/projection.ts'
 import {
   type RebuildState,
@@ -182,5 +185,138 @@ describe('DynamoRepository rebuild begin', () => {
     const repo = new DynamoRepository(fake, 'events', {consistentRead: false})
     expect(await repo.rebuildGeneration()).toEqual({value: 3n, forceReleased: true})
     expect(reads[0]).toMatchObject({ConsistentRead: true})
+  })
+})
+
+// A DynamoDB client whose transactions are cancelled with `codes`, and whose generation is `value`.
+function cancelling(codes: string[] | null, value = '5'): {fake: DynamoClient; sent: number[]} {
+  const sent: number[] = []
+  const fake: DynamoClient = {
+    getItem: async () => ({Item: {value: {N: value}} as Item}),
+    putItem: () => Promise.reject(new Error('unexpected putItem')),
+    query: () => Promise.reject(new Error('unexpected query')),
+    scan: () => Promise.reject(new Error('unexpected scan')),
+    async transactWriteItems(input) {
+      sent.push(input.TransactItems.length)
+      if (codes !== null) {
+        throw Object.assign(new Error('cancelled'), {
+          name: 'TransactionCanceledException',
+          CancellationReasons: codes.map((Code) => ({Code})),
+          $metadata: {httpStatusCode: 400},
+        })
+      }
+      return {}
+    },
+  }
+
+  return {fake, sent}
+}
+
+const BATCH: ProjectedView[] = [view(0), view(1)]
+const LEASE = {owner: 'job', generation: 5n, leaseExpiresAt: 0}
+
+// What a guarded write of the batch rejects with when DynamoDB cancels it with `codes`.
+function guarded(codes: string[]): Promise<unknown> {
+  return new DynamoRepository(cancelling(codes).fake, 'events', {viewsTable: 'views'})
+    .writeRebuildViews(LEASE, BATCH)
+    .catch((error: unknown) => error)
+}
+
+describe('DynamoRepository rebuild failures', () => {
+  test('a lost lease outranks every view failure of a guarded write', async () => {
+    expect(
+      await guarded(['ConditionalCheckFailed', 'None', 'ConditionalCheckFailed']),
+    ).toBeInstanceOf(RebuildLeaseLostError)
+    expect(await guarded(['None', 'ConditionalCheckFailed', 'None'])).toMatchObject({
+      code: 'projectorOperation',
+      operation: 1,
+      reason: 'ConditionalCheckFailed',
+    })
+    expect(await guarded(['None', 'None', 'TransactionConflict'])).toBeInstanceOf(TransientError)
+  })
+
+  test('an end or a force-release that finds another lease reports it lost', async () => {
+    const ended = cancelling(['ConditionalCheckFailed', 'None'])
+    await expect(
+      new DynamoRepository(ended.fake, 'events').endRebuild(LEASE),
+    ).rejects.toBeInstanceOf(RebuildLeaseLostError)
+
+    // A settled generation has no lease to release: nothing is sent.
+    const settled = cancelling(null, '4')
+    const released = new DynamoRepository(settled.fake, 'events').forceReleaseRebuild('job')
+    await expect(released).rejects.toBeInstanceOf(RebuildLeaseLostError)
+    expect(settled.sent).toEqual([])
+  })
+})
+
+// A PostgreSQL client over the fence rows, which fails statements as `fail` decides and records
+// every statement.
+function pgFence(
+  fail: (text: string, index: number) => unknown,
+  rows: Record<string, PgRow[]> = {},
+) {
+  const log: string[] = []
+  const query = async (text: string): Promise<PgResult> => {
+    log.push(text)
+    const failure = fail(text, log.length)
+    if (failure !== undefined) {
+      throw failure
+    }
+    for (const [prefix, result] of Object.entries(rows)) {
+      if (text.startsWith(prefix)) {
+        return {rows: result}
+      }
+    }
+    return {rows: text.includes('RETURNING 1') ? [{}] : []}
+  }
+  const pg: PgClient = {query, connect: async () => ({query, release: () => undefined})}
+
+  return {client: pg, log}
+}
+
+type PgRow = Record<string, unknown>
+
+describe('PgRepository rebuild failures', () => {
+  test('reads again when its rows moved, and reports an unknown COMMIT as indeterminate', async () => {
+    let lost = true
+    const moved = pgFence((text) => {
+      if (text.startsWith('INSERT INTO evt_events__evt_rebuild_lock') && lost) {
+        lost = false
+        return Object.assign(new Error('duplicate key'), {code: '23505'})
+      }
+      return undefined
+    })
+    const repo = new PgRepository(moved.client, {clock: () => NOW * 1000})
+    expect(await repo.beginRebuild('job', 60_000)).toEqual({
+      owner: 'job',
+      generation: 1n,
+      leaseExpiresAt: NOW + 60,
+    })
+    expect(moved.log.filter((text) => text === 'ROLLBACK')).toHaveLength(1)
+    expect(moved.log.at(-1)).toBe('COMMIT')
+
+    const dropped = pgFence((text) =>
+      text === 'COMMIT' ? new Error('connection reset') : undefined,
+    )
+    const indeterminate = await new PgRepository(dropped.client, {clock: () => NOW * 1000})
+      .beginRebuild('job', 60_000)
+      .catch((error: unknown) => error)
+    expect(indeterminate).toBeInstanceOf(RebuildBeginIndeterminateError)
+    expect(indeterminate).toMatchObject({observed: 0n, lease: {generation: 1n}})
+  })
+
+  test('a release or a guarded write without the lease is refused and rolled back', async () => {
+    const settled = pgFence(() => undefined, {
+      'SELECT value::text': [{value: '4', force_released: 'false'}],
+    })
+    const repo = new PgRepository(settled.client, {viewWriter: () => ({sql: 'SELECT 1'})})
+    await expect(repo.endRebuild(LEASE)).rejects.toBeInstanceOf(RebuildLeaseLostError)
+    await expect(repo.forceReleaseRebuild('job')).rejects.toBeInstanceOf(RebuildLeaseLostError)
+    expect(settled.log.filter((text) => text.startsWith('DELETE'))).toEqual([])
+
+    // No lock row: the batch never runs.
+    await expect(repo.writeRebuildViews(LEASE, BATCH)).rejects.toBeInstanceOf(RebuildLeaseLostError)
+    expect(settled.log).not.toContain('SELECT 1')
+    expect(settled.log.at(-1)).toBe('ROLLBACK')
   })
 })
