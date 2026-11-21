@@ -32,6 +32,8 @@ import {
   type Transaction,
   type TransactionCommit,
   type TransactionalRepository,
+  commitTransactionWithReceipt,
+  commitWithReceipt,
   defaultDigest,
   deleteView,
   emptyMetadata,
@@ -557,6 +559,15 @@ export class Runner {
       repository.commitTransaction = async (transaction, options) => {
         await interfere(transaction.outcome)
         return inner.commitTransaction(transaction, options)
+      }
+      // The store commits through the receipt methods, which must interfere as well.
+      repository.commitWithReceipt = async (commit, options) => {
+        await interfere(commit.outcome)
+        return commitWithReceipt(inner, commit, options)
+      }
+      repository.commitTransactionWithReceipt = async (transaction, options) => {
+        await interfere(transaction.outcome)
+        return commitTransactionWithReceipt(inner, transaction, options)
       }
     }
 

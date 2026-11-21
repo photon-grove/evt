@@ -34,7 +34,13 @@ import {
   staleVersionRejection,
   storedOutcome,
 } from './outcome.js'
-import {type CallOptions, type OutcomeRepository, checkNotReserved} from './repository.js'
+import {
+  type CallOptions,
+  type CommitReceipt,
+  type OutcomeRepository,
+  checkNotReserved,
+  commitTransactionWithReceipt,
+} from './repository.js'
 import {
   DEFAULT_RETRY_POLICY,
   type RetryPolicy,
@@ -264,19 +270,20 @@ export function replayed(outcome: Outcome): CommandOutcome {
 
 /**
  * Commits `write`, which carries the command's `outcome`, and settles the result: the outcome as
- * stored with the commit's `events`, or, when the commit failed in a way its row can answer, the
- * stored outcome.
+ * stored with the events its receipt carries, or, when the commit failed in a way its row can
+ * answer, the stored outcome. A receipt keeps the commit's event IDs and their order (a journal
+ * rewrites only metadata), so the returned outcome lists the IDs the stored row does.
  */
 export async function recordCommit(
   repository: OutcomeRepository,
   pending: PendingCommand,
   config: OutcomeConfig,
   outcome: Outcome,
-  events: readonly SerializedEvent[],
-  write: () => Promise<void>,
+  write: () => Promise<CommitReceipt>,
 ): Promise<CommandOutcome> {
+  let events: readonly SerializedEvent[]
   try {
-    await write()
+    ;({events} = await write())
   } catch (error) {
     return replayed(await settle(repository, pending, config, error))
   }
@@ -304,8 +311,8 @@ export async function persistRejection(
 ): Promise<CommandOutcome> {
   const outcome = rejectedOutcome(pending, rejection)
 
-  return recordCommit(repository, pending, config, outcome, [], () =>
-    repository.commitTransaction({streams: [], fences: [], outcome}, options),
+  return recordCommit(repository, pending, config, outcome, () =>
+    commitTransactionWithReceipt(repository, {streams: [], fences: [], outcome}, options),
   )
 }
 

@@ -146,6 +146,7 @@ export {
 export {
   type CallOptions,
   type Commit,
+  type CommitReceipt,
   type NewSnapshot,
   type NormalizedTransaction,
   type OutcomeRepository,
@@ -156,6 +157,8 @@ export {
   type TransactionCommit,
   type TransactionalRepository,
   commitAsTransaction,
+  commitTransactionWithReceipt,
+  commitWithReceipt,
   isReserved,
   normalizeTransaction,
 } from './repository.js'
