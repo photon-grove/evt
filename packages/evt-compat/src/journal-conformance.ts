@@ -164,12 +164,14 @@ export async function journalConformance(checks: Checks, target: JournalTarget):
  */
 export async function journalStoreCases(
   checks: Checks,
-  fresh: () => {repo: JournalBackend; manifest(): Promise<FeatureManifest | null>},
+  fresh: () =>
+    | {repo: JournalBackend; manifest(): Promise<FeatureManifest | null>}
+    | Promise<{repo: JournalBackend; manifest(): Promise<FeatureManifest | null>}>,
 ): Promise<void> {
   await checks.case(
     'journal: a commit to an uninitialized strict store declares nothing',
     async () => {
-      const {repo, manifest} = fresh()
+      const {repo, manifest} = await fresh()
       const ns = namespace()
       const stream = new Stream(ns, 'a', 'ledger')
       const lagging = new Lagging(repo, 0)
@@ -187,7 +189,7 @@ export async function journalStoreCases(
   await checks.case(
     'journal: a commit to an unmigrated store retracts every declaration',
     async () => {
-      const {repo, manifest} = fresh()
+      const {repo, manifest} = await fresh()
       const ns = namespace()
       const stream = new Stream(ns, 'a', 'ledger')
       const lagging = new Lagging(repo, 0)
