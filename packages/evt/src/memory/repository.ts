@@ -12,6 +12,7 @@ import {
   OutcomeConflictError,
   ProjectorOperationError,
   RebuildInProgressError,
+  RebuildUnavailableError,
   SequenceGapError,
   StreamHeadDriftError,
   StreamHeadsNotMigratedError,
@@ -24,6 +25,8 @@ import {
   checkSupported,
   checkWritable,
   declaresStreamHeads,
+  JOURNAL_COMPACTION_FEATURE,
+  JOURNAL_COMPACTION_VERSION,
   JOURNAL_MARKER,
   checkJournalWriter,
   type JournalMarker,
@@ -34,10 +37,19 @@ import {
   missingHistoryDependent,
   withHistoryDependent,
   withJournal,
+  withJournalCompaction,
   withStreamHeads,
   withoutJournal,
 } from '../features.js'
 import {int64Argument} from '../fields.js'
+import {
+  type CompactionWrite,
+  type CompactionWritten,
+  checkCompactionWrites,
+  compactionPartitionKey,
+  meets,
+  writeKey,
+} from '../journal/compaction.js'
 import {type JournalRow, journalRowFromView, readCounter} from '../journal/row.js'
 import {
   COUNTER_SORT_KEY,
@@ -74,6 +86,12 @@ interface Stream {
   snapshot: SerializedSnapshot | null
   /** The highest event sequence ever committed to the stream, 0 while it has none. */
   head: bigint
+}
+
+/** Options for a {@link MemRepository}. */
+export interface MemRepositoryOptions {
+  /** The clock, in Unix milliseconds, of journal compaction's leases and audits. `Date.now`. */
+  readonly clock?: (() => number) | undefined
 }
 
 /** The state of the rebuild fence's two rows that a commit's lock check reads. */
@@ -117,6 +135,12 @@ export class MemRepository implements OutcomeRepository, StoreInitializer {
   readonly #outcomes = new Map<string, Item>()
   // The commit-wide view rows, by pk and then sk.
   readonly #views = new Map<string, Map<string, ViewRow>>()
+  // The clock, in Unix milliseconds, that journal compaction leases and audits read.
+  readonly #clock: () => number
+
+  constructor(options: MemRepositoryOptions = {}) {
+    this.#clock = options.clock ?? Date.now
+  }
 
   async initialize(options?: CallOptions): Promise<boolean> {
     options?.signal?.throwIfAborted()
@@ -496,6 +520,86 @@ export class MemRepository implements OutcomeRepository, StoreInitializer {
         this.#controls.manifest = withoutJournal(this.#controls.manifest, declared)
       }
     },
+    checkCompactionMarker: async (options) => {
+      options?.signal?.throwIfAborted()
+      checkSupported(this.#controls.manifest, true)
+    },
+    declareCompaction: async (options) => {
+      options?.signal?.throwIfAborted()
+      const {manifest} = this.#controls
+      checkSupported(manifest, true)
+      if (manifest?.features.get(JOURNAL_COMPACTION_FEATURE) !== JOURNAL_COMPACTION_VERSION) {
+        this.#controls.manifest = withJournalCompaction(manifest)
+      }
+    },
+  }
+
+  /** A row of a scope's journal compaction partition, or null. */
+  async readCompactionRow(
+    scope: string,
+    sortKey: string,
+    options?: CallOptions,
+  ): Promise<ViewRow | null> {
+    options?.signal?.throwIfAborted()
+
+    return this.view(compactionPartitionKey(scope), sortKey)
+  }
+
+  /**
+   * One journal compaction transaction: every write's expectation (a delete's owner) against the
+   * rows as they are, and the rebuild epoch, then the writes, or nothing.
+   */
+  async writeCompaction(
+    epoch: bigint | null,
+    writes: readonly CompactionWrite[],
+    options?: CallOptions,
+  ): Promise<CompactionWritten> {
+    options?.signal?.throwIfAborted()
+    checkCompactionWrites(writes)
+    if (epoch !== null && epoch !== this.#controls.rebuild.generation) {
+      return {kind: 'epochChanged'}
+    }
+    for (const [at, write] of writes.entries()) {
+      const {pk, sk} = writeKey(write)
+      const stored = this.#views.get(pk)?.get(sk) ?? null
+      const met =
+        write.kind === 'delete'
+          ? stored === null || stored.entityId === write.owner
+          : meets(write.expect, stored)
+      if (!met) {
+        return {kind: 'refused', at}
+      }
+    }
+    for (const write of writes) {
+      if (write.kind === 'put') {
+        const partition = this.#views.get(write.row.pk) ?? new Map<string, ViewRow>()
+        partition.set(write.row.sk, copyRow(write.row))
+        this.#views.set(write.row.pk, partition)
+      } else if (write.kind === 'delete') {
+        this.#views.get(write.pk)?.delete(write.sk)
+      }
+    }
+
+    return {kind: 'written'}
+  }
+
+  /** The clock journal compaction reads, in whole Unix seconds. */
+  compactionNow(): number {
+    return Math.floor(this.#clock() / 1000)
+  }
+
+  /**
+   * The settled rebuild generation: even, 0 for a store no rebuild ever held. An odd one is a
+   * `RebuildUnavailableError`.
+   */
+  async observeRebuildEpoch(options?: CallOptions): Promise<bigint> {
+    options?.signal?.throwIfAborted()
+    const {generation, lock} = this.#controls.rebuild
+    if (generation % 2n !== 0n) {
+      throw new RebuildUnavailableError(generation, lock === 'forceReleased')
+    }
+
+    return generation
   }
 
   static {

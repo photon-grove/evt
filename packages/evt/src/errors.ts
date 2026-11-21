@@ -78,6 +78,17 @@ import type {ProjectedView} from './projection.js'
  * - `journalRowTooLarge`: a journal row is over the configured size cap. Nothing was written.
  * - `expectedPayloadUnsupported`: the journal was asked to commit through a repository that
  *   doesn't apply the expected-payload view condition its counters need. Nothing was written.
+ * - `rebuildUnavailable`: the rebuild generation is odd, so derived state is being rebuilt or
+ *   can't be trusted. Retryable.
+ * - `rebuildEpochChanged`: the rebuild generation moved during a read or a compaction write.
+ *   Retryable.
+ * - `journalGone`: a journal page asked for rows below the scope's compaction floor: install the
+ *   snapshot it names.
+ * - `journalSnapshotMoved`: a compaction snapshot's chunk is missing or doesn't match its
+ *   manifest. Retryable: read the manifest again.
+ * - `foreignJournalRow`: a row in a journal compaction partition isn't the engine's.
+ * - `compactionLeaseHeld`: another compaction holds the scope's unexpired lease.
+ * - `compactionLeaseLost`: a compaction's lease no longer matches: it lapsed or was taken.
  */
 export type EvtErrorCode =
   | 'invalidJson'
@@ -123,6 +134,13 @@ export type EvtErrorCode =
   | 'invalidJournal'
   | 'journalRowTooLarge'
   | 'expectedPayloadUnsupported'
+  | 'rebuildUnavailable'
+  | 'rebuildEpochChanged'
+  | 'journalGone'
+  | 'journalSnapshotMoved'
+  | 'foreignJournalRow'
+  | 'compactionLeaseHeld'
+  | 'compactionLeaseLost'
 
 export class EvtError extends Error {
   override readonly name: string = 'EvtError'
@@ -357,6 +375,51 @@ export class RebuildInProgressError extends EvtError {
 
   constructor() {
     super('rebuildInProgress', 'a projection rebuild is in progress')
+  }
+}
+
+/**
+ * A reader found an odd rebuild generation: a rebuild holds the store, or a force-release left
+ * derived state untrustworthy (`forceReleased`). Retryable: read again once a rebuild has ended.
+ */
+export class RebuildUnavailableError extends EvtError {
+  override readonly name = 'RebuildUnavailableError'
+  override readonly code = 'rebuildUnavailable'
+  /** The odd generation. */
+  readonly generation: bigint
+  /** The generation was left by a force-release. */
+  readonly forceReleased: boolean
+
+  constructor(generation: bigint, forceReleased: boolean) {
+    super(
+      'rebuildUnavailable',
+      `derived state is unavailable: rebuild generation ${generation} is odd` +
+        (forceReleased ? ' (left by a force-release)' : ''),
+    )
+    this.generation = generation
+    this.forceReleased = forceReleased
+  }
+}
+
+/**
+ * The rebuild generation changed between a reader's or a writer's two reads of it: a rebuild
+ * started, finished or was taken over meanwhile. Retryable.
+ */
+export class RebuildEpochChangedError extends EvtError {
+  override readonly name = 'RebuildEpochChangedError'
+  override readonly code = 'rebuildEpochChanged'
+  /** The epoch the work was done under. */
+  readonly observed: bigint
+  /** The settled generation read afterwards. */
+  readonly current: bigint
+
+  constructor(observed: bigint, current: bigint) {
+    super(
+      'rebuildEpochChanged',
+      `the rebuild generation changed from ${observed} to ${current} during the read`,
+    )
+    this.observed = observed
+    this.current = current
   }
 }
 
@@ -813,7 +876,10 @@ export function isRetryable(error: unknown): boolean {
     (error.code === 'rebuildInProgress' ||
       error.code === 'featureManifestChanged' ||
       error.code === 'transient' ||
-      error.code === 'ambiguousWrite')
+      error.code === 'ambiguousWrite' ||
+      error.code === 'rebuildUnavailable' ||
+      error.code === 'rebuildEpochChanged' ||
+      error.code === 'journalSnapshotMoved')
   )
 }
 

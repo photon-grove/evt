@@ -515,12 +515,17 @@ describe('journal acceptance', () => {
     ).rejects.toThrow(/journal@1/)
   })
 
-  test('a journal writer still refuses a store that declares journal compaction', async () => {
+  test('a journal writer accepts journal compaction, which a store without a journal refuses', async () => {
     const memory = new MemRepository()
     const repository = new JournalRepository(memory, journal)
     await repository.commit({entityId: 'a', events: [opened('a')]})
     controlFixtures(memory).declare((draft) => draft.features.set('journal-compaction', 1))
-    await expect(repository.commit({entityId: 'b', events: [opened('b')]})).rejects.toThrow(
+    await repository.commit({entityId: 'b', events: [opened('b')]})
+
+    const plain = new MemRepository()
+    await plain.commit({entityId: 'a', events: [opened('a')]})
+    controlFixtures(plain).declare((draft) => draft.features.set('journal-compaction', 1))
+    await expect(plain.commit({entityId: 'b', events: [opened('b')]})).rejects.toThrow(
       /journal-compaction@1/,
     )
   })

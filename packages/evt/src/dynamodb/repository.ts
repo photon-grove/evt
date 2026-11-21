@@ -19,6 +19,7 @@ import {
   IndeterminateError,
   OutcomeConflictError,
   RebuildInProgressError,
+  RebuildUnavailableError,
   SequenceGapError,
   StoreNotInitializedError,
   StreamHeadDriftError,
@@ -34,6 +35,8 @@ import {
   STREAM_HEADS_VERSION,
   checkSupported,
   declaresStreamHeads,
+  JOURNAL_COMPACTION_FEATURE,
+  JOURNAL_COMPACTION_VERSION,
   JOURNAL_MARKER,
   checkJournalWriter,
   type JournalDeclared,
@@ -46,8 +49,16 @@ import {
   missingHistoryDependent,
 } from '../features.js'
 import {int64Argument} from '../fields.js'
+import {
+  type CompactionWrite,
+  type CompactionWritten,
+  type Expect,
+  checkCompactionWrites,
+  compactionPartitionKey,
+} from '../journal/compaction.js'
 import {type JournalRow, journalRowFromView, readCounter} from '../journal/row.js'
 import {
+  COUNTER_OWNER,
   COUNTER_SORT_KEY,
   counterPartitionKey,
   parseRowSortKey,
@@ -85,7 +96,8 @@ import {
 } from './item.js'
 import {FEATURES_PK, manifestFromItem, markerItem} from './marker.js'
 import {OUTCOME_SORT_KEY, outcomeFromItem, outcomeKey} from './outcome.js'
-import {viewKey, viewRowFromItem} from './view-repository.js'
+import type {ViewRow} from '../views.js'
+import {viewKey, viewRowFromItem, viewRowItem} from './view-repository.js'
 import {DYNAMODB_BACKEND, transactItemSize} from './views.js'
 import {
   type CommitTtl,
@@ -615,6 +627,27 @@ export class DynamoRepository implements OutcomeRepository, StoreInitializer {
         }
       })
     },
+    checkCompactionMarker: async (options) => {
+      checkSupported(await this.#readManifest(requestOptions(options)), true)
+    },
+    declareCompaction: async (options) => {
+      const request = requestOptions(options)
+      await this.#exclusive(async () => {
+        const result = await this.#declare((draft) => {
+          const stored = {...draft, version: 0n}
+          checkSupported(stored, true)
+          if (draft.features.get(JOURNAL_COMPACTION_FEATURE) === JOURNAL_COMPACTION_VERSION) {
+            return false
+          }
+          draft.features.set(JOURNAL_COMPACTION_FEATURE, JOURNAL_COMPACTION_VERSION)
+
+          return true
+        }, request)
+        if (result.wrote) {
+          this.#validated = null
+        }
+      })
+    },
   }
 
   // Declares the journal feature (`feature`) or the entity types history-dependent, and resolves
@@ -649,6 +682,119 @@ export class DynamoRepository implements OutcomeRepository, StoreInitializer {
     this.#validated = null
 
     return declared
+  }
+
+  /** A row of a scope's journal compaction partition, strongly consistent, or null. */
+  async readCompactionRow(
+    scope: string,
+    sk: string,
+    options?: CallOptions,
+  ): Promise<ViewRow | null> {
+    options?.signal?.throwIfAborted()
+    const output = await this.#client.getItem(
+      {
+        TableName: this.#journalTable(),
+        Key: viewKey(compactionPartitionKey(scope), sk),
+        ConsistentRead: true,
+      },
+      requestOptions(options),
+    )
+    const item = output.Item as Item | undefined
+
+    return item === undefined || Object.keys(item).length === 0 ? null : viewRowFromItem(item)
+  }
+
+  /**
+   * One journal compaction transaction: the writes in order, then, with an epoch, a check on the
+   * events table that the rebuild generation still holds it. A failed condition names the write,
+   * or the epoch check; a concurrent transaction or throttling is transient.
+   */
+  async writeCompaction(
+    epoch: bigint | null,
+    writes: readonly CompactionWrite[],
+    options?: CallOptions,
+  ): Promise<CompactionWritten> {
+    options?.signal?.throwIfAborted()
+    checkCompactionWrites(writes)
+    const table = this.#journalTable()
+    const items = writes.map((write) => compactionItem(table, write))
+    if (epoch !== null) {
+      items.push(this.#epochCheck(epoch))
+    }
+
+    try {
+      await this.#client.transactWriteItems({TransactItems: items}, requestOptions(options))
+    } catch (error) {
+      const codes = cancellationCodes(error)
+      if (codes === null) {
+        throw error
+      }
+      if (epoch !== null && codes[writes.length] === CONDITION_FAILED) {
+        return {kind: 'epochChanged'}
+      }
+      const at = codes.slice(0, writes.length).indexOf(CONDITION_FAILED)
+      if (at !== -1) {
+        return {kind: 'refused', at}
+      }
+      if (codes.some((code) => code === 'TransactionConflict' || THROTTLED.has(code))) {
+        throw new TransientError('a journal compaction write met another writer', {cause: error})
+      }
+      throw error
+    }
+
+    return {kind: 'written'}
+  }
+
+  /** The clock journal compaction reads, in whole Unix seconds. */
+  compactionNow(): number {
+    return Math.floor(this.#clock() / 1000)
+  }
+
+  /**
+   * The settled rebuild generation, read strongly consistently from the events table: even, 0
+   * with no generation item. An odd one is a `RebuildUnavailableError`.
+   */
+  async observeRebuildEpoch(options?: CallOptions): Promise<bigint> {
+    options?.signal?.throwIfAborted()
+    const output = await this.#client.getItem(
+      {TableName: this.#table, Key: controlKey(REBUILD_GENERATION_PK), ConsistentRead: true},
+      requestOptions(options),
+    )
+    const item = output.Item as Item | undefined
+    if (item === undefined || Object.keys(item).length === 0) {
+      return 0n
+    }
+    const value = item['value']
+    if (value === undefined || !('N' in value) || !/^-?\d+$/.test(value.N)) {
+      throw new EvtError('invalidRecord', 'rebuild generation: value is not a number')
+    }
+    const flag = item['forceReleased']
+    if (flag !== undefined && !('BOOL' in flag)) {
+      throw new EvtError('invalidRecord', 'rebuild generation: forceReleased is not a boolean')
+    }
+    const generation = BigInt(value.N)
+    if (generation % 2n !== 0n) {
+      throw new RebuildUnavailableError(generation, flag !== undefined && flag.BOOL === true)
+    }
+
+    return generation
+  }
+
+  // The check of a compaction write that the rebuild generation is still `epoch`'s.
+  #epochCheck(epoch: bigint): TransactItem {
+    return {
+      ConditionCheck: {
+        TableName: this.#table,
+        Key: controlKey(REBUILD_GENERATION_PK),
+        ExpressionAttributeNames: {'#value': 'value'},
+        ...(epoch === 0n
+          ? {ConditionExpression: 'attribute_not_exists(#value)'}
+          : {
+              ConditionExpression: '#value = :epoch',
+              ExpressionAttributeValues: {':epoch': {N: epoch.toString()}},
+            }),
+      },
+    }
   }
 
   // The views table the journal reads, which a journal needs.
@@ -1508,4 +1654,74 @@ function isConditionalCheckFailed(error: unknown): boolean {
 
 function isNamed(error: unknown, name: string): boolean {
   return typeof error === 'object' && error !== null && (error as {name?: unknown}).name === name
+}
+
+// The rebuild fence's generation item, on the events table.
+const REBUILD_GENERATION_PK = 'SYSTEM#REBUILD#GENERATION'
+
+// The conditions of a compaction write that expects a row: absent, or the engine's exact payload.
+const COMPACTION_ABSENT = 'attribute_not_exists(pk)'
+const COMPACTION_PAYLOAD = 'entityID = :engine AND payload = :expected'
+const COMPACTION_DELETE = 'attribute_not_exists(pk) OR entityID = :owner'
+const compactionDecoder = new TextDecoder('utf-8', {fatal: true, ignoreBOM: true})
+
+// A compaction write's condition on what it expects at its key.
+function expected(
+  expect: Expect,
+): {ConditionExpression?: string; ExpressionAttributeValues?: Item} {
+  switch (expect.kind) {
+    case 'any':
+      return {}
+    case 'absent':
+      return {ConditionExpression: COMPACTION_ABSENT}
+    case 'payload':
+      return {
+        ConditionExpression: COMPACTION_PAYLOAD,
+        ExpressionAttributeValues: {
+          ':expected': {S: payloadText(expect.payload)},
+          ':engine': {S: COUNTER_OWNER},
+        },
+      }
+  }
+}
+
+// The transaction action of one compaction write.
+function compactionItem(table: string, write: CompactionWrite): TransactItem {
+  switch (write.kind) {
+    case 'put':
+      return {Put: {TableName: table, Item: viewRowItem(write.row), ...expected(write.expect)}}
+    case 'delete':
+      return {
+        Delete: {
+          TableName: table,
+          Key: viewKey(write.pk, write.sk),
+          ConditionExpression: COMPACTION_DELETE,
+          ExpressionAttributeValues: {':owner': {S: write.owner}},
+        },
+      }
+    case 'check': {
+      const condition = expected(write.expect)
+
+      return {
+        ConditionCheck: {
+          TableName: table,
+          Key: viewKey(write.pk, write.sk),
+          // A check needs a condition; `any` checks that the key is a key.
+          ConditionExpression:
+            condition.ConditionExpression ?? 'attribute_not_exists(pk) OR attribute_exists(pk)',
+          ...(condition.ExpressionAttributeValues && {
+            ExpressionAttributeValues: condition.ExpressionAttributeValues,
+          }),
+        },
+      }
+    }
+  }
+}
+
+function payloadText(payload: Uint8Array): string {
+  try {
+    return compactionDecoder.decode(payload)
+  } catch {
+    throw new EvtError('invalidArgument', 'a compaction payload must be UTF-8')
+  }
 }

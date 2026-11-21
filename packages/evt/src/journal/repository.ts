@@ -38,10 +38,12 @@ import {
   normalizeTransaction,
 } from '../repository.js'
 import {retryDelay, sleep} from '../retry.js'
+import type {ViewRow} from '../views.js'
 import {compareUtf8} from '../utf8.js'
 import {type Journal, allocate} from './config.js'
 import {PROJECTOR_NAME, PositionTaken, journalProjector} from './projector.js'
-import {type JournalPage, type JournalStore, highWatermark, page} from './read.js'
+import {type JournalCompactionStore, readFloor} from './compaction.js'
+import {type JournalPage, highWatermark, page} from './read.js'
 import {type JournalRow, counterPayload} from './row.js'
 import {
   COUNTER_ENTITY_TYPE,
@@ -58,7 +60,7 @@ import {
  * `DynamoRepository` (with a views table) do.
  */
 export type JournalBackend = OutcomeRepository &
-  JournalStore & {readonly [JOURNAL_MARKER]: JournalMarker}
+  JournalCompactionStore & {readonly [JOURNAL_MARKER]: JournalMarker}
 
 /** Options for a {@link JournalRepository}. */
 export interface JournalRepositoryOptions {
@@ -95,7 +97,7 @@ export interface JournalRepositoryOptions {
  * is accepted but not journaled.
  */
 export class JournalRepository<R extends JournalBackend = JournalBackend>
-  implements OutcomeRepository, JournalStore
+  implements OutcomeRepository, JournalCompactionStore
 {
   /** The wrapped repository, a journal writer. Commit through the journal, not through it. */
   readonly inner: R
@@ -160,6 +162,14 @@ export class JournalRepository<R extends JournalBackend = JournalBackend>
     options?: CallOptions,
   ): Promise<JournalRow[]> {
     return this.inner.readRows(checkScope(scope), after, limit, options)
+  }
+
+  readCompactionRow(
+    scope: string,
+    sortKey: string,
+    options?: CallOptions,
+  ): Promise<ViewRow | null> {
+    return this.inner.readCompactionRow(checkScope(scope), sortKey, options)
   }
 
   async commit(commit: Commit, options?: CallOptions): Promise<void> {
@@ -333,13 +343,24 @@ export class JournalRepository<R extends JournalBackend = JournalBackend>
     const lasts = repair
       ? await Promise.all(scopes.map((scope) => this.inner.readLastPosition(scope, options)))
       : []
+    // A compacted scope's rows below its floor are gone, so neither a missing counter nor the
+    // highest row can show the positions a compaction deleted: a counter that reads 0, and every
+    // counter being repaired, allocates from the floor at least.
+    const floors = await Promise.all(
+      scopes.map((scope, index) =>
+        repair || (values[index] ?? 0n) === 0n ? readFloor(this.inner, scope, options) : 0n,
+      ),
+    )
     const stored = new Map<string, bigint>()
     const base = new Map<string, bigint>()
     for (const [index, scope] of scopes.entries()) {
       const value = values[index] ?? 0n
-      const last = lasts[index] ?? 0n
+      let from = value
+      for (const candidate of [lasts[index] ?? 0n, floors[index] ?? 0n]) {
+        from = candidate > from ? candidate : from
+      }
       stored.set(scope, value)
-      base.set(scope, last > value ? last : value)
+      base.set(scope, from)
     }
 
     return {stored, base}

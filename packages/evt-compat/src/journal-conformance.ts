@@ -396,6 +396,18 @@ class Lagging implements JournalBackend {
     },
     retractJournal: (declared: JournalDeclared, options?: CallOptions) =>
       this.inner[JOURNAL_MARKER].retractJournal(declared, options),
+    checkCompactionMarker: (options?: CallOptions) =>
+      this.inner[JOURNAL_MARKER].checkCompactionMarker(options),
+    declareCompaction: (options?: CallOptions) =>
+      this.inner[JOURNAL_MARKER].declareCompaction(options),
+  }
+
+  readCompactionRow(
+    scope: string,
+    sortKey: string,
+    options?: CallOptions,
+  ): Promise<ViewRow | null> {
+    return this.inner.readCompactionRow(scope, sortKey, options)
   }
 
   async readCounter(scope: string, options?: CallOptions): Promise<bigint> {
