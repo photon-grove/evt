@@ -835,9 +835,7 @@ transaction as the events. The byte-level rules are in the
 Rust (`photon-evt` with the `journal` cargo feature), and TypeScript (`@photon-grove/evt/journal`)
 on its in-memory and DynamoDB repositories, which holds every rule below except the rebuild's,
 whose lifecycle it doesn't have yet: its projector's seal is a module-private set of the engine's
-own projectors, and a journal writer is a handle the journal added to a module-private set. Until
-it ports compaction, a TypeScript journal writer refuses a store that declares
-`journal-compaction`, since it can't read the floor. Go
+own projectors, and a journal writer is a handle the journal added to a module-private set. Go
 does not implement the journal and
 refuses a table that declares it (`UnsupportedFeatureError` on the first commit after the
 declaration; `evt-doctor migrate-heads` refuses it as well). The stored shapes are in the
@@ -918,6 +916,10 @@ declaration; `evt-doctor migrate-heads` refuses it as well). The stored shapes a
 ## Journal compaction (X2, Rust-first)
 
 The stored shapes are in the [storage format](../reference/storage-format.md#journal-compaction).
+TypeScript holds every rule below on its in-memory and DynamoDB repositories, except the ones about
+a rebuild, whose lifecycle it doesn't have yet. Its rebuild-epoch read is the repositories'
+`observeRebuildEpoch`, and its compaction marker check and declaration accept the journal's
+features on any handle, since compaction is the journal's own.
 
 - **A snapshot before any delete.** A run stores the canonical chunks of rows `1..=checkpoint`,
   swaps the scope's manifest (the checkpoint becomes the floor) in one atomic write with the one
