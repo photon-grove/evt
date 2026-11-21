@@ -310,8 +310,8 @@ export class MemRepository implements OutcomeRepository, StoreInitializer, Event
 
   /**
    * Every entity's events, one batch per entity, entities ascending by ID bytes and events by
-   * sequence. A stream's type is its events', or its snapshot's when compaction left none. The
-   * reserved namespaces are skipped. It reads the log as it stands when each batch is taken.
+   * sequence, a stream's type being its events'. The reserved namespaces are skipped. It reads the
+   * log as it stands when each batch is taken.
    */
   async *streamAllEvents(
     filter?: StreamFilter,
@@ -323,8 +323,7 @@ export class MemRepository implements OutcomeRepository, StoreInitializer, Event
     for (const entityId of ids) {
       options?.signal?.throwIfAborted()
       const events = this.#sorted(entityId)
-      const entityType = events[0]?.entityType ?? this.#streams.get(entityId)?.snapshot?.entityType
-      if (events.length > 0 && matchesFilter(filter, entityType ?? '')) {
+      if (events.length > 0 && matchesFilter(filter, events[0]!.entityType)) {
         yield events.map(cloneEvent)
       }
     }

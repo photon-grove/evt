@@ -1150,6 +1150,8 @@ export class DynamoRepository implements OutcomeRepository, StoreInitializer, Ev
 
     let start: Item | undefined
     do {
+      // Checked between pages too, so a client that ignores the signal still stops.
+      request.abortSignal?.throwIfAborted()
       const page: Page = await this.#client.scan(
         {
           TableName: this.#table,

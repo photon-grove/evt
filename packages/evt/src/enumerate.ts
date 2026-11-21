@@ -67,8 +67,9 @@ export type EnumeratedEntity<S> =
   | {readonly ok: false; readonly entityId: string; readonly error: unknown}
 
 /**
- * Folds the log's batches into entities, from the events alone as Go's `StreamEntities` does: an
- * entity whose early events were compacted fails with a {@link SequenceGapError}. With batches by
+ * Folds the log's batches into entities, from the events alone as Rust's `stream_entities` does:
+ * an entity whose early events were compacted fails with a {@link SequenceGapError}, where Go's
+ * `StreamEntities` folds the events that are left. With batches by
  * entity it folds a batch at a time; otherwise it groups every event first, and yields entities in
  * the order the first of their events was seen.
  */
@@ -102,11 +103,13 @@ function* drain<S, C, D extends EventDefinitions>(
 ): Generator<EnumeratedEntity<S>> {
   for (const [entityId, events] of grouped) {
     grouped.delete(entityId)
+    let entity: EnumeratedEntity<S>
     try {
-      yield {ok: true, entityId, loaded: fold(aggregate, entityId, events)}
+      entity = {ok: true, entityId, loaded: fold(aggregate, entityId, events)}
     } catch (error) {
-      yield {ok: false, entityId, error}
+      entity = {ok: false, entityId, error}
     }
+    yield entity
   }
 }
 

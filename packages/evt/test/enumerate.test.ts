@@ -215,6 +215,42 @@ describe('DynamoRepository enumeration', () => {
 })
 
 describe('PgRepository enumeration', () => {
+  test('reads heads from the events and snapshots until the store declares stream-heads', async () => {
+    const sent: string[] = []
+    const client = (manifest: string | null): PgClient => ({
+      async query(text: string): Promise<PgResult> {
+        sent.push(text)
+        if (text.includes('to_regclass')) {
+          return {rows: [{}]}
+        }
+        if (text.startsWith('SELECT version::text')) {
+          return {
+            rows:
+              manifest === null
+                ? []
+                : [{version: '1', features: manifest, history_dependent: '[]', retention: '[]'}],
+          }
+        }
+        return {
+          rows: [
+            {entity_id: 'a', head: '3'},
+            {entity_id: 'b', head: '0'},
+          ],
+        }
+      },
+    })
+
+    const unmigrated = await new PgRepository(client(null)).entityHeads('ledger')
+    expect([...unmigrated]).toEqual([['a', 3n]])
+    const aggregate = sent.at(-1)!
+    expect(aggregate).toContain('UNION ALL')
+    expect(aggregate).toContain('evt_snapshots')
+    expect(aggregate).toContain('GROUP BY entity_id')
+
+    await new PgRepository(client('{"stream-heads":1}')).entityHeads()
+    expect(sent.at(-1)).toContain('FROM evt_events__evt_stream_heads')
+  })
+
   test('pages the log and yields one batch per entity, across pages', async () => {
     const rows = [
       ...Array.from({length: 499}, (_, i) => event('a', i + 1)),

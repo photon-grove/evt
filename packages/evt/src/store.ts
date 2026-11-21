@@ -242,9 +242,9 @@ export class Store {
   }
 
   /**
-   * Every entity of the aggregate's type folded from the event log alone, as Go's
-   * `StreamEntities` does, for rebuilds and diagnostics: a stream whose early events were
-   * compacted fails with a `SequenceGapError` instead of loading, which
+   * Every entity of the aggregate's type folded from the event log alone, as Rust's
+   * `stream_entities` does, for rebuilds and diagnostics: a stream whose early events were
+   * compacted fails with a `SequenceGapError` instead of loading (Go's folds what's left), which
    * {@link streamEntitiesFromSnapshots} avoids. `filter.entityType` names another type whose
    * events fold into this aggregate, after a rename say. An entity that fails to fold is yielded
    * as an error, and a backend failure rejects the iteration. The repository must enumerate its

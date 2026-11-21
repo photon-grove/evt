@@ -435,8 +435,12 @@ export class Runner {
 
   async step(step: JsonValue): Promise<Outcome> {
     const op = str(field(step, 'op'))
-    // A prefix puts the stream in a reserved namespace, which every write path refuses.
+    // A prefix puts the stream of an appendRaw or putSnapshot step in a reserved namespace, which
+    // every write path refuses. A transaction's streams carry their own.
     const prefix = optionalString(step, 'entityPrefix') ?? ''
+    if (prefix !== '' && op !== 'appendRaw' && op !== 'putSnapshot') {
+      throw new Error(`a ${op} step sets entityPrefix, which only appendRaw and putSnapshot read`)
+    }
     const id = prefix + streamId(this.entityId, optionalString(step, 'suffix') ?? '')
 
     switch (op) {
