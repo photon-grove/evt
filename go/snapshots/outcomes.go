@@ -23,6 +23,27 @@ const (
 	recoveryMaxDelay    = time.Second
 )
 
+// outcomeRowConflictWait is how long settle polls the outcome row after a DynamoDB transaction
+// conflict on the outcome put: reads at 0, 50 and 150 ms, never past the recovery wait. The
+// winner's transaction was committing when the loser was cancelled, and DynamoDB transactions
+// finish in milliseconds. A winner that fails leaves no row, so the poll stays short rather than
+// waiting out the recovery window.
+const outcomeRowConflictWait = 150 * time.Millisecond
+
+// outcomeRowCollision is implemented by a backend's commit error for a transaction cancelled while
+// another transaction was writing its outcome row (DynamoDB's TransactionConflict on the outcome
+// put). Only another attempt of the same command writes that row.
+type outcomeRowCollision interface {
+	CollidedOnOutcomeRow() bool
+}
+
+// collidedOnOutcomeRow reports whether a failed commit collided on its own outcome put.
+func collidedOnOutcomeRow(err error) bool {
+	var collision outcomeRowCollision
+
+	return errors.As(err, &collision) && collision.CollidedOnOutcomeRow()
+}
+
 // errOutcomesNeedCommand refuses a bare Commit on a store with outcomes enabled: the outcome row
 // needs the command's identity (its type, target streams, and payload), which only the
 // command-level entry points have.
@@ -901,8 +922,19 @@ func (c *command) settle(ctx context.Context, commitErr error) (*evt.CommandOutc
 	case evt.IsConflictErr(commitErr) || policy.IsTransient(commitErr):
 		// A concurrent writer of this same command may have won with its events and outcome. If a
 		// row exists, it answers the command; if not, this is an ordinary conflict (or transient
-		// refusal) to retry.
-		resolved, err := c.reread(context.WithoutCancel(ctx))
+		// refusal) to retry. A transaction conflict on the outcome put can only be such a writer,
+		// still committing, so one read right away can miss its row: poll briefly instead.
+		var (
+			resolved *evt.CommandOutcome
+			err      error
+		)
+
+		if collidedOnOutcomeRow(commitErr) {
+			resolved, err = c.poll(ctx, min(outcomeRowConflictWait, c.store.outcomes.recoveryWait))
+		} else {
+			resolved, err = c.reread(context.WithoutCancel(ctx))
+		}
+
 		if errors.Is(err, evt.ErrIdempotencyKeyReuse) || errors.Is(err, evt.ErrCorruptOutcome) {
 			return nil, err
 		}
@@ -939,36 +971,49 @@ func (c *command) recover(ctx context.Context, commitErr error) (*evt.CommandOut
 		}
 	}
 
-	// The whole recovery, including a read that hangs, ends one grace period after the window: the
-	// last poll gets recoveryMaxDelay to answer, and no per-read timeout can extend past it.
-	waitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.store.outcomes.recoveryWait+recoveryMaxDelay)
+	resolved, err := c.poll(ctx, c.store.outcomes.recoveryWait)
+	if errors.Is(err, evt.ErrIdempotencyKeyReuse) || errors.Is(err, evt.ErrCorruptOutcome) {
+		return nil, err
+	}
+
+	if err != nil {
+		return nil, retryable(errors.Join(cause, err))
+	}
+
+	if resolved == nil {
+		return nil, retryable(cause)
+	}
+
+	return resolved, nil
+}
+
+// poll reads the command's outcome row until it appears or wait has been slept through, backing
+// off from recoveryFirstDelay to recoveryMaxDelay, on a context detached from the caller's
+// cancellation. It returns nil, nil when the row is still absent, and the error of a read that
+// failed (resolved against the digest as reread does).
+func (c *command) poll(ctx context.Context, wait time.Duration) (*evt.CommandOutcome, error) {
+	// The whole poll, including a read that hangs, ends one grace period after the wait: the last
+	// read gets recoveryMaxDelay to answer, and no per-read timeout can extend past it.
+	waitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), wait+recoveryMaxDelay)
 	defer cancel()
 
 	delay, waited := recoveryFirstDelay, time.Duration(0)
 
 	for {
 		resolved, err := c.reread(waitCtx)
-		if errors.Is(err, evt.ErrIdempotencyKeyReuse) || errors.Is(err, evt.ErrCorruptOutcome) {
-			return nil, err
+		if err != nil || resolved != nil {
+			return resolved, err
 		}
 
-		if err != nil {
-			return nil, retryable(errors.Join(cause, err))
+		if waited >= wait {
+			return nil, nil
 		}
 
-		if resolved != nil {
-			return resolved, nil
-		}
-
-		if waited >= c.store.outcomes.recoveryWait {
-			return nil, retryable(cause)
-		}
-
-		step := min(delay, c.store.outcomes.recoveryWait-waited)
+		step := min(delay, wait-waited)
 
 		select {
 		case <-waitCtx.Done():
-			return nil, retryable(cause)
+			return nil, nil
 		case <-time.After(step):
 		}
 

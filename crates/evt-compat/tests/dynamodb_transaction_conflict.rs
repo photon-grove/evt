@@ -4,6 +4,9 @@
 //!   DynamoDB does when another transaction holds an item. Moto cannot race two transactions
 //!   itself. The command is unfenced, so nothing it read went stale: it must never be recorded as
 //!   a `stale-fence` rejection.
+//! - A commit that applies but whose answer is a `TransactionConflict`, as the loser of a race for
+//!   the same command ID gets once the winner landed: the store replays the winner's outcome in
+//!   the same attempt.
 //! - A commit that applies but whose response is lost. The SDK retries it with the same
 //!   `ClientRequestToken`, which DynamoDB answers as the same transaction, never as a conflict
 //!   with it.
@@ -36,6 +39,10 @@ enum Fault {
     /// Forwards the commit, so it applies, then answers a server fault as if the response were
     /// lost.
     LoseResponse,
+    /// Forwards the commit, so it applies, then answers a cancellation with `TransactionConflict`
+    /// on the given item, or on the outcome put (the last action) for `None`: the answer the
+    /// loser of a race for the same command ID gets once the winner landed.
+    ConflictAfterLanding(Option<usize>),
 }
 
 /// The proxy's state, shared with every connection it relays.
@@ -173,23 +180,12 @@ async fn relay(mut incoming: TcpStream, upstream: String, shared: Arc<Shared>) {
         }
         Some(Fault::Cancel) => {
             shared.faulted.fetch_add(1, Ordering::SeqCst);
-            let request: Value = serde_json::from_slice(body).unwrap();
-            let items = request["TransactItems"].as_array().unwrap().len();
-            let reasons: Vec<Value> = (0..items)
-                .map(|index| {
-                    if index == 1 {
-                        json!({"Code": "TransactionConflict", "Message": "Transaction is ongoing for the item"})
-                    } else {
-                        json!({"Code": "None"})
-                    }
-                })
-                .collect();
-            let answer = json!({
-                "__type": "com.amazonaws.dynamodb.v20120810#TransactionCanceledException",
-                "Message": "Transaction cancelled, please refer cancellation reasons for specific reasons",
-                "CancellationReasons": reasons,
-            });
-            respond(&mut incoming, "400 Bad Request", &answer).await;
+            respond(&mut incoming, "400 Bad Request", &conflict(body, Some(1))).await;
+        }
+        Some(Fault::ConflictAfterLanding(item)) => {
+            shared.faulted.fetch_add(1, Ordering::SeqCst);
+            forward(&headers[..header_end - 4], body, &upstream).await;
+            respond(&mut incoming, "400 Bad Request", &conflict(body, item)).await;
         }
         Some(Fault::LoseResponse) => {
             shared.faulted.fetch_add(1, Ordering::SeqCst);
@@ -201,6 +197,29 @@ async fn relay(mut incoming: TcpStream, upstream: String, shared: Arc<Shared>) {
             respond(&mut incoming, "500 Internal Server Error", &answer).await;
         }
     }
+}
+
+/// A cancellation of the commit in `body` with `TransactionConflict` on `item`, or on its last
+/// action (the outcome put) for `None`.
+fn conflict(body: &[u8], item: Option<usize>) -> Value {
+    let request: Value = serde_json::from_slice(body).unwrap();
+    let items = request["TransactItems"].as_array().unwrap().len();
+    let colliding = item.unwrap_or(items - 1);
+    let reasons: Vec<Value> = (0..items)
+        .map(|index| {
+            if index == colliding {
+                json!({"Code": "TransactionConflict", "Message": "Transaction is ongoing for the item"})
+            } else {
+                json!({"Code": "None"})
+            }
+        })
+        .collect();
+
+    json!({
+        "__type": "com.amazonaws.dynamodb.v20120810#TransactionCanceledException",
+        "Message": "Transaction cancelled, please refer cancellation reasons for specific reasons",
+        "CancellationReasons": reasons,
+    })
 }
 
 /// Forwards one request (its `head` without the blank line, and its body) to the emulator and
@@ -415,4 +434,27 @@ async fn an_sdk_retry_resends_the_commit_token() {
     let next = proxy.tokens();
     assert_eq!(next.len(), 1, "{next:?}");
     assert_ne!(next[0], tokens[0], "a new call gets a new token");
+}
+
+#[tokio::test]
+async fn the_loser_of_a_race_replays_the_winner_in_one_attempt() {
+    let table = private_table().await;
+    let proxy = Proxy::start().await;
+    let repository = proxy.repository(&table).await;
+
+    // The conflict on the outcome put (only another attempt of the same command writes it) and on
+    // an item every commit shares (the rebuild-lock check): either way the winner landed, so the
+    // store's re-read finds its row and replays it, with no second attempt.
+    for (id, item) in [("on-outcome", None), ("on-lock", Some(1))] {
+        proxy.arm(Fault::ConflictAfterLanding(item), 1);
+        let outcome = store(repository.clone(), 1)
+            .execute_with_outcome(format!("ledger-{id}"), Add(5), command(id))
+            .await
+            .unwrap();
+
+        assert_eq!(proxy.faulted(), 1, "{id}");
+        assert_eq!(proxy.tokens().len(), 1, "{id}: one attempt");
+        assert!(outcome.is_accepted(), "{id}: {outcome:?}");
+        assert!(outcome.replayed, "{id}: the winner's outcome is replayed");
+    }
 }
