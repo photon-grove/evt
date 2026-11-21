@@ -3065,7 +3065,8 @@ record is a wake-up, not a delivery (PostgreSQL's are `NOTIFY` messages:
 the scope with `page` from its own cursor. Removals are not wake-ups, and neither are keys in those
 partitions that the journal does not write (another sort key, an invalid scope): a decoder skips
 them rather than failing the batch, and the page read reports a corrupt journal. `photon-evt-lambda` (feature
-`journal`) implements the filter patterns and the decode. `compat/fixtures/lambda.json` pins them.
+`journal`) implements the filter patterns and the decode, and so does the TypeScript
+`@photon-grove/evt-lambda`. `compat/fixtures/lambda.json` pins them.
 
 ### Feature marker and history
 
