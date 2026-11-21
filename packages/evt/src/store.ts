@@ -62,7 +62,14 @@ import {
   retryDelay,
   sleep,
 } from './retry.js'
-import {commitSnapshot, projectCommit, projectStreams, serializeEvents} from './staging.js'
+import {
+  type HistoryLedger,
+  commitSnapshot,
+  declareHistory,
+  projectCommit,
+  projectStreams,
+  serializeEvents,
+} from './staging.js'
 import type {CommitProjector, ProjectedView} from './projection.js'
 import {
   type ReadFailures,
@@ -100,8 +107,10 @@ export interface StoreOptions {
   /**
    * The commit-wide projectors, whose view operations every commit that writes events carries,
    * in this order. The repository must write views, as every one this package ships does (the
-   * DynamoDB one with a views table). Only current-state projectors run for now: one that names
-   * a `history` is refused.
+   * DynamoDB one with a views table, the PostgreSQL one with a view writer). A history-dependent
+   * projector's entity types are declared in the store's feature manifest once, before the first
+   * commit that runs it, so the repository must declare them too, as every one this package ships
+   * does.
    */
   commitProjectors?: readonly CommitProjector[] | undefined
 }
@@ -156,6 +165,8 @@ export class Store {
   readonly #commitId: () => string
   readonly #outcomes: OutcomeConfig | null
   readonly #commitProjectors: readonly CommitProjector[]
+  // The entity types this store's history-dependent projectors read, once declared.
+  readonly #history: HistoryLedger = {declared: new Set(), inflight: null}
 
   constructor(repository: Repository, options: StoreOptions = {}) {
     const interval = options.snapshotInterval ?? DEFAULT_SNAPSHOT_INTERVAL
@@ -269,6 +280,7 @@ export class Store {
       decision.events,
       metadata,
     )
+    await this.#declareHistory(options)
     await this.repository.commit({entityId, events, snapshot, projections, views}, options)
 
     return {kind: 'committed', state, events}
@@ -449,8 +461,14 @@ export class Store {
       metadata: (partial) => this.#metadata(partial),
       outcomes: this.#outcomes,
       commitProjectors: this.#commitProjectors,
+      declareHistory: (options) => this.#declareHistory(options),
       ...extra,
     })
+  }
+
+  // Declares the history-dependent projectors' entity types before a commit that runs them.
+  #declareHistory(options?: CallOptions): Promise<void> {
+    return declareHistory(this.#commitProjectors, this.repository, this.#history, options)
   }
 
   /**
@@ -647,6 +665,16 @@ export class Store {
       commit = await this.#decide(aggregate, loaded, command, pending)
     } catch (error) {
       return failed(error, 'internal')
+    }
+
+    // Declared before the commit is sent, so a failed declaration is the command's own error and
+    // never settled as the commit's.
+    if (commit.events.length > 0) {
+      try {
+        await this.#declareHistory(options)
+      } catch (error) {
+        return failed(error, 'internal')
+      }
     }
 
     try {

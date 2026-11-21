@@ -13,7 +13,7 @@ import {EvtError} from './errors.js'
 import {type SerializedEvent, eventId} from './event.js'
 import type {Metadata} from './metadata.js'
 import {type CommitProjector, type ProjectedView, commitStream, projectViews} from './projection.js'
-import type {NewSnapshot, ProjectorGroup, Repository} from './repository.js'
+import type {CallOptions, NewSnapshot, ProjectorGroup, Repository} from './repository.js'
 import {compareUtf8} from './utf8.js'
 import {MAX_COMMIT_ITEM_BYTES, snapshotCommitSize, snapshotEventsDue} from './snapshots.js'
 
@@ -153,9 +153,9 @@ export interface WrittenStream {
 
 /**
  * The commit-wide projectors' view operations for a commit that writes `streams`: none when there
- * are no projectors or no events. The repository must write views, and only current-state
- * projectors run here, since a history-dependent one needs its entity types declared in the
- * store's feature manifest first. The projectors read copies, sorted by entity ID bytes.
+ * are no projectors or no events. The repository must write views, and declare a history-dependent
+ * projector's entity types, which {@link declareHistory} does before the commit. The projectors
+ * read copies, sorted by entity ID bytes.
  */
 export function projectStreams(
   projectors: readonly CommitProjector[],
@@ -191,8 +191,8 @@ export function projectStreams(
 
 /**
  * Refuses commit-wide projectors the repository can't serve: it must write view operations, or
- * their rows would be dropped, and a history-dependent projector needs a manifest declaration this
- * package can't make yet.
+ * their rows would be dropped, and a history-dependent projector needs a repository that declares
+ * its entity types in the store's feature manifest.
  */
 export function readyProjectors(
   projectors: readonly CommitProjector[],
@@ -210,11 +210,66 @@ export function readyProjectors(
     )
   }
   const historyDependent = projectors.find((projector) => (projector.history ?? []).length > 0)
-  if (historyDependent !== undefined) {
+  if (historyDependent !== undefined && repository.declareHistoryDependent === undefined) {
     throw new EvtError(
       'historyDeclarationUnsupported',
       `repository ${name} cannot declare history-dependent entity types; refusing a ` +
         `history-dependent projector (${JSON.stringify(historyDependent.name)})`,
     )
+  }
+}
+
+/**
+ * What a store has declared of its projectors' history: the entity types declared, and the
+ * declaration in flight, which concurrent commits wait for instead of sending their own.
+ */
+export interface HistoryLedger {
+  readonly declared: Set<string>
+  inflight: Promise<void> | null
+}
+
+/**
+ * Durably declares the entity types the projectors read events of history-dependent, before a
+ * commit that runs them: each type once per store, which the ledger remembers, so compaction
+ * refuses them in every process from then on. A failed declaration marks nothing, so the next
+ * commit declares again.
+ */
+export async function declareHistory(
+  projectors: readonly CommitProjector[],
+  repository: Repository,
+  ledger: HistoryLedger,
+  options?: CallOptions,
+): Promise<void> {
+  const pending: string[] = []
+  for (const projector of projectors) {
+    for (const entityType of projector.history ?? []) {
+      if (!ledger.declared.has(entityType) && !pending.includes(entityType)) {
+        pending.push(entityType)
+      }
+    }
+  }
+  if (pending.length === 0) {
+    return
+  }
+
+  // Another commit's declaration: wait for it, then see what's left, whatever its result.
+  const inflight = ledger.inflight
+  if (inflight !== null) {
+    await inflight.catch(() => undefined)
+
+    return declareHistory(projectors, repository, ledger, options)
+  }
+
+  readyProjectors(projectors, repository)
+  const run = repository.declareHistoryDependent!(pending, options).then(() => {
+    for (const entityType of pending) {
+      ledger.declared.add(entityType)
+    }
+  })
+  ledger.inflight = run
+  try {
+    await run
+  } finally {
+    ledger.inflight = null
   }
 }

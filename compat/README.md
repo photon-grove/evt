@@ -58,7 +58,8 @@ passes has its own run ID and takes only those scenarios: the other language's d
 own steps of them, limited by `step -scenarios` (Go) or `--scenarios` (Rust), and Go, Rust and
 TypeScript verify them, then Go and Rust compare their enumerations. TypeScript verifies what each
 backend stores, as Go does: the DynamoDB items and the SNS messages they publish, or the PostgreSQL
-event, snapshot and head rows. The other scenarios would only repeat the Go and Rust pass, and Moto
+event, snapshot and head rows, and the view rows. Its passes also run the exclusive scenarios it
+supports, after the interleaved ones, with it standing in. The other scenarios would only repeat the Go and Rust pass, and Moto
 copies a table for every action of a transaction, so a fuller table slows every pass: the
 TypeScript passes run first, while the tables are smallest. TypeScript doesn't join the
 enumeration check yet. Its driver refuses any `AWS_ENDPOINT_URL` or `DATABASE_URL` whose host
@@ -128,7 +129,8 @@ stored payloads changed, and update the spec.
    across its steps: a rebuild lock or a declared feature refuses every other scenario's commits. The interleaved run skips it, and
    `scripts/compat-integration.sh` runs it alone afterwards, one step at a time (`evt-compat steps
    -only NAME`, `step -only NAME`, and `exclusive` in the Go driver. The Rust driver takes the same
-   arguments). `rebuild` owner tokens are scoped to the run and scenario like command IDs (a step that presents a lease rebuilds it from the store: the lock's fencing generation when it names the scoped owner), and a
+   arguments, and the TypeScript driver `step --only NAME` and `exclusive`, listing the exclusive
+   scenarios it supports, which its passes run with it standing in). `rebuild` owner tokens are scoped to the run and scenario like command IDs (a step that presents a lease rebuilds it from the store: the lock's fencing generation when it names the scoped owner), and a
    `writeViews` step writes one view row in the partition `rebuild-<entity ID>`. The fixture runs
    advance an injected clock for `wait`, and the live runs sleep.
 

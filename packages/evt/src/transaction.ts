@@ -70,6 +70,8 @@ export interface TransactionContext {
   readonly frozen?: PendingCommand | undefined
   /** The store's commit-wide projectors, which every commit that writes events runs. */
   readonly commitProjectors?: readonly CommitProjector[] | undefined
+  /** Declares the history-dependent projectors' entity types before a commit that runs them. */
+  readonly declareHistory?: ((options?: CallOptions) => Promise<void>) | undefined
   /** Where the transaction notes a failed read, so the store's retry can tell it apart. */
   readonly readFailures?: ReadFailures | undefined
 }
@@ -402,6 +404,9 @@ export class Transaction {
     }
 
     const {streams, fences, events, views} = this.#prepare(metadata)
+    if (events.length > 0) {
+      await this.#context.declareHistory?.(options)
+    }
     await this.#context.repository.commitTransaction({streams, fences, views}, options)
 
     return {kind: 'committed', events}
@@ -543,6 +548,10 @@ export class Transaction {
     const repository = this.#context.repository as OutcomeRepository
     const {streams, fences, events, views} = prepared
 
+    // Declared before the commit is sent, so a failed declaration is never settled as the commit's.
+    if (events.length > 0) {
+      await this.#context.declareHistory?.(options)
+    }
     try {
       return await recordCommit(repository, pending, config, outcome, events, () =>
         repository.commitTransaction({streams, fences, views, outcome}, options),
