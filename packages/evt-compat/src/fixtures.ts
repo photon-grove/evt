@@ -2,6 +2,7 @@
 // adds the vectors for what it builds.
 import {codecVectors} from './codec.js'
 import {Checks} from './harness.js'
+import {journalVectors} from './journal.js'
 import {commitViewVectors, headVectors, markerVectors, postgresSchemaVectors} from './marker.js'
 import {outcomeVectors} from './outcomes.js'
 import {scenarioChecks} from './scenarios.js'
@@ -25,5 +26,6 @@ await postgresSchemaVectors(checks)
 await outcomeVectors(checks)
 await scenarioChecks(checks)
 await viewVectors(checks)
+await journalVectors(checks)
 
 checks.report()

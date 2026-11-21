@@ -71,6 +71,9 @@ import type {ProjectedView} from './projection.js'
  * - `historyDeclarationUnsupported`: a history-dependent projector needs its entity types declared
  *   in the store's feature manifest, which this package can't do yet.
  * - `commitOrder`: stored commits have no order every stream agrees with.
+ * - `invalidJournal`: a journal configuration, scope or stored allocation is invalid, such as an
+ *   empty or oversized scope, or a malformed allocation in an event's metadata. Nothing was
+ *   written.
  */
 export type EvtErrorCode =
   | 'invalidJson'
@@ -113,6 +116,7 @@ export type EvtErrorCode =
   | 'viewsUnsupported'
   | 'historyDeclarationUnsupported'
   | 'commitOrder'
+  | 'invalidJournal'
 
 export class EvtError extends Error {
   override readonly name: string = 'EvtError'
