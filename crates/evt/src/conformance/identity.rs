@@ -7,29 +7,28 @@ use super::*;
 use crate::ids::PrincipalId;
 use crate::outcome::RecordedIdentity;
 
-/// Runs the recorded-identity cases. Kept out of [`outcome_cases`]' own future, so a debug test
-/// thread's stack holds one case at a time.
+/// Runs the recorded-identity cases, as part of [`outcome_cases`].
 pub(super) async fn identity_cases<R: Repository>(repo: &R) -> Vec<(&'static str, CaseResult)> {
     vec![
         (
             "every outcome records its identity: single-aggregate, multi-stream, rejected, no-op, replayed",
-            Box::pin(identity_recorded(repo)).await,
+            boxed_case(|| identity_recorded(repo)).await,
         ),
         (
             "the engine's stale-fence and stale-version rejections record the identity",
-            Box::pin(identity_recorded_by_engine_rejections(repo)).await,
+            boxed_case(|| identity_recorded_by_engine_rejections(repo)).await,
         ),
         (
             "an outcome resolves by command ID for its own principal only",
-            Box::pin(identity_resolve_for_principal(repo)).await,
+            boxed_case(|| identity_resolve_for_principal(repo)).await,
         ),
         (
             "a row without a recorded identity decodes with none and fails closed",
-            Box::pin(identity_legacy_row(repo)).await,
+            boxed_case(|| identity_legacy_row(repo)).await,
         ),
         (
             "the recorded identity is bounded before any write",
-            Box::pin(identity_bound(repo)).await,
+            boxed_case(|| identity_bound(repo)).await,
         ),
     ]
 }
