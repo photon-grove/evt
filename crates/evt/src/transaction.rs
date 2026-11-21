@@ -801,7 +801,11 @@ impl<'a, R: Repository> Transaction<'a, R> {
         // as stale, through the same fenced, outcome-only commit as a domain rejection. The
         // command's own checks come first, in the order `reject` makes them.
         if !self.expected.is_empty() {
-            self.check_recordable()?;
+            let pending = self.check_recordable()?;
+            if let Some(outcome) = self.already_ran(&pending).await? {
+                return Ok(outcome);
+            }
+
             let stale = self.stale_versions()?;
             if !stale.is_empty() {
                 let rejection = self.outcomes.as_ref().map_or_else(
@@ -814,6 +818,10 @@ impl<'a, R: Repository> Transaction<'a, R> {
         }
 
         let pending = self.take_command()?;
+        if let Some(outcome) = self.already_ran(&pending).await? {
+            return Ok(outcome);
+        }
+
         self.ready_projectors().await?;
 
         let mut commit = self.prepare(&pending.metadata)?;
@@ -872,14 +880,8 @@ impl<'a, R: Repository> Transaction<'a, R> {
             return Err(Error::TransactionPoisoned);
         }
 
-        // A pre-v0.9 event in a stream this command read already carries its ID without an
-        // outcome row: the command ran, so no terminal rejection is recorded for it.
-        if self
-            .streams
-            .iter()
-            .any(|stream| stream.seen_command_ids.contains(&pending.command_id))
-        {
-            return Err(Error::DuplicateCommand(pending.command_id));
+        if let Some(outcome) = self.already_ran(&pending).await? {
+            return Ok(outcome);
         }
 
         let streams = std::mem::take(&mut self.streams);
@@ -926,6 +928,10 @@ impl<'a, R: Repository> Transaction<'a, R> {
         rejection: Rejection,
     ) -> Result<CommandOutcome, Error> {
         let pending = self.take_command()?;
+        if let Some(outcome) = self.already_ran(&pending).await? {
+            return Ok(outcome);
+        }
+
         self.ready_projectors().await?;
 
         let commit = self.prepare(&pending.metadata)?;
@@ -981,8 +987,8 @@ impl<'a, R: Repository> Transaction<'a, R> {
 
     /// Makes the checks [`take_command`](Transaction::take_command) and [`reject`](Transaction::reject)
     /// make before recording an outcome, without taking the command: outcomes enabled, the
-    /// command begun, the transaction not poisoned, and no pre-v0.9 duplicate of the command ID.
-    fn check_recordable(&self) -> Result<(), Error> {
+    /// command begun, and the transaction not poisoned. Returns a copy of the begun command.
+    fn check_recordable(&self) -> Result<PendingCommand, Error> {
         self.check_open()?;
         if self.outcomes.is_none() {
             return Err(Error::InvalidConfig(
@@ -1000,15 +1006,38 @@ impl<'a, R: Repository> Transaction<'a, R> {
             return Err(Error::TransactionPoisoned);
         }
 
-        if self
+        Ok(pending.clone())
+    }
+
+    /// Answers a command whose ID a stream it read already carries. Another attempt of the
+    /// command may have committed since [`begin_command`](Transaction::begin_command) read the
+    /// outcome row, so the row is read again: the stored outcome when the digests match,
+    /// [`Error::IdempotencyKeyReuse`] when they differ. Without a row it is an event written
+    /// before outcomes existed: the command ran, so no outcome is recorded for it
+    /// ([`Error::DuplicateCommand`]). `None` when no stream carries the ID, or when the
+    /// transaction is poisoned, which the caller reports.
+    async fn already_ran(&self, pending: &PendingCommand) -> Result<Option<CommandOutcome>, Error> {
+        let seen = self
             .streams
             .iter()
-            .any(|stream| stream.seen_command_ids.contains(&pending.command_id))
-        {
-            return Err(Error::DuplicateCommand(pending.command_id.clone()));
+            .any(|stream| stream.seen_command_ids.contains(&pending.command_id));
+        if self.poisoned || !seen {
+            return Ok(None);
         }
 
-        Ok(())
+        // Boxed: the outcome read is a large future on some backends, and keeping it on the heap
+        // keeps the futures of the outcome-recording methods that await this one small (the
+        // conformance cases poll them on a default test-thread stack, in debug builds).
+        match Box::pin(pre_check(
+            self.repository,
+            &pending.command_id,
+            &pending.digest,
+        ))
+        .await?
+        {
+            Some(stored) => Ok(Some(CommandOutcome::replay(stored))),
+            None => Err(Error::DuplicateCommand(pending.command_id.clone())),
+        }
     }
 
     fn take_command(&mut self) -> Result<PendingCommand, Error> {
