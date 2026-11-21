@@ -27,6 +27,13 @@ export {
   type StandardSchemaV1,
   json,
 } from './codec.js'
+export {
+  type EnumeratedEntity,
+  type EventLog,
+  type StreamFilter,
+  isEventLog,
+  matchesFilter,
+} from './enumerate.js'
 export {encodeEnvelope, decodeEnvelope, messageAttributes} from './envelope.js'
 export {
   CommitTooLargeError,

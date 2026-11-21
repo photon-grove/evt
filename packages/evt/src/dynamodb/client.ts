@@ -76,6 +76,8 @@ export interface ScanInput {
   TableName: string
   ConsistentRead?: boolean
   ProjectionExpression?: string
+  FilterExpression?: string
+  ExpressionAttributeValues?: Item
   Limit?: number
   ExclusiveStartKey?: Item
 }

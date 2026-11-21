@@ -1061,7 +1061,8 @@ DESC LIMIT n`. The in-memory backend walks its stream backwards.
   `CompactBelow` (which writes no new rows but is refused all the same). TypeScript throws a
   `ReservedEntityIdError` from `commit`, `putSnapshot` and `compactBelow`.
 - Enumeration (`StreamAllEvents`/`StreamEntities`), entity heads (`StreamEntityHeads`), and rebuild
-  scans (`StreamEntitiesFromSnapshots`) skip every reserved partition. `ReservedNamespacePrefixes()` returns a copy; callers cannot
+  scans (`StreamEntitiesFromSnapshots`) skip every reserved partition (TypeScript:
+  `streamAllEvents`, `entityHeads`, `Store.streamEntities` and `Store.streamEntitiesFromSnapshots`). `ReservedNamespacePrefixes()` returns a copy; callers cannot
   change the authoritative namespace checks.
 - Entity IDs were never restricted before, so a pre-existing stream such as `SYSTEM#account` would
   disappear from enumeration after upgrading. Explicit event and snapshot reads by ID still

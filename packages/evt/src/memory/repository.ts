@@ -17,6 +17,7 @@ import {
   StreamHeadsNotMigratedError,
 } from '../errors.js'
 import type {Item} from '../dynamodb/item.js'
+import {type EventLog, type StreamFilter, matchesFilter} from '../enumerate.js'
 import {outcomeFromItem, outcomeItem} from '../dynamodb/outcome.js'
 import type {SerializedEvent, SerializedSnapshot} from '../event.js'
 import {
@@ -46,6 +47,7 @@ import {
   checkNotReserved,
   commitAsTransaction,
   isEmptyTransaction,
+  isReserved,
   normalizeTransaction,
   rankFailures,
   transactionSizes,
@@ -92,7 +94,7 @@ let controlsOf: (repo: MemRepository) => Controls
  * on its feature manifest, so {@link initialize} is needed only where code treats every backend
  * alike.
  */
-export class MemRepository implements OutcomeRepository, StoreInitializer {
+export class MemRepository implements OutcomeRepository, StoreInitializer, EventLog {
   readonly #streams = new Map<string, Stream>()
   readonly #controls: Controls = {manifest: null, rebuild: {generation: 0n, lock: null}}
   // The command outcomes by command ID, kept as the DynamoDB item, so a read decodes and
@@ -311,6 +313,50 @@ export class MemRepository implements OutcomeRepository, StoreInitializer {
     return this.#sorted(entityId)
       .filter((event) => event.sequence > after)
       .map(cloneEvent)
+  }
+
+  /** Each entity's events come whole, in one batch. */
+  readonly batchesByEntity = true
+
+  /**
+   * Every entity's events, one batch per entity, entities ascending by ID bytes and events by
+   * sequence, a stream's type being its events'. The reserved namespaces are skipped. It reads the
+   * log as it stands when each batch is taken.
+   */
+  async *streamAllEvents(
+    filter?: StreamFilter,
+    options?: CallOptions,
+  ): AsyncGenerator<SerializedEvent[]> {
+    options?.signal?.throwIfAborted()
+    const ids = [...this.#streams.keys()].filter((entityId) => !isReserved(entityId))
+    ids.sort(compareUtf8)
+    for (const entityId of ids) {
+      options?.signal?.throwIfAborted()
+      const events = this.#sorted(entityId)
+      if (events.length > 0 && matchesFilter(filter, events[0]!.entityType)) {
+        yield events.map(cloneEvent)
+      }
+    }
+  }
+
+  async entityHeads(entityType?: string, options?: CallOptions): Promise<Map<string, bigint>> {
+    options?.signal?.throwIfAborted()
+    const heads = new Map<string, bigint>()
+    const ids = [...this.#streams.keys()].filter((entityId) => !isReserved(entityId))
+    ids.sort(compareUtf8)
+    for (const entityId of ids) {
+      const stream = this.#streams.get(entityId)!
+      const events = this.#sorted(entityId)
+      const type = events[0]?.entityType ?? stream.snapshot?.entityType ?? ''
+      const last = events.at(-1)?.sequence ?? 0n
+      const covered = stream.snapshot?.eventSequence ?? 0n
+      const head = last > covered ? last : covered
+      if (head > 0n && (entityType === undefined || type === entityType)) {
+        heads.set(entityId, head)
+      }
+    }
+
+    return heads
   }
 
   async latest(entityId: string, n: number, options?: CallOptions): Promise<SerializedEvent[]> {
