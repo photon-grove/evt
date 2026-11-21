@@ -38,6 +38,7 @@ import {
   markerConformance,
 } from './conformance.js'
 import {postgresControls} from './controls.js'
+import {TestClock, compactionConformance} from './compaction-conformance.js'
 import {Checks} from './harness.js'
 import {journalConformance, journalStoreCases} from './journal-conformance.js'
 import {postgresViewDdl, postgresViewWriter} from './pgviews.js'
@@ -80,6 +81,7 @@ try {
   await postgresCases()
   await viewsTableCases()
   await journalCases()
+  await compactionCases()
 } finally {
   for (const events of logs) {
     await pool.query(`DROP TABLE IF EXISTS ${tables(events).join(', ')}`)
@@ -326,13 +328,14 @@ async function postgresCases(): Promise<void> {
 }
 
 // A fresh event log whose commits write their views to its views table.
-async function tableLog(): Promise<PgRepository> {
+async function tableLog(clock?: () => number): Promise<PgRepository> {
   const events = `evt_ts_${run}_${++logCount}`
   logs.push(events)
   const repo = new PgRepository(pool, {
     eventsTable: events,
     snapshotsTable: `${events}_snaps`,
     viewsTable: true,
+    ...(clock && {clock}),
   })
   await repo.ensureSchema()
 
@@ -589,7 +592,7 @@ async function journalCases(): Promise<void> {
   })
 
   await checks.case(
-    'postgres journal: compaction rows are read from the views table, and compaction is refused',
+    'postgres journal: compaction rows are read from the views table, and compaction declared once',
     async () => {
       const log = await tableLog()
       const views = log.viewRepository()
@@ -606,13 +609,15 @@ async function journalCases(): Promise<void> {
       ensure(decode(read?.payload) === '{"owner":"o"}', `the row: ${decode(read?.payload)}`)
       ensure((await log.readCompactionRow('t', 'LEASE')) === null, 'another scope has none')
 
-      // Any handle checks the marker for compaction, a compacted store's included. Nothing
-      // declares compaction until it is ported to PostgreSQL.
+      // Any handle checks and declares compaction, once, and refuses another version of it.
       const marker = log[JOURNAL_MARKER]
       await marker.checkCompactionMarker()
-      await refuses(marker.declareCompaction(), UnsupportedFeatureError, 'declaring compaction')
-      await controls(log).declare((draft) => draft.features.set('journal-compaction', 1))
+      await marker.declareCompaction()
+      const declared = await controls(log).manifest()
+      ensure(declared?.features.get('journal-compaction') === 1, 'declared')
+      await marker.declareCompaction()
       await marker.checkCompactionMarker()
+      ensure((await controls(log).manifest())?.version === declared.version, 'declared once')
       await controls(log).declare((draft) => draft.features.set('journal-compaction', 2))
       await refuses(marker.checkCompactionMarker(), UnsupportedFeatureError, 'another version')
     },
@@ -647,6 +652,113 @@ async function journalCases(): Promise<void> {
       ensure((await plain.events('a')).length === 0, 'nothing was written')
     },
   )
+}
+
+// Journal compaction (ADR 0008, X4), as Rust's postgres_journal_conforms runs it: the shared
+// compaction cases over a log of their own, with a clock the lease cases move, then a batch that
+// finds a key absent and meets a row another transaction inserted there meanwhile.
+async function compactionCases(): Promise<void> {
+  const clock = new TestClock(Date.now())
+  const repo = await tableLog(clock.now)
+  await repo.initialize()
+  const reader = repo.viewRepository()
+  await compactionConformance(checks, {
+    repo,
+    clock,
+    views: {
+      getViewAt: (pk, sk) => reader.getViewAt(pk, sk),
+      putView: (row) => reader.putView(row),
+      deleteView: (pk, sk) => reader.deleteView(pk, sk),
+    },
+    manifest: async () => controls(repo).manifest(),
+    declare: async (change) => {
+      await controls(repo).declare(change)
+      // The repository caches the manifest it validated: have it read the new one now, as its
+      // next write would. A manifest it refuses stays refused.
+      try {
+        await repo.initialize()
+      } catch (error) {
+        if (!(error instanceof UnsupportedFeatureError)) {
+          throw error
+        }
+      }
+    },
+    setRebuild: async (state) => controls(repo).setRebuild(state),
+  })
+
+  await checks.case(
+    'postgres journal compaction: an absent put that meets a row inserted meanwhile is refused',
+    async () => {
+      const log = await tableLog()
+      const table = log.viewRepository().table
+
+      // Another transaction inserts the lease row and holds it uncommitted.
+      const holder = await pool.connect()
+      let open = false
+      let racing: Promise<unknown> = Promise.resolve()
+      try {
+        await holder.query('BEGIN')
+        open = true
+        const theirs = raceLease('theirs')
+        await holder.query(
+          `INSERT INTO ${table} (pk, sk, entity_id, entity_type, payload, ttl) ` +
+            'VALUES ($1, $2, $3, $4, $5, 0)',
+          [theirs.pk, theirs.sk, theirs.entityId, theirs.entityType, decode(theirs.payload)],
+        )
+        const batch = log.writeCompaction(null, [
+          {kind: 'put', row: raceLease('ours'), expect: {kind: 'absent'}},
+        ])
+        racing = batch.catch(() => undefined)
+
+        // The batch's insert waits on the holder's transaction.
+        const deadline = Date.now() + 5000
+        for (;;) {
+          const {rows} = await pool.query(
+            "SELECT 1 FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE $1",
+            [`INSERT INTO ${table} %`],
+          )
+          if (rows.length > 0) {
+            break
+          }
+          ensure(Date.now() < deadline, 'the batch never waited on the other insert')
+          await delay(10)
+        }
+        await holder.query('COMMIT')
+        open = false
+
+        const written = await batch
+        ensure(json(written) === json({kind: 'refused', at: 0}), `refused: ${json(written)}`)
+        const stored = await log.viewRepository().getViewAt('journal-compaction#race', 'LEASE')
+        ensure(decode(stored?.payload).includes('theirs'), "the other transaction's row stands")
+      } finally {
+        // A failure must not leave the insert holding the key, or the batch waiting on it.
+        if (open) {
+          await holder.query('ROLLBACK').catch(() => undefined)
+        }
+        holder.release()
+        await racing
+      }
+    },
+  )
+}
+
+// The lease row of the `race` scope, with the payload `token` names.
+function raceLease(token: string): ViewRow {
+  return {
+    pk: 'journal-compaction#race',
+    sk: 'LEASE',
+    entityId: 'SYSTEM#JOURNAL',
+    entityType: 'journal-compaction',
+    payload: new TextEncoder().encode(`{"scope":"race","token":"${token}"}`),
+  }
+}
+
+function json(value: unknown): string {
+  return JSON.stringify(value)
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 // A view row owned by `owner`, of entity type `kind`.

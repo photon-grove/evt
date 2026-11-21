@@ -3867,9 +3867,9 @@ commit-wide rows never split across two tables.
 [ADR 0008](../adr/0008-postgresql-views-table-and-journal.md), `photon-evt` 0.3, on a repository
 configured `with_views_table()`. Implemented: the journal's commits, its reads, its compaction and
 its wake-ups, with the shared journal, journal-rebuild and compaction conformance suites on
-PostgreSQL. TypeScript's `PgRepository` with `viewsTable: true` implements the commits and the
-reads, with the journal conformance cases on PostgreSQL; it sends no wake-ups yet, so a listener
-reads its commits on `Connected` and `Poll`. The [journal](#journal) and its
+PostgreSQL. TypeScript's `PgRepository` with `viewsTable: true` implements the commits, the
+reads and the compaction, with the journal and compaction conformance cases on PostgreSQL; it
+sends no wake-ups yet, so a listener reads its commits on `Connected` and `Poll`. The [journal](#journal) and its
 [compaction](#journal-compaction) are specified backend-neutrally above. This section pins the
 PostgreSQL statements.
 

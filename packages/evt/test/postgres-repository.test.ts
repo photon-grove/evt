@@ -24,6 +24,7 @@ import type {PgClient, PgConnection, PgResult} from '../src/postgres/client.ts'
 import {PgRepository, type PgRepositoryOptions} from '../src/postgres/repository.ts'
 import type {PgViewRepository} from '../src/postgres/view-repository.ts'
 import type {ViewStatement, ViewWriter} from '../src/postgres/views.ts'
+import type {ViewRow} from '../src/views.ts'
 
 function event(sequence: number): SerializedEvent {
   return {
@@ -1019,5 +1020,147 @@ describe('PgRepository journal', () => {
     const error = await rejection(repo[JOURNAL_MARKER].declareJournal(['ledger']))
     expect(error).toBeInstanceOf(UnsupportedFeatureError)
     expect(log).toEqual([])
+  })
+})
+
+function bytes(text: string): Uint8Array {
+  return new TextEncoder().encode(text)
+}
+
+// A row of scope `s`'s compaction partition at `sk`.
+function compactionRow(sk: string, payload = '{}'): ViewRow {
+  return {
+    pk: 'journal-compaction#s',
+    sk,
+    entityId: 'SYSTEM#JOURNAL',
+    entityType: 'journal-compaction',
+    payload: bytes(payload),
+  }
+}
+
+describe('PgRepository journal compaction', () => {
+  test('locks the lease row first, then by key bytes, checks, and writes in that order', async () => {
+    const {client, log, values} = tableStore({
+      respond: (text) =>
+        text.startsWith('SELECT value::text')
+          ? {rows: [{value: '4', force_released: 'false'}]}
+          : undefined,
+    })
+    const repo = new PgRepository(client, {viewsTable: true})
+    const written = await repo.writeCompaction(4n, [
+      {kind: 'put', row: compactionRow('chunk#1'), expect: {kind: 'absent'}},
+      {kind: 'delete', pk: 'journal#s', sk: '00000000000000000001', owner: 'a'},
+      {kind: 'check', pk: 'journal-compaction#s', sk: 'LEASE', expect: {kind: 'any'}},
+    ])
+    expect(written).toEqual({kind: 'written'})
+    const tx = transaction(log)
+    expect(tx).toEqual([
+      'START TRANSACTION ISOLATION LEVEL',
+      'SELECT pg_advisory_xact_lock_shared(1702261761, hashtext($1))',
+      'SELECT value::text AS value,',
+      'SELECT pk, sk, entity_id,',
+      'SELECT pk, sk, entity_id,',
+      'SELECT pk, sk, entity_id,',
+      'DELETE FROM evt_events__evt_views WHERE',
+      'INSERT INTO evt_events__evt_views (pk,',
+      'COMMIT',
+    ])
+    const start = log.indexOf('START TRANSACTION ISOLATION LEVEL READ COMMITTED')
+    const locked = values.slice(start + 3, start + 6).map((args) => (args as string[]).join('/'))
+    // `#` (0x23) sorts before `-` (0x2D): the row's partition before the compaction partition.
+    expect(locked).toEqual([
+      'journal-compaction#s/LEASE',
+      'journal#s/00000000000000000001',
+      'journal-compaction#s/chunk#1',
+    ])
+  })
+
+  test('refuses on a moved epoch, a failed expectation or a foreign row, writing nothing', async () => {
+    const epoch = tableStore({
+      respond: (text) =>
+        text.startsWith('SELECT value::text')
+          ? {rows: [{value: '6', force_released: 'false'}]}
+          : undefined,
+    })
+    expect(
+      await new PgRepository(epoch.client, {viewsTable: true}).writeCompaction(4n, [
+        {kind: 'check', pk: 'p', sk: 's', expect: {kind: 'any'}},
+      ]),
+    ).toEqual({kind: 'epochChanged'})
+    expect(epoch.log.at(-1)).toBe('ROLLBACK')
+
+    const stored = {
+      pk: 'journal#s',
+      sk: '00000000000000000001',
+      entity_id: 'b',
+      entity_type: 'journal',
+      payload: '{}',
+      ttl: '0',
+    }
+    const taken = tableStore({
+      respond: (text) => (text.endsWith('FOR UPDATE') ? {rows: [stored]} : undefined),
+    })
+    expect(
+      await new PgRepository(taken.client, {viewsTable: true}).writeCompaction(null, [
+        {kind: 'put', row: compactionRow('LEASE'), expect: {kind: 'payload', payload: bytes('{}')}},
+        {kind: 'delete', pk: 'journal#s', sk: '00000000000000000001', owner: 'a'},
+      ]),
+    ).toEqual({kind: 'refused', at: 0})
+    expect(taken.log.some((text) => /^(INSERT|DELETE)/.test(text))).toBe(false)
+    expect(taken.log.at(-1)).toBe('ROLLBACK')
+  })
+
+  test('reports the first failing write in request order, not lock order', async () => {
+    const stored = {
+      pk: 'journal#s',
+      sk: '00000000000000000001',
+      entity_id: 'b',
+      entity_type: 'journal',
+      payload: '{}',
+      ttl: '0',
+    }
+    const {client} = tableStore({
+      respond: (text) => (text.endsWith('FOR UPDATE') ? {rows: [stored]} : undefined),
+    })
+    // The delete sorts after the lease row, which is locked first, and is refused first.
+    expect(
+      await new PgRepository(client, {viewsTable: true}).writeCompaction(null, [
+        {kind: 'delete', pk: 'journal#s', sk: '00000000000000000001', owner: 'a'},
+        {kind: 'check', pk: 'journal-compaction#s', sk: 'LEASE', expect: {kind: 'absent'}},
+      ]),
+    ).toEqual({kind: 'refused', at: 0})
+  })
+
+  test('refuses a row no view row may hold before any query', async () => {
+    const {client, log} = tableStore()
+    const repo = new PgRepository(client, {viewsTable: true})
+    const writes = [
+      {kind: 'put', row: {...compactionRow('LEASE'), ttl: 1.5}, expect: {kind: 'any'}},
+      {kind: 'delete', pk: 'journal#s', sk: '\uD800', owner: 'a'},
+    ] as const
+    const errors = await Promise.all(
+      writes.map((write) => rejection(repo.writeCompaction(null, [write]))),
+    )
+    for (const error of errors) {
+      expect(error).toMatchObject({code: 'invalidArgument'})
+    }
+    expect(log).toEqual([])
+  })
+
+  test('refuses a payload that is not UTF-8 before any query', async () => {
+    const {client, log} = tableStore()
+    const bad = {...compactionRow('LEASE'), payload: new Uint8Array([0xff])}
+    const error = await rejection(
+      new PgRepository(client, {viewsTable: true}).writeCompaction(null, [
+        {kind: 'put', row: bad, expect: {kind: 'any'}},
+      ]),
+    )
+    expect(error).toMatchObject({code: 'invalidArgument'})
+    expect(log).toEqual([])
+  })
+
+  test('reads the clock in whole seconds', () => {
+    const {client} = tableStore()
+    expect(new PgRepository(client, {viewsTable: true, clock: () => 1_999}).compactionNow()).toBe(1)
   })
 })
