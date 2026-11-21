@@ -391,7 +391,11 @@ error before any write and is never split.
   that stalls past the recovery window `Error::Transient` / `TransientError` (a backend's
   `Transient` stays retryable, a definitive `Backend` error is returned). An ordinary conflict
   of an outcome-bearing commit also re-reads the row once, so a lost race with the same command
-  returns the winner's outcome
+  returns the winner's outcome. A DynamoDB `TransactionConflict` on the outcome put (only another
+  attempt of the same command writes it, and it is still committing) polls the row instead, for
+  150 ms with the recovery backoff and never past the recovery window (Go and Rust; TypeScript
+  reads once for now); one on any other item reads it once. Absent, the transient error stands
+  and is never recorded
 - Only a genuinely indeterminate failure of an outcome-bearing commit is recovered — a timeout or
   cancelled context, a dispatch or connection failure, a truncated response, a 5xx or server fault,
   a connection dropped during PostgreSQL's `COMMIT` (Go `*AmbiguousWriteError`, Rust

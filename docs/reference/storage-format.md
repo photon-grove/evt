@@ -1283,6 +1283,19 @@ outcome row returns only the winner's stored outcome (its result or rejection, m
 replayed). The loser's own handler error and local decision are neither returned nor reachable
 through the error chain.
 
+On DynamoDB the loser may instead be cancelled with `TransactionConflict` while the winner's
+transaction is still committing, so a single read can miss the winner's row. When the
+`TransactionConflict` reason is on the outcome put, which only another attempt of the same command
+writes, the store polls the row with the recovery backoff for 150 ms (reads at 0, 50 and 150 ms,
+never past the recovery window). A conflict on any other item, and every other conflict, reads the
+row once, so contention between different commands pays nothing extra. A row found is replayed;
+absent, the attempt keeps its transient error, and the next attempt's pre-read (or a resend of the
+command ID) replays the winner. Go reports the collision through `CollidedOnOutcomeRow()` on the
+backend's error, Rust through `TransactionConflict::on_outcome_row`. TypeScript reads the row once
+on every conflict for now. The poll runs only when DynamoDB reports the reason on the outcome put
+itself; a loser whose cancellation names only an item the two attempts share (a control check or
+a stream head) reads the row once.
+
 Stored rows are validated. A row read back must have a known `status`, a non-empty `digest`, a
 `rejection` (one complete JSON document whose `details` is an object or `null`, with trailing
 data refused) with a non-empty code exactly when the status is `rejected` (and a `code` attribute

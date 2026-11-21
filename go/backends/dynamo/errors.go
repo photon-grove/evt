@@ -39,3 +39,25 @@ func hasTransactionConflict(err error) bool {
 
 	return false
 }
+
+// transactionConflictError is a commit DynamoDB cancelled with TransactionConflict. It matches
+// ErrTransactionConflict and the SDK's cancellation with errors.Is and errors.As.
+type transactionConflictError struct {
+	err          error
+	onOutcomeRow bool
+}
+
+func (e *transactionConflictError) Error() string {
+	return ErrTransactionConflict.Error() + ": " + e.err.Error()
+}
+
+func (e *transactionConflictError) Unwrap() []error {
+	return []error{ErrTransactionConflict, e.err}
+}
+
+// CollidedOnOutcomeRow reports whether the commit collided on its command-outcome put. Only
+// another attempt of the same command writes that item, so its winner is still committing: the
+// store polls the outcome row briefly to replay it, rather than reading it once.
+func (e *transactionConflictError) CollidedOnOutcomeRow() bool {
+	return e.onOutcomeRow
+}
