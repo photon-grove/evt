@@ -198,7 +198,8 @@ const page = await repository.page('account:a-1', 0n, 100)
   throws a `ConflictError`; a counter behind its rows is repaired from the highest row.
 - **Reads.** `highWatermark(scope)` reads the counter, and `page(scope, after, limit)` returns the
   contiguous rows after `after`, stopping before the first gap, which it reports. A reader never
-  moves past a gap: it reads the same page again.
+  moves past a gap: it reads the same page again. A consumer of a journal that can be rebuilt reads with
+  `pageAtEpoch` and `highWatermarkAtEpoch`, which fail retryably while a rebuild rewrites it.
 - **Row size.** A row over `maxRowBytes` (30,000 by default) fails the commit before any write with
   a `JournalRowTooLargeError`, and a store with outcomes records it as the command's
   `journal-row-too-large` rejection. `journal.preCheck(events)` measures the same rows in a
@@ -207,8 +208,15 @@ const page = await repository.page('account:a-1', 0n, 100)
   types history-dependent, so compaction refuses them. Only the repository handle a journal wraps
   accepts a store that declares the journal: every writer must journal its commits.
 
-Journal compaction, rebuilds under the rebuild lock and the journal on PostgreSQL are still Rust
-only.
+- **Compaction.** `compactWithLease(store, scope, through, owner, leaseMs)` stores a scope's rows
+  up to `through` as a snapshot (a manifest and canonical chunks) and deletes them, under a lease
+  and the rebuild epoch; give it the repository the journal wraps. The checkpoint becomes the
+  scope's floor: `page` hands a reader below it a `JournalGoneError` (HTTP 410) naming the snapshot,
+  which it installs with `readManifest` and `readChunk` before paging on from the checkpoint, and
+  allocation never goes below it. `beginCompaction`, `compact`, `renewCompaction`,
+  `endCompaction` and `forceReleaseCompaction` run the steps by hand.
+
+Rebuilds under the rebuild lock and the journal on PostgreSQL are still Rust only.
 
 ## Runtimes
 
@@ -251,9 +259,9 @@ of `AbortSignal`, which the DOM library, `@types/node`, and Bun's and Deno's typ
   it on the parsed JSON, losslessly. A stored version the upcasters don't bring to the declared one
   fails the load with a `ReplayError` rather than decoding into the wrong shape.
 - **The feature marker.** A store keeps one manifest of the features it uses. Every write path
-  refuses a store that declares a feature this package doesn't model (journal compaction) with an
+  refuses a store that declares a feature this package doesn't model with an
   `UnsupportedFeatureError`, and so does every handle but the one a `JournalRepository` wraps for
-  a store that declares the journal. A `PgRepository` without `viewsTable: true` refuses one that
+  a store that declares the journal or journal compaction. A `PgRepository` without `viewsTable: true` refuses one that
   declares the PostgreSQL views table (`postgres-views`), and compaction
   refuses an entity type the manifest declares history-dependent, which every repository's
   `declareHistoryDependent(types)` declares. `MemRepository` declares the required `stream-heads`

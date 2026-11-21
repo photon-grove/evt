@@ -20,6 +20,19 @@ import {
   COUNTER_SORT_KEY,
   DEFAULT_MAX_ROW_BYTES,
   Journal,
+  JournalGoneError,
+  LEASE_SORT_KEY,
+  MANIFEST_SORT_KEY,
+  MAX_CHUNK_BYTES,
+  MAX_CHUNK_ROWS,
+  auditSortKey,
+  chunkSortKey,
+  compactWithLease,
+  compactionPartitionKey,
+  decodeChunk,
+  decodeManifest,
+  manifestDigest,
+  page,
   JournalRepository,
   MAX_SCOPE_BYTES,
   POSITION_WIDTH,
@@ -79,7 +92,7 @@ export async function journalVectors(checks: Checks): Promise<void> {
   }
 
   commitVectors(checks, field(fixture, 'commit'))
-  await liveCommitVectors(checks, field(fixture, 'commit'))
+  await liveCommitVectors(checks, field(fixture, 'commit'), field(fixture, 'compaction'))
 
   const marker = field(fixture, 'marker')
   checks.run('journal marker', () => {
@@ -218,9 +231,14 @@ function sortedTexts(values: unknown[]): string[] {
 // The fixture's commits, made again through a journal over the in-memory repository: two events
 // of one stream, then one of another, into a world scope and a place scope of each stream. The
 // stored events, rows and counters must be the fixture's, byte for byte.
-async function liveCommitVectors(checks: Checks, commit: JsonValue): Promise<void> {
+async function liveCommitVectors(
+  checks: Checks,
+  commit: JsonValue,
+  compaction: JsonValue,
+): Promise<void> {
   await checks.case('journal commit through the journal repository', async () => {
-    const memory = new MemRepository()
+    // A fixed clock, so the lease expiry and the audit's completion time are stable.
+    const memory = new MemRepository({clock: () => FIXTURE_CLOCK_MS})
     const journal = new Journal(['account'], (event) => [
       'world:7',
       `world:7/${event.entityId === 'acct-1' ? 'place:3' : 'place:4'}`,
@@ -241,7 +259,9 @@ async function liveCommitVectors(checks: Checks, commit: JsonValue): Promise<voi
       throw new Error('the stored events differ from the fixture')
     }
 
-    const live = memory.views().filter((row) => row.pk.startsWith('journal'))
+    const live = memory
+      .views()
+      .filter((row) => row.pk.startsWith('journal#') || row.pk.startsWith('journal-counter#'))
     const items = sortedTexts(live.map((row) => viewRowItem(row)))
     const fixture = sortedTexts([
       ...list(field(commit, 'rows')).map((row) => plain(field(row, 'dynamoItem'))),
@@ -250,8 +270,80 @@ async function liveCommitVectors(checks: Checks, commit: JsonValue): Promise<voi
     if (items.join('\n') !== fixture.join('\n')) {
       throw new Error(`the live rows differ from the fixture:\n${items.join('\n')}`)
     }
+
+    await compactionVectors(checks, memory, compaction)
   })
 }
+
+// world:7 compacted through 2 by compactor-1 under a 60-second lease, then read after 1.
+async function compactionVectors(
+  checks: Checks,
+  memory: MemRepository,
+  compaction: JsonValue,
+): Promise<void> {
+  const world = 'world:7'
+  const report = await compactWithLease(memory, world, 2n, 'compactor-1', 60_000)
+  checks.equal('journal compaction digest', report.digest, str(field(compaction, 'manifestDigest')))
+
+  const keys = field(compaction, 'keys')
+  checks.equal('journal compaction pk', compactionPartitionKey(world), str(field(keys, 'pk')))
+  checks.equal('journal compaction lease key', LEASE_SORT_KEY, str(field(keys, 'lease')))
+  checks.equal('journal compaction manifest key', MANIFEST_SORT_KEY, str(field(keys, 'manifest')))
+  checks.equal('journal compaction chunk key', chunkSortKey(0), str(field(keys, 'chunk0')))
+  checks.equal('journal compaction audit key', auditSortKey(2n), str(field(keys, 'audit2')))
+  const limits = field(compaction, 'limits')
+  checks.equal('journal compaction max rows', MAX_CHUNK_ROWS, num(field(limits, 'maxChunkRows')))
+  checks.equal('journal compaction max bytes', MAX_CHUNK_BYTES, num(field(limits, 'maxChunkBytes')))
+
+  const stored = [
+    ['lease', LEASE_SORT_KEY, field(compaction, 'lease')],
+    ['manifest', MANIFEST_SORT_KEY, field(compaction, 'manifest')],
+    ['chunk 0', chunkSortKey(0), list(field(compaction, 'chunks'))[0]!],
+    ['audit', auditSortKey(2n), field(compaction, 'audit')],
+  ] as const
+  const rows = await Promise.all(stored.map(([, sk]) => memory.readCompactionRow(world, sk)))
+  for (const [index, [name, , want]] of stored.entries()) {
+    const row = rows[index] ?? null
+    checks.equal(
+      `journal compaction ${name} item`,
+      row && canonical(viewRowItem(row)),
+      canonical(plain(want)),
+    )
+  }
+  checks.equal(
+    'journal compaction remaining rows',
+    canonical((await memory.readRows(world, 0n, 10)).map((row) => row.position.toString())),
+    canonical(plain(field(compaction, 'remainingRows'))),
+  )
+
+  const gone = field(compaction, 'gone')
+  let handoff: unknown
+  try {
+    await page(memory, world, 1n, 10)
+  } catch (error) {
+    handoff = error
+  }
+  if (!(handoff instanceof JournalGoneError)) {
+    throw new Error(`a page below the floor: ${String(handoff)}`)
+  }
+  checks.equal('journal gone status', JournalGoneError.HTTP_STATUS, num(field(gone, 'httpStatus')))
+  checks.equal('journal gone after', handoff.after, at(field(gone, 'after')))
+  checks.equal('journal gone checkpoint', handoff.checkpoint, at(field(gone, 'checkpoint')))
+  checks.equal('journal gone chunks', handoff.chunkCount, num(field(gone, 'chunkCount')))
+  checks.equal('journal gone digest', handoff.digest, str(field(gone, 'digest')))
+  checks.equal('journal gone resume', handoff.resumeAfter, at(field(gone, 'resumeAfter')))
+
+  // The stored rows decode back: the manifest and its digest, and the chunk's rows 1 and 2.
+  const manifestText = str(field(field(field(compaction, 'manifest'), 'payload'), 'S'))
+  const manifest = decodeManifest(world, new TextEncoder().encode(manifestText))
+  checks.equal('journal manifest decodes', await manifestDigest(manifest), handoff.digest)
+  const chunkText = str(field(field(list(field(compaction, 'chunks'))[0]!, 'payload'), 'S'))
+  const chunk = decodeChunk(world, new TextEncoder().encode(chunkText))
+  checks.equal('journal chunk range', `${chunk.from}..${chunk.through}`, '1..2')
+}
+
+// The fixture's clock: 1,792,000,000 Unix seconds.
+const FIXTURE_CLOCK_MS = 1_792_000_000_000
 
 function metadataWith(value: string): SerializedEvent['metadata'] {
   const event = decodeEvent('{}')

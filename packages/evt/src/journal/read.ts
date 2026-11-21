@@ -1,8 +1,9 @@
 // Reading the journal: highWatermark and page, with gap detection (storage format, "Reads").
 
-import {EvtError} from '../errors.js'
+import {EvtError, RebuildEpochChangedError} from '../errors.js'
 import type {CallOptions} from '../repository.js'
 import type {JournalRow} from './row.js'
+import {type JournalCompactionStore, manifestGone, readManifest} from './compaction.js'
 import {MAX_POSITION, checkScope} from './scope.js'
 
 /** The most rows {@link page} returns at once. */
@@ -84,11 +85,15 @@ export function highWatermark(
  * first gap: a jump in the rows, or, when they end short of the counter and the page isn't full,
  * the missing tail. A row that landed between the two reads raises the watermark to itself.
  *
+ * A gap below the scope's compaction floor is rows a compaction deleted: the read throws a
+ * `JournalGoneError` naming the snapshot to install instead (the `410 Gone` handoff). Rows below
+ * the floor that are still there are served as usual.
+ *
  * Start at `after = 0`, and page on after `nextAfter` until `caughtUp`. Poll at the same `after`
  * to wait for new rows.
  */
 export async function page(
-  store: JournalStore,
+  store: JournalCompactionStore,
   scope: string,
   after: bigint,
   limit: number,
@@ -110,7 +115,18 @@ export async function page(
   // the counter is missing or behind.
   const found = await store.readRows(scope, after, limit + 1, options)
 
-  return assemble(scope, after, limit, counter, found)
+  const read = assemble(scope, after, limit, counter, found)
+  // A gap may be rows a compaction deleted. The manifest is read after the rows: a compaction
+  // swaps it before it deletes anything, so a deletion the rows show is always explained by the
+  // floor read here. A page that reaches the floor is served as it is.
+  if (read.gap !== null) {
+    const manifest = await readManifest(store, scope, options)
+    if (manifest !== null && read.nextAfter < manifest.checkpoint) {
+      throw await manifestGone(manifest, after)
+    }
+  }
+
+  return read
 }
 
 /** Builds a page from the rows a read returned: the contiguous prefix, the first gap, the mark. */
@@ -157,4 +173,56 @@ export function assemble(
     hasMore: gap === null && nextAfter < watermark,
     caughtUp: gap === null && !cursorAhead && nextAfter >= watermark,
   }
+}
+
+/** A journal store that reads the rebuild generation, for the epoch-checked reads. */
+export interface EpochStore extends JournalCompactionStore {
+  /** The settled rebuild generation; an odd one throws a `RebuildUnavailableError`. */
+  observeRebuildEpoch(options?: CallOptions): Promise<bigint>
+}
+
+/**
+ * {@link highWatermark} under the rebuild epoch check: it fails with a `RebuildUnavailableError`
+ * while a rebuild holds the store (or after a force-release), and with a
+ * `RebuildEpochChangedError` when one started, finished or was taken over during the read. Both
+ * are retryable: read again once the rebuild is over.
+ */
+export function highWatermarkAtEpoch(
+  store: EpochStore,
+  scope: string,
+  options?: CallOptions,
+): Promise<bigint> {
+  return atEpoch(store, () => highWatermark(store, scope, options), options)
+}
+
+/**
+ * {@link page} under the rebuild epoch check, as {@link highWatermarkAtEpoch}: the read a consumer
+ * of a journal that can be rebuilt makes, so a page read while a rebuild rewrites rows and
+ * counters is a retryable error rather than a gap to interpret. On a failure, keep the cursor
+ * and read the same page again after a backoff.
+ */
+export function pageAtEpoch(
+  store: EpochStore,
+  scope: string,
+  after: bigint,
+  limit: number,
+  options?: CallOptions,
+): Promise<JournalPage> {
+  return atEpoch(store, () => page(store, scope, after, limit, options), options)
+}
+
+// Observes the generation, reads, and verifies the generation again: the read counts only then.
+async function atEpoch<T>(
+  store: EpochStore,
+  read: () => Promise<T>,
+  options: CallOptions | undefined,
+): Promise<T> {
+  const epoch = await store.observeRebuildEpoch(options)
+  const value = await read()
+  const current = await store.observeRebuildEpoch(options)
+  if (current !== epoch) {
+    throw new RebuildEpochChangedError(epoch, current)
+  }
+
+  return value
 }

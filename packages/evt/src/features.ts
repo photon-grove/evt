@@ -34,9 +34,8 @@ export const POSTGRES_VIEWS_VERSION = 1
 /**
  * The `(feature, stored-format version)` pairs this package models: `stream-heads`, which every
  * writer also requires, and `postgres-views`, which a PostgreSQL repository without the views
- * table refuses on its own, as Rust's does. Only a journal writer accepts `journal` (see
- * {@link acceptJournal}), and `journal-compaction` is Rust-first, so a store that declares it is
- * refused.
+ * table refuses on its own, as Rust's does. Only a journal writer accepts `journal` and
+ * `journal-compaction` (see {@link acceptJournal}).
  */
 export const SUPPORTED_FEATURES: readonly FeaturePair[] = Object.freeze([
   Object.freeze({name: POSTGRES_VIEWS_FEATURE, version: POSTGRES_VIEWS_VERSION}),
@@ -58,10 +57,11 @@ export const JOURNAL_COMPACTION_FEATURE = 'journal-compaction'
 /** The stored-format version of {@link JOURNAL_COMPACTION_FEATURE} this package writes. */
 export const JOURNAL_COMPACTION_VERSION = 1
 
-// The pairs a journal writer accepts besides the supported ones. Not journal compaction yet: a
-// writer that doesn't model it would read compacted rows as a gap, and could allocate below the
-// floor.
-const journalPairs = new Map([[JOURNAL_FEATURE, JOURNAL_VERSION]])
+// The pairs a journal writer accepts besides the supported ones.
+const journalPairs = new Map([
+  [JOURNAL_FEATURE, JOURNAL_VERSION],
+  [JOURNAL_COMPACTION_FEATURE, JOURNAL_COMPACTION_VERSION],
+])
 
 // The repository handles a journal repository wraps (ADR 0005, #178). Every writer of a journal
 // table must commit through the journal, or its events are missing from their scopes with no gap
@@ -76,8 +76,8 @@ const journalWriters = new WeakSet<object>()
 export const JOURNAL_WRITER_TARGET: unique symbol = Symbol('evt.journalWriterTarget')
 
 /**
- * Makes a repository handle a journal writer: it accepts a store that declares the journal, which
- * every other handle refuses. A wrapper's acceptance passes down to the
+ * Makes a repository handle a journal writer: it accepts a store that declares the journal or
+ * journal compaction, which every other handle refuses. A wrapper's acceptance passes down to the
  * repository it wraps. Internal: the journal's repository calls it.
  */
 export function acceptJournal(repository: object): void {
@@ -211,6 +211,13 @@ export interface JournalMarker {
   declareJournal(types: readonly string[], options?: CallOptions): Promise<JournalDeclared>
   /** Takes back what a declaration wrote, in one declaration. Best effort: the caller ignores failures. */
   retractJournal(declared: JournalDeclared, options?: CallOptions): Promise<void>
+  /**
+   * Reads the manifest and refuses one that declares a pair this package doesn't model, the
+   * journal's included. Compaction is the journal's own, so any handle may run it.
+   */
+  checkCompactionMarker(options?: CallOptions): Promise<void>
+  /** Declares `journal-compaction` on the manifest, unless it declares it already. */
+  declareCompaction(options?: CallOptions): Promise<void>
 }
 
 /** Whether a declaration wrote anything. */
@@ -251,6 +258,19 @@ export function withJournal(
     version: (manifest?.version ?? 0n) + 1n,
     features,
     historyDependent: entityTypeSet([...(manifest?.historyDependent ?? []), ...declared.history]),
+    retention: manifest?.retention ?? [],
+  }
+}
+
+/** The manifest with `journal-compaction` declared and its version bumped once. */
+export function withJournalCompaction(manifest: FeatureManifest | null): FeatureManifest {
+  const features = new Map(manifest?.features)
+  features.set(JOURNAL_COMPACTION_FEATURE, JOURNAL_COMPACTION_VERSION)
+
+  return {
+    version: (manifest?.version ?? 0n) + 1n,
+    features,
+    historyDependent: manifest?.historyDependent ?? [],
     retention: manifest?.retention ?? [],
   }
 }

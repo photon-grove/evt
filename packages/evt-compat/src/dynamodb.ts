@@ -14,6 +14,7 @@ import {
   StoreNotInitializedError,
   StreamHeadDriftError,
   StreamHeadsNotMigratedError,
+  UnsupportedFeatureError,
   emptyMetadata,
   eventId,
 } from '@photon-grove/evt'
@@ -31,6 +32,7 @@ import {
 import {type HeadFixtures, conformance, markerConformance} from './conformance.js'
 import {Journal, JournalRepository} from '@photon-grove/evt/journal'
 
+import {TestClock, compactionConformance} from './compaction-conformance.js'
 import {dynamoControls} from './controls.js'
 import {Checks, canonical} from './harness.js'
 import {journalConformance, journalStoreCases} from './journal-conformance.js'
@@ -84,6 +86,7 @@ try {
   await views(created)
   await viewRepository(created)
   await journal(created)
+  await compaction(created)
 } finally {
   await Promise.all(created.map(deleteTable))
 }
@@ -461,6 +464,44 @@ async function journal(tables: string[]): Promise<void> {
       repo: new DynamoRepository(client, fresh, {viewsTable, lazyInitialization: true}),
       manifest: async () => dynamoControls(client, fresh).manifest(),
     }
+  })
+}
+
+// The journal compaction cases, on an initialized table and views table of their own: they declare
+// store-wide and set the rebuild fence. The repository's clock is the cases', which they move.
+async function compaction(tables: string[]): Promise<void> {
+  const table = await freshTable(tables)
+  const viewsTable = `evt-ts-compaction-views-${run}`
+  await createTable(viewsTable, 'S')
+  tables.push(viewsTable)
+  await new DynamoRepository(client, table).initialize()
+
+  const clock = new TestClock(Date.now())
+  const repo = new DynamoRepository(client, table, {viewsTable, clock: clock.now})
+  const reader = new DynamoViewRepository(client, viewsTable)
+  const controls = dynamoControls(client, table)
+  await compactionConformance(checks, {
+    repo,
+    clock,
+    views: {
+      getViewAt: (pk, sk) => reader.getViewAt(pk, sk),
+      putView: (row) => reader.putView(row),
+      deleteView: (pk, sk) => reader.deleteView(pk, sk),
+    },
+    manifest: async () => controls.manifest(),
+    declare: async (change) => {
+      await controls.declare(change)
+      // The repository caches the manifest it validated: have it read the new one now, as its
+      // next write would, so that write doesn't fail once. A manifest it refuses stays refused.
+      try {
+        await repo.initialize()
+      } catch (error) {
+        if (!(error instanceof UnsupportedFeatureError)) {
+          throw error
+        }
+      }
+    },
+    setRebuild: async (state) => controls.setRebuild(state),
   })
 }
 
