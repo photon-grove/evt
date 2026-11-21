@@ -15,6 +15,7 @@ import {emptyMetadata} from '../src/metadata.ts'
 import {type ProjectedView, type ViewOperation, deleteView, putView} from '../src/projection.ts'
 import type {PgClient, PgConnection, PgResult} from '../src/postgres/client.ts'
 import {PgRepository, type PgRepositoryOptions} from '../src/postgres/repository.ts'
+import type {PgViewRepository} from '../src/postgres/view-repository.ts'
 import type {ViewStatement, ViewWriter} from '../src/postgres/views.ts'
 
 function event(sequence: number): SerializedEvent {
@@ -849,6 +850,40 @@ describe('PgRepository views table', () => {
     expect(lone).toMatchObject({code: 'invalidViewOperation'})
     expect((lone as Error).message).toContain('lone surrogate')
     expect(log).toEqual([])
+  })
+
+  test('needs no driver count: an absent put is never counted, the rest return their rows', async () => {
+    // Rows only, as a client that reports no rowCount or affectedRows answers.
+    const {client, log} = tableStore({
+      respond: (text) =>
+        text.includes('__evt_views') ? {rows: text.endsWith('RETURNING 1') ? [{}] : []} : undefined,
+    })
+    await commitViews(
+      new PgRepository(client, {viewsTable: true}),
+      putView('k', 'one', 'a', 'ledger', '{}', {condition: 'absent'}),
+      putView('k', 'two', 'a', 'ledger', '{}'),
+      deleteView('k', 'three', 'a', {condition: 'present'}),
+      deleteView('k', 'four', 'a'),
+    )
+    expect(log.at(-1)).toBe('COMMIT')
+  })
+
+  test.each<[string, (views: PgViewRepository, signal: AbortSignal) => Promise<unknown>]>([
+    ['deleteView', (views, signal) => views.deleteView('k', 'one', {signal})],
+    ['purgeExpired', (views, signal) => views.purgeExpired(1, {signal})],
+  ])('%s rejects when aborted in flight', async (_name, call) => {
+    const controller = new AbortController()
+    const {client} = tableStore({
+      respond: (text) => {
+        if (text.startsWith('DELETE FROM') || text.startsWith('WITH gone AS')) {
+          controller.abort(new Error('stop'))
+          return {rows: [{deleted: '0'}]}
+        }
+        return undefined
+      },
+    })
+    const views = new PgRepository(client, {viewsTable: true}).viewRepository()
+    expect(await rejection(call(views, controller.signal))).toMatchObject({message: 'stop'})
   })
 
   test('takes the views table or a view writer, not both', () => {

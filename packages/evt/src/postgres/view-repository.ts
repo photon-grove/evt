@@ -98,6 +98,8 @@ export class PgViewRepository implements ViewRepository {
       const rows = await query(this.#client, sql, [now.toString(), PURGE_BATCH.toString()])
       const batch = Number(text(rows[0] ?? {}, 'deleted'))
       deleted += batch
+      // An abort while a batch was in flight rejects, though the batch may have applied.
+      options?.signal?.throwIfAborted()
       if (batch === 0) {
         return deleted
       }
@@ -165,6 +167,8 @@ export class PgViewRepository implements ViewRepository {
       pk,
       resolved,
     ])
+    // An abort while the delete was in flight rejects, though the delete may have applied.
+    options?.signal?.throwIfAborted()
   }
 
   async batchGetViews(pks: readonly string[], options?: CallOptions): Promise<ViewRow[]> {
