@@ -109,8 +109,8 @@ both backends). The row shape and rules are specified in the
 [storage format](../reference/storage-format.md#views); the invariants are under
 [Commit-Wide Projectors](#commit-wide-projectors-v09-c7).
 
-The view repository (Go `dynamo.ViewRepository`; Rust `ViewRepository` on mem, DynamoDB and
-PostgreSQL; TypeScript `ViewRepository` on mem and DynamoDB) refuses U+0000 in a written row's `pk`,
+The view repository (Go `dynamo.ViewRepository`; Rust and TypeScript `ViewRepository` on mem,
+DynamoDB and PostgreSQL) refuses U+0000 in a written row's `pk`,
 `sk`, owner, entity type or payload, and in a `pk`, `sk` or entity type a read, delete or list
 names, with the typed invalid-argument error before any request. A batch holding such a row writes
 nothing. PostgreSQL `text` cannot hold U+0000, so the same call has the same result on every backend
@@ -332,7 +332,8 @@ error before any write and is never split.
   `snapshots.Store.Transaction` refuses one that does not with `*TransactionsUnsupportedError`
   before dispatching anything
 - Go PostgreSQL executes a commit's view operations through its `ViewWriter` (TypeScript: the
-  `PgRepository` `viewWriter` option), and refuses the operations of a transaction group built for
+  `PgRepository` `viewWriter` option, or its views table with `viewsTable: true`, Rust's
+  `with_views_table()`), and refuses the operations of a transaction group built for
   another storage type with `*ProjectorOperationsUnsupportedError` (TypeScript `invalidCommit`)
   before any write; it never drops them
 - A commit that carries projector operations but writes no event is refused before any write
@@ -769,8 +770,9 @@ transaction as the events. The byte-level rules are in the
   `ProjectorOnlyCommit` / `ProjectorWithoutEvents` first. A repository with nowhere to write the
   operations refuses the commit with `ViewsNotConfigured`.
 - Each operation is one action in the 100-action budget and is sized as DynamoDB sizes it (a put its
-  item, a delete its key plus its condition expression); PostgreSQL sizes a statement by its SQL
-  text, so its byte estimate is a lower bound while its action count is exact.
+  item, a delete its key plus its condition expression); PostgreSQL with a view writer sizes a
+  statement by its SQL text, so its byte estimate is a lower bound while its action count is exact.
+  PostgreSQL with the views table sizes each operation as DynamoDB does, so the same commits fail.
 
 **Failure**
 
@@ -787,6 +789,34 @@ transaction as the events. The byte-level rules are in the
   gap, and any conflict on a written stream or a fence are reported first, so it surfaces only when
   nothing above it failed. The first failed operation in transaction order is the one named.
 - Nothing from the commit is written: not its events, not its other rows.
+
+### PostgreSQL views table (ADR 0008)
+
+- `{events}__evt_views` keys collate as `"C"`, so listings order by UTF-8 bytes as on DynamoDB, and
+  `payload` is `text` holding the exact bytes. `ensureSchema` / `ensure_schema` create it in Rust and
+  TypeScript, with Rust's DDL byte for byte; Go never does.
+- A row whose entity type, `pk` and `sk` are over 2,600 UTF-8 bytes together is refused before any
+  write: `invalidArgument` from the view repository, `ViewKeyTooLong` on the commit path.
+- The view repository and the commit target refuse a database whose encoding isn't `UTF8`, checked
+  once per repository on first use.
+- Cursors are DynamoDB's (`pk`, `sk`, and `entityType` for an entity-type listing), so Rust and
+  TypeScript continue each other's listings. A full page has a cursor; an unbounded page holds at
+  most 1,000 rows. Every read sees every committed transaction. `putViews` is one transaction, in
+  key byte order, keeping a repeated key's last row. `purgeExpired(now)` / `purge_expired` deletes
+  only rows whose positive `ttl` has passed.
+- With the views table as the commit target, every put replaces the whole row with `ttl = 0` and is
+  guarded by the owner (`absent`: a plain insert whose key violation fails it; otherwise an upsert
+  `WHERE entity_id = EXCLUDED.entity_id`); a `present` delete fails on no row, and an unconditioned
+  delete fails when another owner holds the key. A repository has the views table or a view writer,
+  never both (TypeScript refuses both at construction).
+- Before its first commit, outside the commit transaction, a views-table repository declares
+  `postgres-views` (version 1) once, after the encoding check. Every commit then requires it: a store
+  that lost it fails the commit as transient, and the retry declares it again. Every PostgreSQL
+  writer without the views table (Go's, and Rust's or TypeScript's with a view writer or none)
+  refuses a store that declares it on commits, snapshot writes and compaction, so a store's views
+  never split across two tables. Initialization still succeeds on such a store.
+- TypeScript doesn't apply the expected-payload condition or write rebuild views on PostgreSQL yet;
+  Rust does both on the views table.
 
 ## Journal (X1, Rust-first)
 

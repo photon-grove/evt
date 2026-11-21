@@ -1,12 +1,16 @@
-// Commit-wide view operations on PostgreSQL (ADR 0004, C7). evt defines no PostgreSQL view schema:
-// the application owns its view tables and their DDL, and a repository's view writer turns each
-// operation into the statement that writes it. The repository runs the statements inside the
-// commit's transaction, after the events and before the snapshots, and reads each condition's
-// verdict from the statement's outcome, as Go's and Rust's repositories do.
+// Commit-wide view operations on PostgreSQL (ADR 0004, C7). A repository writes them either to the
+// evt-owned views table (ADR 0008), with statements evt builds, or to the application's own view
+// tables, through a view writer that turns each operation into the statement that writes it. The
+// repository runs the statements inside the commit's transaction, after the events and before the
+// snapshots, and reads each condition's verdict from the statement's outcome, as Go's and Rust's
+// repositories do.
 
-import {EvtError, ProjectorError, ProjectorOperationError} from '../errors.js'
+import {EvtError, ProjectorError, ProjectorOperationError, ViewKeyTooLongError} from '../errors.js'
 import {type ProjectedView, REASON_CONDITION_FAILED, type ViewOperation} from '../projection.js'
+import {utf8Decode, utf8Length} from '../utf8.js'
+import {checkViewText} from '../views.js'
 import type {PgResult} from './client.js'
+import {MAX_VIEW_INDEX_KEY_BYTES} from './schema.js'
 
 /**
  * The statement that writes one view operation to the application's view table: the text, with
@@ -93,6 +97,92 @@ export function buildViews(views: readonly ProjectedView[], writer: ViewWriter):
 
     return {view, statement}
   })
+}
+
+/**
+ * Builds a commit's statements on the views table `table`, with the DynamoDB repository's owner
+ * rules, as Rust's `with_views_table()` builds them (storage format, "PostgreSQL views table").
+ * It refuses, before any write, what the table can't store: a payload that isn't UTF-8, U+0000 or
+ * a lone surrogate in any text, and a key too long for the btree indexes
+ * ({@link ViewKeyTooLongError}). Every counted statement returns its rows, so its count doesn't
+ * depend on the driver.
+ */
+export function viewsTableStatements(table: string, views: readonly ProjectedView[]): BuiltView[] {
+  return views.map((view) => ({view, statement: viewsTableStatement(table, view)}))
+}
+
+function viewsTableStatement(table: string, view: ProjectedView): ViewStatement {
+  const {op} = view
+  let payload: string
+  try {
+    payload = utf8Decode(op.payload, 'view payload')
+    for (const [field, value] of [
+      ['pk', op.pk],
+      ['sk', op.sk],
+      ['owner', op.owner],
+      ['entity type', op.entityType],
+      ['payload', payload],
+    ] as const) {
+      checkViewText(value, field)
+    }
+  } catch (error) {
+    throw invalidView(view, `the views table can't store it: ${(error as Error).message}`)
+  }
+
+  const bytes = utf8Length(op.entityType) + utf8Length(op.pk) + utf8Length(op.sk)
+  if (bytes > MAX_VIEW_INDEX_KEY_BYTES) {
+    throw new ViewKeyTooLongError(
+      'entity type, pk and sk',
+      bytes,
+      MAX_VIEW_INDEX_KEY_BYTES,
+      view.projector,
+      view.operation,
+    )
+  }
+
+  const key = [op.pk, op.sk, op.owner]
+  const row = [...key, op.entityType, payload]
+  const columns = '(pk, sk, entity_id, entity_type, payload, ttl)'
+  if (op.kind === 'put') {
+    switch (op.condition) {
+      // A plain insert: a violation of the key is the failed condition.
+      case 'absent':
+        return {
+          sql: `INSERT INTO ${table} ${columns} VALUES ($1, $2, $3, $4, $5, 0)`,
+          args: row,
+          keyConstraint: `${table}_pkey`,
+        }
+      // An upsert that replaces only the owner's row: no row when another stream owns it.
+      default:
+        return {
+          sql:
+            `INSERT INTO ${table} ${columns} VALUES ($1, $2, $3, $4, $5, 0) ` +
+            'ON CONFLICT (pk, sk) DO UPDATE SET entity_type = EXCLUDED.entity_type, ' +
+            `payload = EXCLUDED.payload, ttl = 0 WHERE ${table}.entity_id = EXCLUDED.entity_id ` +
+            'RETURNING 1',
+          args: row,
+          returning: true,
+        }
+    }
+  }
+
+  // Deletes the owner's row; no row (absent, or another owner's) fails the condition.
+  if (op.condition === 'present') {
+    return {
+      sql: `DELETE FROM ${table} WHERE pk = $1 AND sk = $2 AND entity_id = $3 RETURNING 1`,
+      args: key,
+      returning: true,
+    }
+  }
+
+  // Deletes the owner's row if there is one, and reports another owner's row instead of the rows
+  // it deleted: any row it reports fails the condition.
+  return {
+    sql:
+      `WITH gone AS (DELETE FROM ${table} WHERE pk = $1 AND sk = $2 AND entity_id = $3) ` +
+      `SELECT 1 FROM ${table} WHERE pk = $1 AND sk = $2 AND entity_id <> $3`,
+    args: key,
+  }
 }
 
 /**

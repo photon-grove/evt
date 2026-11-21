@@ -8,13 +8,18 @@ import process from 'node:process'
 import {Pool} from 'pg'
 
 import {
+  CommitTooLargeError,
+  POSTGRES_VIEWS_FEATURE,
   type ProjectedView,
   ProjectorError,
   ProjectorOperationError,
   type SerializedEvent,
   StreamHeadsNotMigratedError,
+  TransientError,
   UnsupportedFeatureError,
+  ViewKeyTooLongError,
   type ViewOperation,
+  type ViewRow,
   emptyMetadata,
   encodeMetadata,
   deleteView,
@@ -32,6 +37,7 @@ import {
 import {postgresControls} from './controls.js'
 import {Checks} from './harness.js'
 import {postgresViewDdl, postgresViewWriter} from './pgviews.js'
+import {viewRepositoryConformance} from './view-conformance.js'
 
 // The local-only placeholder credentials infra/local-postgres creates.
 const url = process.env['DATABASE_URL'] || 'postgres://evt:evt@localhost:5432/evt_local'
@@ -68,6 +74,7 @@ try {
   }
 
   await postgresCases()
+  await viewsTableCases()
 } finally {
   for (const events of logs) {
     await pool.query(`DROP TABLE IF EXISTS ${tables(events).join(', ')}`)
@@ -105,6 +112,7 @@ function tables(events: string): string[] {
     'rebuild_lock',
     'rebuild_generation',
     'stream_heads',
+    'views',
   ]
 
   return [
@@ -310,6 +318,284 @@ async function postgresCases(): Promise<void> {
       ensure((await repo.events('a')).length === 3, 'the held conditions committed')
     },
   )
+}
+
+// A fresh event log whose commits write their views to its views table.
+async function tableLog(): Promise<PgRepository> {
+  const events = `evt_ts_${run}_${++logCount}`
+  logs.push(events)
+  const repo = new PgRepository(pool, {
+    eventsTable: events,
+    snapshotsTable: `${events}_snaps`,
+    viewsTable: true,
+  })
+  await repo.ensureSchema()
+
+  return repo
+}
+
+// The evt-owned views table (ADR 0008), as Rust's postgres_view_repository_conforms and
+// postgres_views_table_conforms run it: the view repository cases, then what is PostgreSQL's own;
+// the conformance suite with the views table as the commit's view target; the committed rows
+// through the view repository; the budget; and the postgres-views marker feature.
+async function viewsTableCases(): Promise<void> {
+  const noise = noiseSource()
+  const reader = (await tableLog()).viewRepository()
+  await viewRepositoryConformance(checks, 'postgres', reader)
+
+  await checks.case('postgres views: payloads are exact and keys order by bytes', async () => {
+    // The payload is text, not jsonb: whitespace and key order survive.
+    const exact = '{ "b": 1,   "a": [ 2 ] }'
+    await reader.putView(viewRow('exact', 'VIEW', exact))
+    const stored = await reader.getView('exact')
+    ensure(decode(stored?.payload) === exact, `the payload bytes: got ${decode(stored?.payload)}`)
+
+    // "Z" (0x5A) < "b" (0x62) < "é" (0xC3 0xA9), as on DynamoDB, whatever the database collation.
+    for (const sk of ['é', 'b', 'Z']) {
+      await reader.putView(viewRow('ordered', sk))
+    }
+    const order = (await reader.listViewsByPk('ordered')).map((row) => row.sk)
+    ensure(order.join() === 'Z,b,é', `bytewise order: got ${order.join()}`)
+  })
+
+  await checks.case('postgres views: a key the btree indexes cannot hold is refused', async () => {
+    const long = {...viewRow('p'.repeat(2048), 's'.repeat(1000)), entityType: 'kind'}
+    await refusesWith(reader.putView(long), 'invalidArgument', '2600', 'a key over the bound')
+
+    // At the bound, an incompressible key fits both indexes.
+    const boundary = {...viewRow(noise(1598), noise(998)), entityType: noise(4)}
+    await reader.putView(boundary)
+    ensure((await reader.getViewAt(boundary.pk, boundary.sk)) !== null, 'the key at the bound')
+  })
+
+  await checks.case("postgres views: a batch keeps a repeated key's last row", async () => {
+    await reader.putViews([
+      viewRow('batch', 'b', '{"n":1}'),
+      viewRow('batch', 'a', '{"n":2}'),
+      viewRow('batch', 'b', '{"n":3}'),
+    ])
+    const rows = (await reader.listViewsByPk('batch')).map(
+      (row) => `${row.sk}=${decode(row.payload)}`,
+    )
+    ensure(rows.join() === 'a={"n":2},b={"n":3}', `the batch: got ${rows.join()}`)
+  })
+
+  await checks.case('postgres views: an unbounded page holds 1,000 rows and a cursor', async () => {
+    const many = Array.from({length: 1001}, (_, i) => ({
+      ...viewRow('many', String(i).padStart(4, '0')),
+      entityType: 'many',
+    }))
+    await reader.putViews(many)
+    const first = await reader.listViewsByPkPaged('many')
+    ensure(first.views.length === 1000, `the first page: got ${first.views.length}`)
+    ensure(first.nextCursor !== null, 'a full unbounded page has a cursor')
+    ensure((await reader.listViewsByPk('many')).length === 1001, 'the whole partition')
+    ensure((await reader.listViewsByEntityType('many')).length === 1001, 'the whole entity type')
+  })
+
+  await checks.case('postgres views: purgeExpired deletes only the expired rows', async () => {
+    await reader.putViews([
+      {...viewRow('ttl', 'old'), ttl: 1000},
+      {...viewRow('ttl', 'new'), ttl: 4_102_444_800},
+      viewRow('ttl', 'none'),
+    ])
+    ensure((await reader.getViewAt('ttl', 'old')) !== null, 'an expired row reads until a purge')
+    const purged = await reader.purgeExpired(2000)
+    ensure(purged === 1, `purged: got ${purged}`)
+    const left = (await reader.listViewsByPk('ttl')).map((row) => row.sk)
+    ensure(left.join() === 'new,none', `left: got ${left.join()}`)
+  })
+
+  // The conformance suite, its commit-wide views case writing to the views table.
+  const target = await tableLog()
+  await target.initialize()
+  await conformance(checks, target, headFixtures(target))
+
+  await checks.case('postgres views table: committed rows read back as stored', async () => {
+    const repo = await tableLog()
+    const views = repo.viewRepository()
+    // A row written outside a commit, with a ttl, which the owner's commit then replaces.
+    await views.putView({...viewRow('acct', 'VIEW', '{"old":true}'), entityId: 'a', ttl: 99})
+    await repo.commit({
+      entityId: 'a',
+      events: [ledgerEvent('a', 1)],
+      views: [
+        projected(putView('acct', 'VIEW', 'a', 'account', '{ "n": 1 }')),
+        projected(putView('acct', 'gone', 'a', 'account', '{}'), 1),
+      ],
+    })
+    await repo.commit({
+      entityId: 'a',
+      events: [ledgerEvent('a', 2)],
+      views: [projected(deleteView('acct', 'gone', 'a', {condition: 'present'}))],
+    })
+
+    const rows = await views.listViewsByPk('acct')
+    const shown = rows.map((row) => [
+      row.sk,
+      row.entityId,
+      row.entityType,
+      decode(row.payload),
+      row.ttl,
+    ])
+    ensure(
+      JSON.stringify(shown) === JSON.stringify([['VIEW', 'a', 'account', '{ "n": 1 }', 0]]),
+      `the rows: got ${JSON.stringify(shown)}`,
+    )
+    const listed = await views.listViewsByEntityType('account')
+    ensure(listed.length === 1 && listed[0]!.pk === 'acct', 'listed by entity type')
+  })
+
+  await checks.case('postgres views table: each view counts as its DynamoDB item', async () => {
+    const repo = await tableLog()
+    const puts = (count: number) =>
+      Array.from({length: count}, (_, n) =>
+        projected(putView('k', String(n).padStart(3, '0'), 'a', 'ledger', '{}'), n),
+      )
+    // Two control checks, the head and the event leave room for 96 views.
+    await refuses(
+      repo.commit({entityId: 'a', events: [ledgerEvent('a', 1)], views: puts(97)}),
+      CommitTooLargeError,
+      '97 views',
+    )
+    const big = `"${'x'.repeat(400_000)}"`
+    await refuses(
+      repo.commit({
+        entityId: 'a',
+        events: [ledgerEvent('a', 1)],
+        views: [projected(putView('k', 'big', 'a', 'ledger', big))],
+      }),
+      CommitTooLargeError,
+      'a view over the item limit',
+    )
+    ensure((await repo.events('a')).length === 0, 'the refused commits wrote nothing')
+    await repo.commit({entityId: 'a', events: [ledgerEvent('a', 1)], views: puts(96)})
+    ensure((await repo.viewRepository().listViewsByPk('k')).length === 96, 'the rows of 96 views')
+  })
+
+  await checks.case(
+    'postgres views table: a key over the index bound is refused before any write',
+    async () => {
+      const repo = await tableLog()
+      const long = putView('p'.repeat(2048), 's'.repeat(549), 'a', 'abcd', '{}')
+      await refuses(
+        repo.commit({entityId: 'a', events: [ledgerEvent('a', 1)], views: [projected(long)]}),
+        ViewKeyTooLongError,
+        'a key a byte over the bound',
+      )
+      ensure((await repo.events('a')).length === 0, 'the refused commit wrote nothing')
+      const boundary = putView(noise(1598), noise(998), 'a', noise(4), '{}')
+      await repo.commit({
+        entityId: 'a',
+        events: [ledgerEvent('a', 1)],
+        views: [projected(boundary)],
+      })
+    },
+  )
+
+  await checks.case(
+    'postgres views table: the first commit declares postgres-views, and other writers refuse it',
+    async () => {
+      const repo = await tableLog()
+      await repo.commit({entityId: 'a', events: [ledgerEvent('a', 1)]})
+      const manifest = await controls(repo).manifest()
+      ensure(manifest?.features.get(POSTGRES_VIEWS_FEATURE) === 1, 'the feature is declared')
+
+      const {events, snapshots} = repo.tables
+      const others = [
+        new PgRepository(pool, {eventsTable: events, snapshotsTable: snapshots}),
+        new PgRepository(pool, {
+          eventsTable: events,
+          snapshotsTable: snapshots,
+          viewWriter: postgresViewWriter(`${events}_views`),
+        }),
+      ]
+      for (const other of others) {
+        await refuses(
+          other.commit({entityId: 'b', events: [ledgerEvent('b', 1)]}),
+          UnsupportedFeatureError,
+          'a commit by a writer without the views table',
+        )
+        await refuses(
+          other.putSnapshot({
+            entityType: 'ledger',
+            entityId: 'b',
+            sequence: 0n,
+            eventSequence: 0n,
+            payload: new Uint8Array(),
+          }),
+          UnsupportedFeatureError,
+          'a snapshot write by a writer without the views table',
+        )
+        await refuses(
+          other.compactBelow('a', 1n),
+          UnsupportedFeatureError,
+          'a compaction by a writer without the views table',
+        )
+      }
+      ensure((await repo.events('b')).length === 0, 'the refused writers wrote nothing')
+
+      // Initialization still works on the declared store, as a deploy step runs it.
+      ensure(!(await repo.initialize()), 'already initialized')
+      ensure(!(await others[0]!.initialize()), 'already initialized, for any writer')
+    },
+  )
+
+  await checks.case(
+    'postgres views table: a store that lost the declaration is declared again on retry',
+    async () => {
+      const repo = await tableLog()
+      await repo.commit({entityId: 'a', events: [ledgerEvent('a', 1)]})
+      await controls(repo).declare((draft) => draft.features.delete(POSTGRES_VIEWS_FEATURE))
+      await refuses(
+        repo.commit({entityId: 'a', events: [ledgerEvent('a', 2)]}),
+        TransientError,
+        'a commit after the declaration was lost',
+      )
+      await repo.commit({entityId: 'a', events: [ledgerEvent('a', 2)]})
+      const manifest = await controls(repo).manifest()
+      ensure(manifest?.features.get(POSTGRES_VIEWS_FEATURE) === 1, 'declared again')
+      ensure((await repo.events('a')).length === 2, 'the retry committed')
+    },
+  )
+}
+
+// A view row owned by `owner`, of entity type `kind`.
+function viewRow(pk: string, sk: string, payload = '{}'): ViewRow {
+  return {pk, sk, entityId: 'owner', entityType: 'kind', payload: new TextEncoder().encode(payload)}
+}
+
+function decode(payload: Uint8Array | undefined): string {
+  return new TextDecoder().decode(payload)
+}
+
+// Incompressible printable ASCII from a fixed seed, as Rust's case builds its boundary key.
+function noiseSource(): (length: number) => string {
+  let seed = 0x9e3779b97f4a7c15n
+
+  return (length) => {
+    let out = ''
+    for (let i = 0; i < length; i++) {
+      seed = (seed * 6364136223846793005n + 1n) & 0xffffffffffffffffn
+      out += String.fromCharCode(33 + Number((seed >> 33n) % 94n))
+    }
+
+    return out
+  }
+}
+
+// Fails unless the call rejects with an EvtError of `code` whose message holds `text`.
+async function refusesWith(call: Promise<unknown>, code: string, text: string, what: string) {
+  try {
+    await call
+  } catch (error) {
+    const {code: got, message} = error as {code?: unknown; message?: unknown}
+    ensure(got === code && String(message).includes(text), `${what}: got ${String(error)}`)
+
+    return
+  }
+
+  throw new Error(`${what}: resolved, want ${code}`)
 }
 
 // The compat view writer with RETURNING on its puts and present deletes, which makes their count

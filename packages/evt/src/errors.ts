@@ -58,7 +58,8 @@ import type {ProjectedView} from './projection.js'
  *   so the command ran, but no outcome row says how. Nothing was written.
  * - `invalidViewOperation`: a commit-wide projector's view operation is malformed, or names an
  *   owner the commit didn't write. Nothing was written.
- * - `viewKeyTooLong`: a view operation's `pk` is over 2048 UTF-8 bytes or its `sk` over 1024.
+ * - `viewKeyTooLong`: a view operation's `pk` is over 2048 UTF-8 bytes or its `sk` over 1024, or,
+ *   on PostgreSQL's views table, its entity type, `pk` and `sk` are over 2600 together.
  * - `duplicateViewKey`: two view operations of one commit name the same row.
  * - `reservedViewKey`: a view operation's `pk` is in a partition the engine keeps for itself.
  * - `projector`: a commit-wide projector threw. Nothing was written.
@@ -621,18 +622,21 @@ export class DuplicateCommandError extends EvtError {
   }
 }
 
-/** A view operation's key is over its limit: `pk` 2048 UTF-8 bytes, `sk` 1024. */
+/**
+ * A view operation's key is over its limit: `pk` 2048 UTF-8 bytes, `sk` 1024, and, on a
+ * PostgreSQL repository writing to its views table, the entity type, `pk` and `sk` 2600 together.
+ */
 export class ViewKeyTooLongError extends EvtError {
   override readonly name = 'ViewKeyTooLongError'
   override readonly code = 'viewKeyTooLong'
-  readonly field: 'pk' | 'sk'
+  readonly field: 'pk' | 'sk' | 'entity type, pk and sk'
   readonly length: number
   readonly max: number
   readonly projector: string
   readonly operation: number
 
   constructor(
-    field: 'pk' | 'sk',
+    field: 'pk' | 'sk' | 'entity type, pk and sk',
     length: number,
     max: number,
     projector: string,
