@@ -38,6 +38,7 @@ import {
   checkViews,
   commitStream,
   deleteView,
+  expectPayload,
   groupCommits,
   projectViews,
   putView,
@@ -166,6 +167,16 @@ describe('projectViews', () => {
     }
     expect(() => projectViews([undeclared], commitOf(['a', 'ledger', 1]))).toThrow(
       /does not declare in its history/,
+    )
+  })
+
+  test("refuses a projector's expected payload, which is the engine's alone", () => {
+    const forger: CommitProjector = {
+      name: 'p',
+      project: () => [expectPayload(putView('k', 'a', 'a', 'ledger', '{}'), encoder.encode('{}'))],
+    }
+    expect(() => projectViews([forger], commitOf(['a', 'ledger', 1]))).toThrow(
+      /operation 0: an expected payload is the engine's alone/,
     )
   })
 
@@ -450,6 +461,35 @@ describe('DynamoRepository views', () => {
         ExpressionAttributeValues: {':owner': {S: 'a'}},
       },
     })
+  })
+
+  test("conditions an expected payload's put on the owner's exact row", async () => {
+    const client = new Scripted()
+    const counter = expectPayload(
+      putView('journal-counter#s', 'COUNTER', 'SYSTEM#JOURNAL', 'journal-counter', '{"n":2}'),
+      encoder.encode('{"n":1}'),
+    )
+    await new DynamoRepository(client, 'events', {viewsTable: 'views'}).commit({
+      entityId: 'a',
+      events: [event('a', 1)],
+      views: [projected(counter)],
+    })
+
+    expect(client.transactions[0]![2]).toEqual({
+      Put: {
+        TableName: 'views',
+        Item: {
+          pk: {S: 'journal-counter#s'},
+          sk: {S: 'COUNTER'},
+          entityID: {S: 'SYSTEM#JOURNAL'},
+          entityType: {S: 'journal-counter'},
+          payload: {S: '{"n":2}'},
+        },
+        ConditionExpression: 'entityID = :owner AND payload = :expected',
+        ExpressionAttributeValues: {':owner': {S: 'SYSTEM#JOURNAL'}, ':expected': {S: '{"n":1}'}},
+      },
+    })
+    expect(viewOperationSize(counter)).toBe(viewOperationSize({...counter, expectedPayload: null}))
   })
 
   test("keeps a payload's leading byte order mark", async () => {
