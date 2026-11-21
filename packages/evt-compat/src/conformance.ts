@@ -2038,6 +2038,10 @@ export async function markerConformance(
       'the durable historyDependent set refuses compaction',
       () => historyDependentRefusal(repo, controls),
     ],
+    [
+      'declaring history-dependent types adds the missing ones in one declaration',
+      () => historyDeclaration(repo, controls),
+    ],
     ['the retention set is stored sorted and deduplicated', () => retentionSet(repo, controls)],
     ['a fence on a retained entity type is refused', () => fenceRetention(repo, controls)],
     [
@@ -2225,6 +2229,51 @@ async function historyDependentRefusal(
 
   await controls.declare(streamHeadsOnly)
   ensureEqual(await repo.compactBelow(audited.id, 3n), 3, 'the type compacts once removed')
+}
+
+async function historyDeclaration(
+  repo: Repository & StoreInitializer,
+  controls: ControlFixtures,
+): Promise<void> {
+  const declare = repo.declareHistoryDependent?.bind(repo)
+  if (declare === undefined) {
+    throw new Failure('the repository declares no history-dependent types')
+  }
+
+  const ns = namespace()
+  const audited = new Stream(ns, 'audited', `${ns}-audit`)
+  await settled(() => audited.commit(repo, audited.events(1, 2), audited.newSnapshot(1, '{}')))
+
+  const before = (await controls.manifest())!
+  await declare([`${ns}-z`, audited.entityType, `${ns}-z`])
+  const declared = (await controls.manifest())!
+  ensureEqual(declared.version, before.version + 1n, 'one declaration')
+  ensureEqual(
+    declared.historyDependent,
+    [audited.entityType, `${ns}-z`],
+    'the set, sorted and deduplicated',
+  )
+
+  // Declaring them again writes nothing, and the writer goes on writing.
+  await declare([audited.entityType])
+  ensureEqual((await controls.manifest())!.version, declared.version, 'no second declaration')
+  await settled(() => audited.commit(repo, audited.events(3, 3)))
+  await expectError(
+    repo.compactBelow(audited.id, 2n),
+    'compacting a declared type',
+    (error) => error instanceof HistoryDependentProjectionError,
+  )
+
+  // A store that declares a feature this package doesn't model refuses the declaration.
+  await controls.declare((draft) => draft.features.set('compat-unsupported', 1))
+  await expectError(
+    declare([`${ns}-y`]),
+    'a declaration on a store with an unsupported feature',
+    (error) => error instanceof UnsupportedFeatureError,
+  )
+  ensure(!(await controls.manifest())!.historyDependent.includes(`${ns}-y`), 'nothing declared')
+
+  await controls.declare(streamHeadsOnly)
 }
 
 async function retentionSet(

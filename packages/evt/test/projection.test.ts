@@ -27,7 +27,7 @@ import {
   ViewsNotConfiguredError,
 } from '../src/errors.ts'
 import {type SerializedEvent, eventId} from '../src/event.ts'
-import {MemRepository} from '../src/memory/repository.ts'
+import {MemRepository, controlFixtures} from '../src/memory/repository.ts'
 import {PgRepository} from '../src/postgres/repository.ts'
 import {emptyMetadata} from '../src/metadata.ts'
 import {
@@ -685,7 +685,7 @@ describe('Store commit projectors', () => {
     ])
   })
 
-  test('refuses a repository that writes no views, and a history-dependent projector', async () => {
+  test('refuses a repository that writes no views, or declares no history for a projector', async () => {
     const plain = new MemRepository()
     const repository: Repository = {
       commit: (commit, options) => plain.commit(commit, options),
@@ -703,11 +703,117 @@ describe('Store commit projectors', () => {
     expect(await plain.events('a')).toEqual([])
 
     const historical = await failure(
-      new Store(new MemRepository(), {
+      new Store(Object.assign(repository, {writesViews: () => true}), {
         commitProjectors: [{...totals, history: ['ledger']}],
-      }).execute(ledger, 'a', 1),
+      }).execute(ledger, 'b', 1),
     )
     expect(historical).toMatchObject({code: 'historyDeclarationUnsupported'})
+    expect(await plain.events('b')).toEqual([])
+  })
+
+  test('declares a history-dependent projector type once, before its first commit', async () => {
+    const repository = new MemRepository()
+    const declared: string[][] = []
+    const declare = repository.declareHistoryDependent.bind(repository)
+    repository.declareHistoryDependent = async (types, options) => {
+      declared.push([...types])
+      await declare(types, options)
+    }
+    const seen: string[] = []
+    const audit: CommitProjector = {
+      name: 'audit',
+      history: ['ledger', 'other', 'ledger'],
+      project: (commit) => {
+        seen.push(`${commit.commitId}:${commit.streams.flatMap((s) => s.events).length}`)
+        return commit.streams.map((stream) =>
+          putView('audit', stream.entityId, stream.entityId, stream.entityType, '{}'),
+        )
+      },
+    }
+    const store = new Store(repository, {snapshotInterval: 1, commitProjectors: [audit]})
+    await store.execute(ledger, 'a', 2, {metadata: {commandId: 'c1'}})
+    const transaction = store.transaction()
+    transaction.append(await transaction.read(ledger, 'b'), [
+      {type: 'ledger:added', data: {amount: 1}},
+    ])
+    await transaction.commit({metadata: {commandId: 'c2'}})
+
+    // Declared once for the store, before the first commit, which ran the projector with history.
+    expect(declared).toEqual([['ledger', 'other']])
+    expect(seen).toEqual(['c1:1', 'c2:1'])
+    expect(repository.views().map((row) => row.sk)).toEqual(['a', 'b'])
+
+    // A declared type is never compacted, in any process.
+    const compaction = await failure(repository.compactBelow('a', 1n))
+    expect(compaction).toMatchObject({code: 'historyDependentProjection'})
+
+    // Another store declares again, and nothing changes: the types are already there.
+    await new Store(repository, {commitProjectors: [audit]}).execute(ledger, 'a', 1)
+    expect(declared).toHaveLength(2)
+  })
+
+  test('a failed declaration marks nothing, and the next commit declares again', async () => {
+    const repository = new MemRepository()
+    const declare = repository.declareHistoryDependent.bind(repository)
+    let calls = 0
+    repository.declareHistoryDependent = async (types, options) => {
+      calls++
+      if (calls === 1) {
+        throw new Error('marker unavailable')
+      }
+      await declare(types, options)
+    }
+    const store = new Store(repository, {commitProjectors: [{...totals, history: ['ledger']}]})
+    expect(await failure(store.execute(ledger, 'a', 1))).toMatchObject({
+      message: 'marker unavailable',
+    })
+    expect(await repository.events('a')).toEqual([])
+
+    await store.execute(ledger, 'a', 1)
+    expect(calls).toBe(2)
+    expect((await repository.events('a')).length).toBe(1)
+  })
+
+  test('concurrent first commits share one declaration', async () => {
+    const repository = new MemRepository()
+    const declare = repository.declareHistoryDependent.bind(repository)
+    let calls = 0
+    repository.declareHistoryDependent = async (types, options) => {
+      calls++
+      await new Promise((resolve) => setTimeout(resolve, 5))
+      await declare(types, options)
+    }
+    const store = new Store(repository, {commitProjectors: [{...totals, history: ['ledger']}]})
+    await Promise.all(['a', 'b', 'c'].map((id) => store.execute(ledger, id, 1)))
+    expect(calls).toBe(1)
+  })
+
+  test('a store with outcomes declares before its commit, and through a FaultRepository', async () => {
+    const repository = new MemRepository()
+    const faulty = new FaultRepository(repository)
+    expect(faulty.declareHistoryDependent).toBeTypeOf('function')
+    const store = new Store(faulty, {
+      outcomes: {},
+      commitProjectors: [{...totals, history: ['ledger']}],
+    })
+    const identified = {
+      ...ledger,
+      identify: (amount: number) => ({
+        commandType: 'ledger:add',
+        payload: new TextEncoder().encode(`${amount}`),
+      }),
+    }
+    const outcome = await store.executeWithOutcome(identified, 'a', 2, {
+      metadata: {commandId: 'c1'},
+    })
+    expect(outcome.outcome.status).toBe('accepted')
+    expect(controlFixtures(repository).manifest()?.historyDependent).toEqual(['ledger'])
+
+    // A wrapped repository that can't declare leaves the wrapper without the method.
+    const plain = Object.assign(Object.create(repository) as MemRepository, {
+      declareHistoryDependent: undefined,
+    })
+    expect(new FaultRepository(plain).declareHistoryDependent).toBeUndefined()
   })
 
   test('each projector reads its own copy of the commit', async () => {

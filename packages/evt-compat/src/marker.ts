@@ -1,17 +1,21 @@
-// feature-marker.json: the declarations (the manifest's stored JSON texts and its DynamoDB item,
-// for each declaration of a chain) and the streamHeads requests of the DynamoDB writer. The view
-// commits and the PostgreSQL rows and writes wait for the backends that write them. The
-// postgresSchemas DDL is checked byte for byte, so every language creates the same schema.
+// feature-marker.json: the declarations (the manifest's stored JSON texts, its DynamoDB item and
+// its PostgreSQL row and write, for each declaration of a chain), the commits a writer sends
+// against a declared and a fresh marker, and the streamHeads and commitViews requests of the
+// DynamoDB writer. The postgresSchemas DDL is checked byte for byte, so every language creates the
+// same schema.
 import {
   type Commit,
   type FeatureManifest,
   type JsonValue,
   type SerializedEvent,
   type SerializedSnapshot,
+  decodeMetadata,
   emptyMetadata,
   encodeManifest,
   eventId,
   normalizeTransaction,
+  STREAM_HEADS_FEATURE,
+  STREAM_HEADS_VERSION,
   viewOperationSize,
 } from '@photon-grove/evt'
 import {
@@ -25,8 +29,9 @@ import {
   snapshotTransaction,
   transactionItems,
   transactItemSize,
+  viewProjector,
 } from '@photon-grove/evt/dynamodb'
-import {pgTables, schemaDdl} from '@photon-grove/evt/postgres'
+import {manifestRow, manifestWrite, pgTables, schemaDdl} from '@photon-grove/evt/postgres'
 
 import {milliseconds} from './codec.js'
 import {stepViews} from './runner.js'
@@ -36,6 +41,8 @@ export async function markerVectors(checks: Checks): Promise<void> {
   const declarations = list(field(await loadFixture('feature-marker.json'), 'declarations'))
   checks.equal('feature-marker declarations present', declarations.length > 0, true)
 
+  // The vectors are one chain of declarations: each declares over the one before.
+  let stored: FeatureManifest | null = null
   for (const vector of declarations) {
     const name = `feature-marker declaration ${str(field(vector, 'name'))}`
     checks.run(name, () => {
@@ -65,8 +72,46 @@ export async function markerVectors(checks: Checks): Promise<void> {
 
       // Decoding the item gives back the manifest as stored: each set sorted and deduplicated.
       checks.equal(`${name} decoded`, canonical(markerItem(manifestFromItem(item))), want)
+
+      // The PostgreSQL row, and the statement that writes it over the chain's previous one, as
+      // Go's repository runs it: the SQL with its whitespace, casts and RETURNING aside.
+      const row = field(output, 'postgresRow')
+      checks.equal(
+        `${name} postgresRow`,
+        canonical(manifestRow(manifest)),
+        canonical({
+          id: num(field(row, 'id')),
+          version: int(field(row, 'version')).toString(),
+          features: str(field(row, 'features')),
+          history_dependent: str(field(row, 'history_dependent')),
+          retention: str(field(row, 'retention')),
+        }),
+      )
+      const write = manifestWrite(pgTables(), stored, manifest)
+      const wantWrite = field(output, 'postgresWrite')
+      checks.equal(
+        `${name} postgresWrite`,
+        canonical({sql: statementShape(write.text), args: write.values}),
+        canonical({
+          sql: statementShape(str(field(wantWrite, 'sql'))),
+          args: list(field(wantWrite, 'args')).map((arg) =>
+            typeof arg === 'string' ? arg : int(arg).toString(),
+          ),
+        }),
+      )
+      stored = manifest
     })
   }
+}
+
+// A statement as Go's and this package's writers both shape it: whitespace collapsed, and without
+// the casts and the RETURNING clause this package adds so that no driver parses a value.
+function statementShape(sql: string): string {
+  return sql
+    .replaceAll('::bigint', '')
+    .replace(/ RETURNING 1$/, '')
+    .replace(/\s+/g, ' ')
+    .trim()
 }
 
 // The streamHeads vectors this package's writers produce: single-stream commits, a transaction
@@ -292,6 +337,87 @@ function normalize(action: TransactItem): unknown {
   }
 
   return normalized
+}
+
+// The commits vectors: a writer's commit with the per-entity view projector's row, against a store
+// whose manifest a declaration of the chain left, or a fresh one the writer declares stream-heads
+// on before its first commit, whose marker check then conditions on that version.
+export async function commitVectors(checks: Checks): Promise<void> {
+  const fixture = await loadFixture('feature-marker.json')
+  const versions = new Map(
+    list(field(fixture, 'declarations')).map((vector) => [
+      str(field(vector, 'name')),
+      int(field(field(field(vector, 'output'), 'postgresRow'), 'version')),
+    ]),
+  )
+  const vectors = list(field(fixture, 'commits'))
+  checks.equal('feature-marker commits present', vectors.length > 0, true)
+
+  for (const vector of vectors) {
+    const name = `feature-marker commit ${str(field(vector, 'name'))}`
+    checks.run(name, () => {
+      const input = field(vector, 'input')
+      const declaration = str(field(input, 'markerDeclaration'))
+      let version = versions.get(declaration)
+      if (declaration === '') {
+        const declared: FeatureManifest = {
+          version: 1n,
+          features: new Map([[STREAM_HEADS_FEATURE, STREAM_HEADS_VERSION]]),
+          historyDependent: [],
+          retention: [],
+        }
+        checks.equal(
+          `${name} declared`,
+          canonical(markerItem(declared)),
+          canonical(plain(field(vector, 'declared'))),
+        )
+        version = declared.version
+      }
+      if (version === undefined) {
+        throw new Error(`no declaration ${declaration}`)
+      }
+
+      const raw = field(input, 'event')
+      const entityId = str(field(raw, 'entityId'))
+      const entityType = str(field(raw, 'entityType'))
+      const event: SerializedEvent = {
+        id: str(field(raw, 'id')),
+        sequence: int(field(raw, 'sequence')),
+        type: str(field(raw, 'type')),
+        version: num(field(raw, 'version')),
+        entityId,
+        entityType,
+        payload: encoder.encode(str(field(raw, 'payload'))),
+        metadata: decodeMetadata(str(field(raw, 'metadataJson'))),
+      }
+      const group = viewProjector(str(field(input, 'viewsTable'))).project({
+        entityType,
+        entityId,
+        state: null,
+        encodedState: encoder.encode(str(field(input, 'viewState'))),
+        events: [event],
+      })
+      const snapshot = field(input, 'snapshot')
+      const commit: Commit = {
+        entityId,
+        events: [event],
+        projections: group === null ? [] : [group],
+        ...(snapshot !== null && {
+          snapshot: {
+            entityType: str(field(snapshot, 'entityType')),
+            sequence: int(field(snapshot, 'sequence')),
+            payload: encoder.encode(str(field(snapshot, 'payload'))),
+          },
+        }),
+      }
+      const got = commitTransaction(str(field(input, 'eventsTable')), commit, version)
+      checks.equal(
+        name,
+        canonical(got.map(normalize)),
+        canonical(list(field(vector, 'output')).map(plain)),
+      )
+    })
+  }
 }
 
 export async function postgresSchemaVectors(checks: Checks): Promise<void> {

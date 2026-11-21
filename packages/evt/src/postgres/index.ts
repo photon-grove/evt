@@ -2,6 +2,7 @@
 // `pg`'s Pool, or anything shaped like it, as a PgClient.
 
 export {type PgClient, type PgConnection, type PgQueryable, type PgResult} from './client.js'
+export {type ManifestRow, manifestRow, manifestWrite} from './marker.js'
 export {
   type OutcomeRow,
   insertOutcomeSql,

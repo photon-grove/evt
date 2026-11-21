@@ -193,9 +193,9 @@ of `AbortSignal`, which the DOM library, `@types/node`, and Bun's and Deno's typ
 - **The feature marker.** A store keeps one manifest of the features it uses. Every write path
   refuses a store that declares a feature this package doesn't model (the journal, journal
   compaction, the PostgreSQL views table) with an `UnsupportedFeatureError`, and compaction
-  refuses an entity type the manifest declares history-dependent. `MemRepository` declares the
-  required `stream-heads` feature on a fresh store's first write, and `initialize()` declares it
-  up front.
+  refuses an entity type the manifest declares history-dependent, which every repository's
+  `declareHistoryDependent(types)` declares. `MemRepository` declares the required `stream-heads`
+  feature on a fresh store's first write, and `initialize()` declares it up front.
 - **Projectors.** An aggregate's `projectors` run on the state after each commit's events, and
   the operations they return are written in the commit's own transaction, by the backend they
   name. `MemRepository` budgets them and writes none, as Go's in-memory repository does, so code
@@ -214,8 +214,12 @@ of `AbortSignal`, which the DOM library, `@types/node`, and Bun's and Deno's typ
   operation's own `conflict` error as `mapped`. Operations are checked before any write (keys up to
   2048 and 1024 bytes, no key twice, none in the engine's journal partitions), and counted in the
   commit budget. `MemRepository` keeps the rows (`view`, `views`), `DynamoRepository` writes
-  them to its `viewsTable`, and `PgRepository` through its `viewWriter`. Only current-state projectors run for now: one that names a `history`
-  is refused. `groupCommits` regroups stored events into the commits that wrote them.
+  them to its `viewsTable`, and `PgRepository` through its `viewWriter`. A projector that names a
+  `history` of entity types is history-dependent: it also gets the commit ID and the events of
+  those types, and the store declares them in its feature manifest's historyDependent set, once,
+  before the first commit that runs it, so compaction refuses them in every process. A repository
+  without `declareHistoryDependent` refuses it with `historyDeclarationUnsupported`.
+  `groupCommits` regroups stored events into the commits that wrote them.
 - **Rebuilds.** While a projection rebuild holds the store, every commit fails with a
   `RebuildInProgressError`. It's retryable, so `executeWithRetry` runs the command again after its
   backoff, though a rebuild usually outlasts the default policy's attempts.

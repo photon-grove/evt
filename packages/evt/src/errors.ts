@@ -69,7 +69,7 @@ import type {ProjectedView} from './projection.js'
  * - `viewsUnsupported`: a store has commit-wide projectors, and its repository doesn't write view
  *   operations.
  * - `historyDeclarationUnsupported`: a history-dependent projector needs its entity types declared
- *   in the store's feature manifest, which this package can't do yet.
+ *   in the store's feature manifest, and the repository has no `declareHistoryDependent`.
  * - `commitOrder`: stored commits have no order every stream agrees with.
  * - `invalidJournal`: a journal configuration, scope or stored allocation is invalid, such as an
  *   empty or oversized scope, or a malformed allocation in an event's metadata. Nothing was

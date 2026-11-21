@@ -33,6 +33,7 @@ import {
   STREAM_HEADS_VERSION,
   checkSupported,
   declaresStreamHeads,
+  missingHistoryDependent,
 } from '../features.js'
 import {int64Argument} from '../fields.js'
 import {type Outcome, checkCommandId} from '../outcome.js'
@@ -214,6 +215,35 @@ export class DynamoRepository implements OutcomeRepository, StoreInitializer {
         return wrote
       } finally {
         // A declaration, or its retraction, moved the version: the next write reads it again.
+        this.#validated = null
+      }
+    })
+  }
+
+  /**
+   * Adds the entity types to the feature manifest's historyDependent set in one conditional
+   * declaration, so compaction refuses them in every process. The store is validated first, as a
+   * write validates it: an uninitialized store is refused (or, initializing lazily, declared) before
+   * anything is declared. Types already declared are left alone, and nothing is written when there
+   * are none to add.
+   */
+  async declareHistoryDependent(types: readonly string[], options?: CallOptions): Promise<void> {
+    options?.signal?.throwIfAborted()
+    const request = requestOptions(options)
+
+    await this.#exclusive(async () => {
+      await this.#validate(true, request)
+      const declared = await this.#declare((draft) => {
+        // Another writer may have declared a feature this package doesn't model since.
+        const stored = {...draft, version: 0n}
+        checkSupported(stored)
+        const missing = missingHistoryDependent(stored, types)
+        draft.historyDependent.push(...missing)
+
+        return missing.length > 0
+      }, request)
+      if (declared.wrote) {
+        // The declaration moved the version: the next write reads it again.
         this.#validated = null
       }
     })
