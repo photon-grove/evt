@@ -5,6 +5,7 @@ import {Checks} from './harness.js'
 import {commitViewVectors, headVectors, markerVectors, postgresSchemaVectors} from './marker.js'
 import {outcomeVectors} from './outcomes.js'
 import {scenarioChecks} from './scenarios.js'
+import {viewVectors} from './views.js'
 
 const checks = new Checks()
 
@@ -23,5 +24,6 @@ await commitViewVectors(checks)
 await postgresSchemaVectors(checks)
 await outcomeVectors(checks)
 await scenarioChecks(checks)
+await viewVectors(checks)
 
 checks.report()
