@@ -4,6 +4,14 @@
 
 export {AssertionError, deepEqual} from './equal.js'
 export {FaultRepository} from './fault.js'
+// The journal's internal hooks, for a test's repository wrapper that sits under a journal: it
+// forwards a journal writer's acceptance and the journal's own declarations to what it wraps.
+export {
+  JOURNAL_MARKER,
+  JOURNAL_WRITER_TARGET,
+  type JournalDeclared,
+  type JournalMarker,
+} from '../features.js'
 export {
   type Committed,
   DEFAULT_ENTITY_ID,

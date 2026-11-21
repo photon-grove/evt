@@ -82,6 +82,12 @@ import type {ProjectedView} from './projection.js'
  *   Retryable.
  * - `rebuildEpochChanged`: the rebuild generation changed during a read of derived state.
  *   Retryable.
+ * - `invalidJournal`: a journal configuration, scope or stored allocation is invalid, such as an
+ *   empty or oversized scope, or a malformed allocation in an event's metadata. Nothing was
+ *   written.
+ * - `journalRowTooLarge`: a journal row is over the configured size cap. Nothing was written.
+ * - `expectedPayloadUnsupported`: the journal was asked to commit through a repository that
+ *   doesn't apply the expected-payload view condition its counters need. Nothing was written.
  */
 export type EvtErrorCode =
   | 'invalidJson'
@@ -131,6 +137,9 @@ export type EvtErrorCode =
   | 'rebuildStateInvalid'
   | 'rebuildUnavailable'
   | 'rebuildEpochChanged'
+  | 'invalidJournal'
+  | 'journalRowTooLarge'
+  | 'expectedPayloadUnsupported'
 
 export class EvtError extends Error {
   override readonly name: string = 'EvtError'

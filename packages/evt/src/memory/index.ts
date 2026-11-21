@@ -8,8 +8,10 @@ export {
   type MemRepositoryOptions,
   type RebuildFixture,
   type RebuildState,
+  type ViewFixtures,
   type ViewRow,
   controlFixtures,
   headFixtures,
+  viewFixtures,
 } from './repository.js'
 export {MemViewRepository} from './views.js'

@@ -13,7 +13,8 @@ npm install @photon-grove/evt
 
 So far it has the core, multi-stream transactions with read fences, command outcomes,
 commit-wide projectors, the in-memory, DynamoDB and PostgreSQL backends, the view repository
-with its typed view codec, and the testing helpers. The
+with its typed view codec, the journal on the in-memory and DynamoDB backends, and the testing
+helpers. The
 [feature matrix](https://github.com/photon-grove/evt/blob/main/docs/reference/feature-matrix.md)
 tracks each one. The
 [getting started guide](https://github.com/photon-grove/evt/blob/main/docs/guide/getting-started.md#the-same-model-in-typescript)
@@ -28,6 +29,7 @@ builds a bank account aggregate with it, end to end.
 | `@photon-grove/evt/testing`  | `scenario` and `Fixture`, the given/when/then helpers over `MemRepository` |
 | `@photon-grove/evt/dynamodb` | `DynamoRepository`, `viewProjector`, `DynamoViewRepository`, item codecs   |
 | `@photon-grove/evt/postgres` | `PgRepository`, `PgViewRepository`, `ViewWriter`, the schema and its DDL   |
+| `@photon-grove/evt/journal`  | `Journal`, `JournalRepository`, `page` and `replay`: the journal           |
 
 ## DynamoDB
 
@@ -167,6 +169,47 @@ writes its rows in one transaction, so unlike DynamoDB's batch it's atomic. Expi
 readable until `purgeExpired(now)` deletes them, since PostgreSQL has no TTL sweep. Go has no
 PostgreSQL view repository.
 
+## Journal
+
+The journal (`@photon-grove/evt/journal`, [ADR 0005](https://github.com/photon-grove/evt/blob/main/docs/adr/0005-rust-first-extensions-journal-and-lambda.md))
+delivers a store's events in per-scope order, as rows written in the commit that wrote the events.
+A `Journal` names the entity types it covers and maps each of their events to zero or more scopes,
+with a pure function of the event. A `JournalRepository` wraps an in-memory repository, or a
+DynamoDB one with a views table, and journals every commit through it:
+
+```ts
+import {Journal, JournalRepository} from '@photon-grove/evt/journal'
+
+const journal = new Journal(['account'], (event) => [`account:${event.entityId}`])
+const repository = new JournalRepository(new DynamoRepository(client, 'events', {viewsTable}), journal)
+const store = new Store(repository)
+
+const page = await repository.page('account:a-1', 0n, 100)
+```
+
+- **Allocations live on the event.** Each event takes the next position in each of its scopes,
+  stored in its metadata extension `evt.journal`, so every row and counter can be derived again
+  from the stored events (`replay`). The store hands back the events as stored, allocations
+  included, through the commit's receipt. No other projector sees the extension.
+- **Rows and counters commit with the events.** The journal's rows come from its own
+  history-dependent projector, each owned by its event's stream and claimed only if absent, and
+  each scope's counter is a compare-and-set on the counter the commit read. A writer that lost a
+  position reads the counters again and allocates again, up to the journal's `retry` policy, then
+  throws a `ConflictError`; a counter behind its rows is repaired from the highest row.
+- **Reads.** `highWatermark(scope)` reads the counter, and `page(scope, after, limit)` returns the
+  contiguous rows after `after`, stopping before the first gap, which it reports. A reader never
+  moves past a gap: it reads the same page again.
+- **Row size.** A row over `maxRowBytes` (30,000 by default) fails the commit before any write with
+  a `JournalRowTooLargeError`, and a store with outcomes records it as the command's
+  `journal-row-too-large` rejection. `journal.preCheck(events)` measures the same rows in a
+  handler, so it can reject first.
+- **Declarations.** The first journaled commit declares the `journal` feature and the journaled
+  types history-dependent, so compaction refuses them. Only the repository handle a journal wraps
+  accepts a store that declares the journal: every writer must journal its commits.
+
+Journal compaction, rebuilds under the rebuild lock and the journal on PostgreSQL are still Rust
+only.
+
 ## Runtimes
 
 The package is ESM only and has no runtime dependencies. CI runs it on Node 26, Node 22.12, Bun and
@@ -208,9 +251,10 @@ of `AbortSignal`, which the DOM library, `@types/node`, and Bun's and Deno's typ
   it on the parsed JSON, losslessly. A stored version the upcasters don't bring to the declared one
   fails the load with a `ReplayError` rather than decoding into the wrong shape.
 - **The feature marker.** A store keeps one manifest of the features it uses. Every write path
-  refuses a store that declares a feature this package doesn't model (the journal and journal
-  compaction) with an `UnsupportedFeatureError`, a `PgRepository` without `viewsTable: true`
-  refuses one that declares the PostgreSQL views table (`postgres-views`), and compaction
+  refuses a store that declares a feature this package doesn't model (journal compaction) with an
+  `UnsupportedFeatureError`, and so does every handle but the one a `JournalRepository` wraps for
+  a store that declares the journal. A `PgRepository` without `viewsTable: true` refuses one that
+  declares the PostgreSQL views table (`postgres-views`), and compaction
   refuses an entity type the manifest declares history-dependent, which every repository's
   `declareHistoryDependent(types)` declares. `MemRepository` declares the required `stream-heads`
   feature on a fresh store's first write, and `initialize()` declares it up front.
@@ -303,10 +347,10 @@ of `AbortSignal`, which the DOM library, `@types/node`, and Bun's and Deno's typ
   test recovery.
 - **Commit receipts.** The events `execute`, `executeWithOutcome`, `executeTransaction` and a
   transaction's `commit` hand back are the events as the repository stored them, from its
-  receipt, by entity ID bytes then sequence. A repository that rewrites events as it commits
-  implements `commitWithReceipt` and `commitTransactionWithReceipt`, and a wrapper must forward
-  them. The root helpers of the same names call them, or commit and return the commit's own events
-  for a repository without them, as every backend here is.
+  receipt, by entity ID bytes then sequence. A repository that rewrites events as it commits, as
+  `JournalRepository` does, implements `commitWithReceipt` and `commitTransactionWithReceipt`, and
+  a wrapper must forward them. The root helpers of the same names call them, or commit and return
+  the commit's own events for a repository without them, as every backend here is.
 - **Sequences** are `bigint`s, because Go and Rust store them as 64-bit integers.
 
 Errors are `EvtError`s with a `code`. `isConflict` and `isRetryable` tell them apart.

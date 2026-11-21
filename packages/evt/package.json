@@ -34,6 +34,10 @@
       "types": "./dist/dynamodb/index.d.ts",
       "default": "./dist/dynamodb/index.js"
     },
+    "./journal": {
+      "types": "./dist/journal/index.d.ts",
+      "default": "./dist/journal/index.js"
+    },
     "./memory": {
       "types": "./dist/memory/index.d.ts",
       "default": "./dist/memory/index.js"
