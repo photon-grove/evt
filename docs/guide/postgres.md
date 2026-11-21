@@ -29,8 +29,8 @@ share one database.
 
 The TypeScript package's `PgRepository` (`@photon-grove/evt/postgres`) writes the same tables. It
 takes a pool shaped like `pg`'s `Pool`, has `ensureSchema()` and the `eventsTable` and
-`snapshotsTable` options, and initializes a fresh store on its first write. It writes no view rows
-yet, so don't point it at entity types that have projectors.
+`snapshotsTable` options, and initializes a fresh store on its first write. Its `viewWriter` option
+writes commit-wide views as Go's [view writer](#views) does.
 
 ## Schema
 
@@ -185,6 +185,44 @@ An integrity violation raised at `COMMIT`, which only a deferred constraint on y
 cause, is a `*evt.ProjectorError`. A commit that carries view operations but has no writer fails
 with `*evt.ViewsNotConfiguredError` before any write. Each statement counts as one action in the
 commit budget, sized by its SQL text.
+
+In TypeScript the writer is `PgRepository`'s `viewWriter` option, a function from a view operation
+to `{sql, args, keyConstraint}`, with the same statement rules, errors and budget:
+
+```ts
+const repository = new PgRepository(pool, {
+  viewWriter: (op) => {
+    const args = [op.pk, op.sk, op.owner]
+    if (op.kind === 'delete') {
+      return op.condition === 'present'
+        ? {sql: 'DELETE FROM views WHERE pk = $1 AND sk = $2 AND entity_id = $3', args}
+        : {
+            sql:
+              'WITH gone AS (DELETE FROM views WHERE pk = $1 AND sk = $2 AND entity_id = $3) ' +
+              'SELECT 1 FROM views WHERE pk = $1 AND sk = $2 AND entity_id <> $3',
+            args,
+          }
+    }
+    const insert =
+      'INSERT INTO views (pk, sk, entity_id, entity_type, payload) VALUES ($1, $2, $3, $4, $5)'
+    const payload = new TextDecoder('utf-8', {ignoreBOM: true}).decode(op.payload)
+    const row = [...args, op.entityType, payload]
+    return op.condition === 'absent'
+      ? {sql: insert, args: row, keyConstraint: 'views_pkey'}
+      : {
+          sql:
+            `${insert} ON CONFLICT (pk, sk) DO UPDATE SET entity_type = EXCLUDED.entity_type, ` +
+            'payload = EXCLUDED.payload WHERE views.entity_id = EXCLUDED.entity_id',
+          args: row,
+        }
+  },
+})
+```
+
+It reads a statement's count from the rows it returns, or, when it returns none, from the driver's
+`rowCount` (`pg`, Neon) or `affectedRows` (PGlite). With a driver that reports neither, add
+`RETURNING 1` to the puts and the `present` deletes and mark their statements `returning: true`,
+so that a statement returning no row is a failed condition.
 
 #### The Rust views table
 

@@ -9,16 +9,22 @@ import {Pool} from 'pg'
 
 import {
   type FeatureManifest,
+  type ProjectedView,
+  ProjectorError,
+  ProjectorOperationError,
   type SerializedEvent,
   StreamHeadsNotMigratedError,
   UnsupportedFeatureError,
+  type ViewOperation,
   decodeManifest,
   emptyMetadata,
   encodeManifest,
   encodeMetadata,
+  deleteView,
   eventId,
+  putView,
 } from '@photon-grove/evt'
-import {type PgClient, PgRepository} from '@photon-grove/evt/postgres'
+import {type PgClient, PgRepository, type ViewWriter} from '@photon-grove/evt/postgres'
 
 import {
   type ControlFixtures,
@@ -29,6 +35,7 @@ import {
   markerConformance,
 } from './conformance.js'
 import {Checks} from './harness.js'
+import {postgresViewDdl, postgresViewWriter} from './pgviews.js'
 
 // The local-only placeholder credentials infra/local-postgres creates.
 const url = process.env['DATABASE_URL'] || 'postgres://evt:evt@localhost:5432/evt_local'
@@ -74,11 +81,21 @@ try {
 
 checks.report()
 
-// A fresh event log, under table names unique to this run, with its schema in place.
-async function freshLog(client: PgClient = pool): Promise<PgRepository> {
+// A fresh event log, under table names unique to this run, with its schema in place, and a view
+// table of its own that its repository writes through the compat drivers' view writer.
+async function freshLog(
+  client: PgClient = pool,
+  viewWriter?: (views: string) => ViewWriter,
+): Promise<PgRepository> {
   const events = `evt_ts_${run}_${++logCount}`
   logs.push(events)
-  const repo = new PgRepository(client, {eventsTable: events, snapshotsTable: `${events}_snaps`})
+  const views = `${events}_views`
+  await pool.query(postgresViewDdl(views))
+  const repo = new PgRepository(client, {
+    eventsTable: events,
+    snapshotsTable: `${events}_snaps`,
+    viewWriter: (viewWriter ?? postgresViewWriter)(views),
+  })
   await repo.ensureSchema()
 
   return repo
@@ -94,7 +111,12 @@ function tables(events: string): string[] {
     'stream_heads',
   ]
 
-  return [events, `${events}_snaps`, ...derived.map((suffix) => `${events}__evt_${suffix}`)]
+  return [
+    events,
+    `${events}_snaps`,
+    `${events}_views`,
+    ...derived.map((suffix) => `${events}__evt_${suffix}`),
+  ]
 }
 
 // What PostgreSQL alone does: initialize a fresh store on the first write, keep a cached writer
@@ -203,6 +225,147 @@ async function postgresCases(): Promise<void> {
       await strict.end()
     }
   })
+
+  await checks.case(
+    "postgres: a view statement's database errors are its operation's",
+    async () => {
+      const repo = await freshLog()
+      const views = `${repo.tables.events}_views`
+      // A unique payload is another constraint than the key, and a CHECK rejects one payload.
+      await pool.query(`ALTER TABLE ${views} ADD CONSTRAINT ${views}_payload_key UNIQUE (payload)`)
+      await pool.query(`ALTER TABLE ${views} ADD CONSTRAINT ${views}_sane CHECK (payload <> '{}')`)
+      await repo.commit({
+        entityId: 'a',
+        events: [ledgerEvent('a', 1)],
+        views: [projected(putView('k', 'a', 'a', 'ledger', '{"n":1}', {condition: 'absent'}))],
+      })
+
+      const claim = (entityId: string, payload: string) =>
+        repo.commit({
+          entityId,
+          events: [ledgerEvent(entityId, 1)],
+          views: [
+            projected(putView('k', entityId, entityId, 'ledger', payload, {condition: 'absent'})),
+          ],
+        })
+      await reason(claim('b', '{"n":1}'), '23505', 'a unique payload of another row')
+      await reason(claim('b', '{}'), '23514', 'a CHECK violation')
+      await reason(
+        repo.commit({
+          entityId: 'b',
+          events: [ledgerEvent('b', 1)],
+          views: [projected(putView('k', 'a', 'b', 'ledger', '{"n":2}', {condition: 'absent'}))],
+        }),
+        'ConditionalCheckFailed',
+        'a claimed key',
+      )
+      ensure((await repo.events('b')).length === 0, 'the refused commits wrote no event')
+
+      const {rows} = await pool.query(`SELECT sk FROM ${views}`)
+      ensure(rows.length === 1, `the refused commits wrote no row: got ${rows.length}`)
+    },
+  )
+
+  await checks.case(
+    'postgres: an integrity violation at COMMIT is the projector failure',
+    async () => {
+      const repo = await freshLog()
+      const views = `${repo.tables.events}_views`
+      await pool.query(
+        `ALTER TABLE ${views} ADD CONSTRAINT ${views}_payload_key UNIQUE (payload) ` +
+          'DEFERRABLE INITIALLY DEFERRED',
+      )
+      const twice = [
+        projected(putView('k', 'one', 'a', 'ledger', '{"n":1}')),
+        projected(putView('k', 'two', 'a', 'ledger', '{"n":1}'), 1),
+      ]
+      try {
+        await repo.commit({entityId: 'a', events: [ledgerEvent('a', 1)], views: twice})
+      } catch (error) {
+        ensure(error instanceof ProjectorError, `got ${String(error)}`)
+        ensure(error.projector === '(at commit)', `the projector: got ${error.projector}`)
+        ensure((await repo.events('a')).length === 0, 'the commit rolled back')
+
+        return
+      }
+      throw new Error('the commit resolved')
+    },
+  )
+
+  await checks.case(
+    'postgres: RETURNING statements serve a driver that reports no count',
+    async () => {
+      const repo = await freshLog(countless(), returning)
+      const put = (entityId: string, owner: string) =>
+        repo.commit({
+          entityId,
+          events: [ledgerEvent(entityId, 1)],
+          views: [projected(putView('k', 'one', owner, 'ledger', `{"by":"${owner}"}`))],
+        })
+      await put('a', 'a')
+      await reason(put('b', 'b'), 'ConditionalCheckFailed', "an overwrite of another owner's row")
+
+      const release = (sequence: number, op: ViewOperation) =>
+        repo.commit({entityId: 'a', events: [ledgerEvent('a', sequence)], views: [projected(op)]})
+      await release(2, deleteView('k', 'one', 'a', {condition: 'present'}))
+      const absent = deleteView('k', 'one', 'a', {condition: 'present'})
+      await reason(release(3, absent), 'ConditionalCheckFailed', 'a release of an absent row')
+      await release(3, deleteView('k', 'one', 'a'))
+      ensure((await repo.events('a')).length === 3, 'the held conditions committed')
+    },
+  )
+}
+
+// The compat view writer with RETURNING on its puts and present deletes, which makes their count
+// driver-independent: one that returns nothing affected nothing.
+function returning(views: string): ViewWriter {
+  const writer = postgresViewWriter(views)
+
+  return (op) => {
+    const statement = writer(op)
+    const counted = op.kind === 'put' ? op.condition !== 'absent' : op.condition === 'present'
+    return counted
+      ? {...statement, sql: `${statement.sql} RETURNING 1`, returning: true}
+      : statement
+  }
+}
+
+// A driver's result with its rows alone.
+async function rowsOnly(result: Promise<{rows: unknown[]}>): Promise<{rows: unknown[]}> {
+  return {rows: (await result).rows}
+}
+
+// The pool as a driver that returns rows and reports no affected-row count.
+function countless(): PgClient {
+  return {
+    query: (text, values) => rowsOnly(pool.query(text, values)),
+    async connect() {
+      const connection = await pool.connect()
+      return {
+        query: (text: string, values?: unknown[]) => rowsOnly(connection.query(text, values)),
+        release: (error?: Error) => connection.release(error),
+      }
+    },
+  }
+}
+
+// A view operation of the `handles` projector.
+function projected(op: ViewOperation, operation = 0): ProjectedView {
+  return {projector: 'handles', projectorIndex: 0, operation, op}
+}
+
+// Fails unless `call` rejects with a ProjectorOperationError with `want` as its reason.
+async function reason(call: Promise<unknown>, want: string, what: string): Promise<void> {
+  try {
+    await call
+  } catch (error) {
+    ensure(error instanceof ProjectorOperationError, `${what}: got ${String(error)}`)
+    ensure(error.reason === want, `${what}: the reason ${error.reason}, want ${want}`)
+
+    return
+  }
+
+  throw new Error(`${what}: resolved, want a ProjectorOperationError`)
 }
 
 function repoTables(repo: PgRepository): {eventsTable: string; snapshotsTable: string} {

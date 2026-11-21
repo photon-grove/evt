@@ -327,8 +327,8 @@ condition of any put), and a view delete counts its two key attributes plus its 
 expression string (`attribute_not_exists(pk) OR entityID = :owner`, or `attribute_exists(pk) AND
 entityID = :owner`) and the `:owner` placeholder with the owner's bytes. The in-memory repository sizes view operations the same way. A PostgreSQL
 repository counts each statement as one action sized by its SQL text. The bound parameters are
-opaque, so the byte estimate is a lower bound while the action count is exact. Both languages'
-PostgreSQL repositories execute commit-wide view operations and count them this way. A Go commit
+opaque, so the byte estimate is a lower bound while the action count is exact. Every language's
+PostgreSQL repository executes commit-wide view operations and counts them this way. A Go commit
 that carries operations of a transaction group no backend-specific executor handles (a group
 built for another storage type) is refused before any write with `ProjectorOperationsUnsupported`,
 never silently dropped.
@@ -3446,27 +3446,34 @@ CREATE TABLE IF NOT EXISTS evt_events__evt_stream_heads (
   one insert per event, projector statements, the snapshot upserts, then the outcome insert.
   Projector statements run after the events, so a writer that lost a race fails on its head
   statement (a conflict) before it reaches a view row. Commit-wide
-  view operations execute inside the commit transaction in both languages in v0.9. evt
+  view operations execute inside the commit transaction in every language in v0.9. evt
   defines no PostgreSQL view schema yet (applications own their view tables; the planned
   [views table](#postgresql-views-table) is the exception) so each repository is
   configured with a view writer that turns one view operation into one SQL statement (Go
-  `postgres.Repository.WithViewWriter`, Rust `PostgresRepository::with_view_writer`), and a
+  `postgres.Repository.WithViewWriter`, Rust `PostgresRepository::with_view_writer`, TypeScript
+  the `PgRepository` `viewWriter` option), and a
   repository without one refuses a commit that carries view operations with `ViewsNotConfigured`.
   The engine executes the statement the writer returns, in the pinned order, and decides whether
   the operation's condition held: an `absent` put must raise a unique violation (`23505`) of the
   table's `(pk, sk)` key constraint when the row exists, which is the failed condition, and the
   writer names that constraint with the statement (Go `ViewStatement.KeyConstraint`, Rust
-  `PgStatement::with_key_constraint`. An `absent` put without one is `InvalidViewOperation`). A
+  `PgStatement::with_key_constraint`, TypeScript `ViewStatement.keyConstraint`. An `absent` put
+  without one is `InvalidViewOperation`). A
   unique violation of any other constraint of the table says nothing about the requested row, so
   it is an ordinary failure of the statement, with the SQLSTATE as its reason. Because the owner never changes, the
   writer must enforce it in SQL, and the engine reads the outcome from the affected-row count: a put
   without `absent` is an upsert guarded by the owner, whose count is zero when another stream owns
   the row. A `present` delete deletes the owner's row, and a count of zero fails the condition. A
   delete without a condition reports the rows of another owner instead of the rows it deleted (a
-  count above zero fails the condition). The engine hands the writer the owner with the operation. A projector statement that the database rejects is a projector
+  count above zero fails the condition). TypeScript takes the count from the rows a statement
+  returns, or from the driver's reported count when it returns none (only from the rows for a
+  statement the writer marks `returning`), and refuses a statement that needs a count its driver
+  doesn't report with `InvalidViewOperation`. The engine hands the writer
+  the owner with the operation. A projector statement that the database rejects is a projector
   operation failure (a lost connection is a backend error), and so is an integrity violation
   raised at `COMMIT`, which only a deferred constraint on a projector's table can cause (it
-  names no operation: Go `*evt.ProjectorError`, Rust `Error::Projector`).
+  names no operation: Go `*evt.ProjectorError`, Rust `Error::Projector`, TypeScript
+  `ProjectorError` with the projector `(at commit)`).
 - A failed head statement is an optimistic-concurrency conflict (or drift or a gap, by the
   [failure-path probe](#failure-classification)). In Go, conflicts are `evt.ConflictError`s wrapped in a
   transient `policy.ClassifiedError`, so the fence-aware retry loop retries them as it does on

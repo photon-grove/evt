@@ -11,7 +11,8 @@
 // scenarios prints (-scenarios or --scenarios). verify checks the streams of the supported
 // scenarios against the golden fixtures: the events and snapshot read through the repository, the
 // loaded state and the head, and what the backend stores: the raw DynamoDB items and the SNS
-// messages they publish, or the PostgreSQL event and snapshot rows.
+// messages they publish, or the PostgreSQL event and snapshot rows, and the view rows commit-wide
+// projectors wrote.
 //
 // It runs against a local DynamoDB emulator, such as Moto, at AWS_ENDPOINT_URL, never real AWS,
 // or a local PostgreSQL server at DATABASE_URL, in the default tables the Go and Rust drivers use.
@@ -62,7 +63,6 @@ import {
   type Observed,
   Runner,
   SUPPORTED_SCENARIOS,
-  UNSUPPORTED_ON,
   checkScenario,
   checkStep,
   compareObserved,
@@ -70,6 +70,7 @@ import {
   expectedOutcome,
   optionalList,
 } from './runner.js'
+import {POSTGRES_VIEW_TABLE, postgresViewDdl, postgresViewWriter} from './pgviews.js'
 import {viewPartitions} from './scenarios.js'
 
 const WRITERS = ['go', 'rust']
@@ -91,10 +92,16 @@ interface Backend {
   /** Compares what the backend stores for a stream beyond what `observe` reads. */
   checkRows(checks: Checks, name: string, id: string, expected: JsonValue): Promise<void>
   /**
-   * The view rows of `partitions` whose key names `base`, as the fixtures record them, by
-   * partition and then sort key bytes.
+   * Compares the view rows of `partitions` whose key names `base` with the fixture's, which
+   * records them as DynamoDB items.
    */
-  views(partitions: readonly string[], base: string): Promise<unknown[]>
+  checkViews(
+    checks: Checks,
+    name: string,
+    partitions: readonly string[],
+    base: string,
+    expected: readonly JsonValue[],
+  ): Promise<void>
   /** Compares a command's stored outcome row with its fixture's DynamoDB item. */
   checkOutcome(checks: Checks, name: string, commandId: string, expected: JsonValue): Promise<void>
   close(): Promise<void>
@@ -245,19 +252,15 @@ function dynamoBackend(): Backend {
     },
     // The items are compared with the stream itself.
     async checkRows() {},
-    async views(partitions, base) {
+    async checkViews(checks, name, partitions, base, expected) {
       const rows: unknown[] = []
       for (const pk of partitions) {
         const items = await partition(client, viewsTable, pk)
-        const owned = items.filter((item) => {
-          const sk = item['sk'] !== undefined && 'S' in item['sk'] ? item['sk'].S : ''
-          return pk.includes(base) || sk.includes(base)
-        })
+        const owned = items.filter((item) => ownsViewRow(base, pk, textOf(item['sk'])))
         owned.sort((a, b) => compareUtf8(textOf(a['sk']), textOf(b['sk'])))
         rows.push(...owned.map((item) => ({pk, sk: textOf(item['sk']), dynamoItem: item})))
       }
-
-      return rows
+      checks.equal(`${name}: views`, canonical(rows), canonical(expected.map(plain)))
     },
     async checkOutcome(checks, name, commandId, expected) {
       const items = await partition(client, table, outcomeKey(commandId))
@@ -277,10 +280,12 @@ async function postgresBackend(): Promise<Backend> {
     'PostgreSQL server',
   )
   const pool = new Pool({connectionString: url, max: 2})
-  const repository = new PgRepository(pool)
+  // The view writer the Go and Rust drivers use, on the view table they create.
+  const repository = new PgRepository(pool, {viewWriter: postgresViewWriter()})
   try {
     // As the Go and Rust drivers do: whichever language writes first creates the schema.
     await repository.ensureSchema()
+    await pool.query(postgresViewDdl())
   } catch (error) {
     await pool.end()
     throw error
@@ -320,9 +325,36 @@ async function postgresBackend(): Promise<Backend> {
         head: rows[0] === undefined ? null : BigInt(rows[0].head),
       }
     },
-    // TypeScript doesn't write PostgreSQL views yet, so no scenario it runs here has any.
-    async views() {
-      return []
+    // The rows as the neutral five columns, against the fixture items', as Go's driver compares
+    // them.
+    async checkViews(checks, name, partitions, base, expected) {
+      const {rows} = await pool.query<Record<string, string>>(
+        'SELECT pk, sk, entity_id, entity_type, payload FROM ' +
+          `${POSTGRES_VIEW_TABLE} WHERE pk = ANY($1)`,
+        [partitions],
+      )
+      const got = rows
+        .filter((row) => ownsViewRow(base, row['pk']!, row['sk']!))
+        .map((row) => ({
+          pk: row['pk']!,
+          sk: row['sk']!,
+          entityId: row['entity_id']!,
+          entityType: row['entity_type']!,
+          payload: row['payload']!,
+        }))
+      const want = expected.map((view) => {
+        const item = field(view, 'dynamoItem')
+        const attribute = (key: string) => str(field(field(item, key), 'S'))
+
+        return {
+          pk: attribute('pk'),
+          sk: attribute('sk'),
+          entityId: attribute('entityID'),
+          entityType: attribute('entityType'),
+          payload: attribute('payload'),
+        }
+      })
+      checks.equal(`${name}: views`, canonical(byKey(got)), canonical(byKey(want)))
     },
     // The event and snapshot rows as stored, as the Go driver compares them: each event's
     // metadata as JSON, since jsonb normalizes its text.
@@ -413,11 +445,13 @@ function jsonColumn(text: string | null | undefined): unknown {
   return text === null || text === undefined ? null : plain(parseJson(text))
 }
 
-// The scenarios TypeScript supports on a backend: every one, less what the backend can't run yet.
+// The scenarios TypeScript supports, which it runs on every backend.
 function scenarioNames(backend: string): string[] {
-  const unsupported = UNSUPPORTED_ON[backend] ?? []
+  if (!['dynamo', 'postgres'].includes(backend)) {
+    throw new Error(`--backend must be dynamo or postgres, not ${backend || '-'}`)
+  }
 
-  return SUPPORTED_SCENARIOS.filter((name) => !unsupported.includes(name))
+  return [...SUPPORTED_SCENARIOS]
 }
 
 async function supportedScenarios(backend: string): Promise<JsonValue[]> {
@@ -484,11 +518,8 @@ async function verify(
     // The view rows the scenario's projectors left in its own partitions.
     const partitions = viewPartitions(scenario, runner.entityId)
     if (partitions.length > 0) {
-      checks.equal(
-        `${name}: views`,
-        canonical(await backend.views(partitions, runner.entityId)),
-        canonical(optionalList(expected, 'views').map(plain)),
-      )
+      const views = optionalList(expected, 'views')
+      await backend.checkViews(checks, name, partitions, runner.entityId, views)
     }
 
     // The outcome rows the scenario's commands left.
@@ -505,6 +536,19 @@ async function verify(
       await backend.checkRows(checks, label, id, sibling)
     }
   }
+}
+
+// Whether a row of a shared view partition belongs to the run's scenario: its partition or sort key
+// names the scenario's entity ID, as Go's OwnsViewRow decides.
+function ownsViewRow(base: string, pk: string, sk: string): boolean {
+  return pk.includes(base) || sk.includes(base)
+}
+
+// Neutral view rows by partition, then sort key bytes.
+function byKey<T extends {pk: string; sk: string}>(rows: T[]): T[] {
+  rows.sort((a, b) => compareUtf8(a.pk, b.pk) || compareUtf8(a.sk, b.sk))
+
+  return rows
 }
 
 // A string attribute's text, or empty.
