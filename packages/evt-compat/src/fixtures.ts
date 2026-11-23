@@ -1,5 +1,5 @@
-// Runs every fixture vector the TypeScript implementation covers so far. Each phase of ADR 0009
-// adds the vectors for what it builds.
+// Runs the fixture vectors in `compat/fixtures` against the TypeScript implementation. Go and Rust
+// generate them; TypeScript only reads them.
 import {codecVectors} from './codec.js'
 import {Checks} from './harness.js'
 import {journalVectors} from './journal.js'

@@ -5,7 +5,7 @@
 // rebuild-lock check. Every case namespaces its entity IDs and types, so a durable backend can
 // share one table across runs.
 //
-// The cases follow the Rust suite's, and keep its names, for what TypeScript implements so far.
+// The cases follow the Rust suite's, and keep its names.
 // Every step depends on the ones before it, so the cases await in loops on purpose.
 /* oxlint-disable no-await-in-loop */
 

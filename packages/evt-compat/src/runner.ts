@@ -65,7 +65,7 @@ import {FaultRepository} from '@photon-grove/evt/testing'
 import {type Account, account, accountCommand, ledgerProjector, sortedKeys} from './account.js'
 import {type Checks, canonical, field, int, list, num, plain, str} from './harness.js'
 
-/** The scenarios TypeScript supports so far, in memory and in the live run. */
+/** The scenarios TypeScript runs, in memory and in the live run: every one in `scenarios.json`. */
 export const SUPPORTED_SCENARIOS: readonly string[] = [
   'metadata-extensions',
   'go-writes-rust-reads',
