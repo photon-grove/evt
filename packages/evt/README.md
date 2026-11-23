@@ -13,8 +13,7 @@ npm install @photon-grove/evt
 
 So far it has the core, multi-stream transactions with read fences, command outcomes,
 commit-wide projectors, the in-memory, DynamoDB and PostgreSQL backends, the view repository
-with its typed view codec, the journal on the in-memory and DynamoDB backends, and the testing
-helpers. The
+with its typed view codec, the journal on every backend, and the testing helpers. The
 [feature matrix](https://github.com/photon-grove/evt/blob/main/docs/reference/feature-matrix.md)
 tracks each one. The
 [getting started guide](https://github.com/photon-grove/evt/blob/main/docs/guide/getting-started.md#the-same-model-in-typescript)
@@ -174,8 +173,9 @@ PostgreSQL view repository.
 The journal (`@photon-grove/evt/journal`, [ADR 0005](https://github.com/photon-grove/evt/blob/main/docs/adr/0005-rust-first-extensions-journal-and-lambda.md))
 delivers a store's events in per-scope order, as rows written in the commit that wrote the events.
 A `Journal` names the entity types it covers and maps each of their events to zero or more scopes,
-with a pure function of the event. A `JournalRepository` wraps an in-memory repository, or a
-DynamoDB one with a views table, and journals every commit through it:
+with a pure function of the event. A `JournalRepository` wraps an in-memory repository, a
+DynamoDB one with a views table, or a PostgreSQL one with `viewsTable: true`, and journals every
+commit through it:
 
 ```ts
 import {Journal, JournalRepository} from '@photon-grove/evt/journal'
@@ -216,7 +216,12 @@ const page = await repository.page('account:a-1', 0n, 100)
   allocation never goes below it. `beginCompaction`, `compact`, `renewCompaction`,
   `endCompaction` and `forceReleaseCompaction` run the steps by hand.
 
-Rebuilds under the rebuild lock and the journal on PostgreSQL are still Rust only.
+On PostgreSQL the rows and counters are rows of the views table, written in the commit's
+transaction, and each read is one statement that sees every committed transaction. A
+`PgRepository` without `viewsTable: true` holds no journal: its journal reads fail with a
+`ViewsNotConfiguredError`, and a journaled commit through it is refused before anything is declared.
+A PostgreSQL journal reads a compacted scope's floor, but compacting on PostgreSQL, and rebuilds
+under the rebuild lock, are still Rust only.
 
 ## Runtimes
 
