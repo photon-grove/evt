@@ -69,6 +69,25 @@ default:
 }
 ```
 
+TypeScript's `ProjectionRebuild` does all of this for commit-wide projectors. `run` takes the lock,
+computes every row from the log (current-state projectors from each stream's snapshot-seeded final
+state, history-dependent ones by replaying their commits), writes them in guarded batches while
+renewing the lease, and releases the lock:
+
+```ts
+const rebuild = new ProjectionRebuild(repository, {
+  projectors: [totals], // the store's commit-wide projectors
+  aggregates: [account], // every type whose streams own rows or feed a history replay
+})
+const plan = await rebuild.plan() // a dry run: the operations, nothing locked or written
+const report = await rebuild.run('rebuild-2026-10', 5 * 60_000)
+```
+
+A failure before the first write leaves the rows alone and releases the lock, if the run acquired
+it from a settled generation. A failure after a write keeps the lock, so commits stay refused until
+a run completes. `runWithLease` rebuilds under a lease you took yourself and throws a
+`RebuildFailure` with the batches it attempted, so you can apply the same rule.
+
 The fence keeps a generation counter that's odd while a rebuild is in progress and even when the
 views are settled. `Begin` raises it by one (by two for a takeover or after a force-release), and
 `End` raises it by one more. A lease is both the owner token and the generation `Begin` returned,

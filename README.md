@@ -42,7 +42,7 @@ same streams today, and the TypeScript package is held to the same fixtures as i
 | --- | --- | --- |
 | **Rust** · [`photon-evt`](crates/evt/README.md) | `cargo add photon-evt` | Shipping, with the most features: the core, fenced rebuilds, the sync journal, and [`photon-evt-lambda`](crates/evt-lambda/README.md) for DynamoDB Streams |
 | **Go** · [`github.com/photon-grove/evt/go`](go/README.md) | `go get github.com/photon-grove/evt/go` | Shipping: the original module, with the core, fenced rebuilds and the `evt-doctor` CLI. The journal is Rust-only for now |
-| **TypeScript** · [`@photon-grove/evt`](packages/evt/README.md) | `npm install @photon-grove/evt` | Being ported in phases. The core, command outcomes, fence-aware retry and the in-memory backend are in. Multi-stream transactions, read fences and the DynamoDB and PostgreSQL backends are landing, and commit-wide projectors, rebuilds, views and the journal come after. The Lambda helpers are ported as [`@photon-grove/evt-lambda`](packages/evt-lambda/README.md), not yet on npm |
+| **TypeScript** · [`@photon-grove/evt`](packages/evt/README.md) | `npm install @photon-grove/evt` | Being ported in phases. The core, multi-stream transactions with read fences, command outcomes, fence-aware retry, commit-wide projectors with the fenced full rebuild, enumeration, the view repository, and the in-memory, DynamoDB and PostgreSQL backends are in. The journal is landing. The Lambda helpers are ported as [`@photon-grove/evt-lambda`](packages/evt-lambda/README.md), not yet on npm |
 
 The [feature matrix](docs/reference/feature-matrix.md) tracks every capability in each language,
 and a PR that changes one updates its row, so it describes the code on `main` rather than plans.
@@ -55,7 +55,7 @@ and a PR that changes one updates its row, so it describes the code on `main` ra
 | **Three backends, one contract**      | DynamoDB (single table, `pk`/`sk`), PostgreSQL, and an in-memory store for tests. Every backend passes the same conformance suite.       |
 | **Multi-stream transactions**         | Append to several aggregates in one atomic commit, with read fences on streams you only looked at.                                      |
 | **Durable command outcomes**          | A retried command gets its stored answer, accepted or rejected, instead of running twice. Rejections can carry events of their own.     |
-| **Views derived from events**         | Commit-wide projectors write read-model rows in the same commit as the events. Rust's `ProjectionRebuild` rebuilds them from the log behind a rebuild fence, and Go's `RebuildProjections` rebuilds per-entity views under the same fence. |
+| **Views derived from events**         | Commit-wide projectors write read-model rows in the same commit as the events. Rust's and TypeScript's `ProjectionRebuild` rebuild them from the log behind a rebuild fence, and Go's `RebuildProjections` rebuilds per-entity views under the same fence. |
 | **Snapshots and upcasters**           | Inline snapshots keep loads short, snapshot-verified compaction trims old history, and versioned upcasters let payloads change shape.    |
 | **One format, three languages**       | Golden fixtures and live interleaved runs keep Go and Rust writing the same bytes, and TypeScript checks itself against the same fixtures. See [how it's checked](#one-format-three-languages). |
 | **Realtime sync and Lambda (Rust)**   | A per-scope sync journal with gap detection and compaction, and `photon-evt-lambda` for DynamoDB Streams handlers.                       |

@@ -693,6 +693,15 @@ from the plan and deletes owned rows (by row type) the plan no longer produces, 
 skip and delete with a strongly consistent read by key; a planned put of an unowned type fails the
 run before any write.
 
+TypeScript's counterpart is `Store.streamEntitiesFromSnapshots(aggregate, filter)`, over the
+entity heads' IDs by bytes, each loaded like `Store.load`. Its `ProjectionRebuild` (`run`,
+`runWithLease`, `plan`) follows Rust's without the diff mode and the journal: the same split into
+current-state and history-dependent projectors, the same `CompactionUncoveredError`,
+`StreamHeadDriftError` and `SequenceGapError` rules for the replay, the same checks across the run
+(`SharedViewKeyError`, `DuplicateViewKeyError`, `CommitTooLargeError`), the same guarded batches of
+at most 99 operations with lease renewal, and the same release rule. A failure under a caller's
+lease is a `RebuildFailure` carrying the error, the batches attempted and the last lease.
+
 ## Commit-Wide Projectors (v0.9, C7)
 
 A `CommitProjector` is a pure function over one commit; its view operations commit in the same
