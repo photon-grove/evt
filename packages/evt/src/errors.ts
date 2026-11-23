@@ -372,14 +372,23 @@ export class TransientError extends EvtError {
    * `TransactionConflict`), so the winner may be another attempt of the same command.
    */
   readonly transactionConflict: boolean
+  /**
+   * The transaction conflict was on the commit's outcome put, which only another attempt of the
+   * same command writes: its transaction was still committing, so its row may appear shortly.
+   */
+  readonly outcomeRow: boolean
 
-  constructor(detail: string, options?: {cause?: unknown; transactionConflict?: boolean}) {
+  constructor(
+    detail: string,
+    options?: {cause?: unknown; transactionConflict?: boolean; outcomeRow?: boolean},
+  ) {
     super(
       'transient',
       `transient failure: ${detail}`,
       options && 'cause' in options ? {cause: options.cause} : undefined,
     )
     this.transactionConflict = options?.transactionConflict ?? false
+    this.outcomeRow = options?.outcomeRow ?? false
   }
 }
 
