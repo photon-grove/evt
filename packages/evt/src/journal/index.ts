@@ -96,7 +96,7 @@ export {
   rebuildJournalWithLease,
   rebuildJournalWithLock,
 } from './rebuild.js'
-export {type JournalState, journalOperations, replay, stateViews} from './replay.js'
+export {type JournalState, replay, stateViews} from './replay.js'
 export {
   DEFAULT_MAX_ROW_BYTES,
   type JournalRow,

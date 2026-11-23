@@ -222,15 +222,7 @@ export class ProjectionRebuild {
     try {
       result = await this.#fenced(held.lease, leaseMs, held.taken, options)
     } catch (error) {
-      const failure = error as RebuildFailure
-      if (held.fromSettled && failure.attempted === 0) {
-        // The rows were complete when the run began and it attempted no write, so settling the
-        // generation is safe. It runs even after an abort, as cleanup. A failed release (a lost
-        // lease, say) leaves the lock to lapse: the run's own error is the one to report.
-        await this.#repository.endRebuild(failure.lease).catch(() => {})
-      }
-
-      throw failure.error
+      return failRebuildLock(this.#repository, held, error as RebuildFailure)
     }
 
     // Every row is written: settling the generation runs even after an abort, so a finished
@@ -590,6 +582,26 @@ export async function takeRebuildLock(
   /* oxlint-enable no-await-in-loop */
 
   throw new RebuildConflictError(MAX_REBUILD_BEGIN_ATTEMPTS)
+}
+
+/**
+ * Ends a run that failed under a lock {@link takeRebuildLock} took, and throws the run's error. The
+ * lock is released only when it was acquired from a settled generation and no write was attempted:
+ * the rows were complete when the run began, so settling the generation is safe. Otherwise it is
+ * kept, since the rows may be half-written. The release runs even after an abort, as cleanup, and a
+ * failed release (a lost lease, say) leaves the lock to lapse: the run's own error is the one to
+ * report. Internal: a projection rebuild and the journal's rebuild share it.
+ */
+export async function failRebuildLock(
+  repository: RebuildFence,
+  held: {readonly fromSettled: boolean},
+  failure: RebuildFailure,
+): Promise<never> {
+  if (held.fromSettled && failure.attempted === 0) {
+    await repository.endRebuild(failure.lease).catch(() => {})
+  }
+
+  throw failure.error
 }
 
 // A rebuild's planned operations, checked across the whole run, then written in guarded batches

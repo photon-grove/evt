@@ -889,6 +889,23 @@ describe('the journal rebuild', () => {
     expect((await memory.rebuildState()).lock?.owner).toBe(JOURNAL_REBUILD_OWNER)
   })
 
+  test('under the lock, a failure before the first write releases only a settled lock', async () => {
+    const {memory, events} = await journaledStore(1)
+    memory.renewRebuild = async () => {
+      throw new Error('the renewal failed')
+    }
+
+    // A one-second lease is renewed before every batch, the first included, so nothing is written.
+    await expect(rebuildJournalWithLock(memory, events, 1000)).rejects.toThrow(/the renewal failed/)
+    expect((await memory.rebuildState()).lock).toBeNull()
+
+    // After a force-release the lock is kept whatever failed: the rows may be half-written.
+    await memory.beginRebuild('crashed', 60_000)
+    await memory.forceReleaseRebuild('crashed')
+    await expect(rebuildJournalWithLock(memory, events, 1000)).rejects.toThrow(/the renewal failed/)
+    expect((await memory.rebuildState()).lock?.owner).toBe(JOURNAL_REBUILD_OWNER)
+  })
+
   test('a projection rebuild may carry the journal alone', async () => {
     const {memory} = await journaledStore(3)
     for (const row of memory.views()) {
@@ -904,6 +921,7 @@ describe('the journal rebuild', () => {
       3, 3, 1, 4,
     ])
     expect(await memory.readCounter('world:7')).toBe(3n)
+    expect(memory.views()).toHaveLength(4)
 
     // The journal's projector is the engine's: a rebuild takes the journal option instead.
     const engine = new ProjectionRebuild(memory, {

@@ -6,7 +6,7 @@ import {RebuildFailure} from '../errors.js'
 import type {SerializedEvent} from '../event.js'
 import type {ProjectedView} from '../projection.js'
 import type {RebuildFence, RebuildLease} from '../rebuild-fence.js'
-import {Renewing, checkRenew, rebuildBatches, takeRebuildLock} from '../rebuild.js'
+import {Renewing, checkRenew, failRebuildLock, rebuildBatches, takeRebuildLock} from '../rebuild.js'
 import type {CallOptions} from '../repository.js'
 import {type JournalState, journalOperations, replay} from './replay.js'
 
@@ -117,13 +117,7 @@ export async function rebuildJournalWithLock(
   try {
     await write(renewing, operations)
   } catch (error) {
-    const failure = error as RebuildFailure
-    if (held.fromSettled && failure.attempted === 0) {
-      // The rows were complete when the run began and it attempted no write, so settling the
-      // generation is safe. A failed release leaves the lock to lapse: the run's error is the one.
-      await fence.endRebuild(failure.lease).catch(() => {})
-    }
-    throw failure.error
+    return failRebuildLock(fence, held, error as RebuildFailure)
   }
   // Every row is written: settling the generation runs even after an abort, so a finished rebuild
   // never leaves the store locked.

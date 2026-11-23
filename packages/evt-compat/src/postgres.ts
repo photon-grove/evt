@@ -27,7 +27,7 @@ import {
   eventId,
   putView,
 } from '@photon-grove/evt'
-import {Journal, JournalRepository} from '@photon-grove/evt/journal'
+import {Journal, JournalRepository, rebuildJournalWithLock} from '@photon-grove/evt/journal'
 import {JOURNAL_MARKER} from '@photon-grove/evt/testing'
 import {
   JournalListener,
@@ -600,6 +600,37 @@ async function journalCases(): Promise<void> {
   await journalConformance(checks, journalTarget)
   // The rebuild cases take the store-wide rebuild lock: after the others, on the same store.
   await journalRebuildConformance(checks, journalTarget)
+
+  await checks.case(
+    "postgres journal: a rebuild writes the journal's tables through any handle, which still refuses its own commits",
+    async () => {
+      const log = await tableLog()
+      const journal = new Journal(['ledger'], (event) => [`ledger:${event.entityId}`])
+      await new JournalRepository(log, journal).commit({
+        entityId: 'a',
+        events: [ledgerEvent('a', 1), ledgerEvent('a', 2)],
+      })
+      const views = log.viewRepository()
+      const rowPk = 'journal#ledger:a'
+      for (const row of await views.listViewsByPk(rowPk)) {
+        await views.deleteView(row.pk, row.sk)
+      }
+
+      // A handle no journal wraps rebuilds the journal's rows on the store that declares it.
+      const plain = new PgRepository(pool, {...repoTables(log), viewsTable: true})
+      await rebuildJournalWithLock(plain, await plain.events('a'), 60_000)
+      ensure((await views.listViewsByPk(rowPk)).length === 2, 'the rows are restored')
+      ensure((await plain.rebuildState()).lock === null, 'the lock is released')
+
+      // Its own commits are still a non-journal writer's, refused on a journal store.
+      await refuses(
+        plain.commit({entityId: 'b', events: [ledgerEvent('b', 1)]}),
+        UnsupportedFeatureError,
+        'a plain commit',
+      )
+      ensure((await plain.events('b')).length === 0, 'nothing was written')
+    },
+  )
   await journalStoreCases(checks, async () => {
     const fresh = await tableLog()
 

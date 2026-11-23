@@ -54,7 +54,6 @@ import {
   counterPartitionKey,
   counterView,
   encodeAllocations,
-  journalOperations,
   pageAtEpoch,
   rebuildJournal,
   rebuildJournalWithLease,
@@ -63,6 +62,7 @@ import {
   rowPartitionKey,
   rowSize,
   rowSortKey,
+  stateViews,
 } from '@photon-grove/evt/journal'
 
 import {
@@ -1536,8 +1536,15 @@ async function forceReleasedRebuildRefusesJournaledCommits(
     }
     await views.deleteView(counterPartitionKey(at), 'COUNTER')
   }
-  const [first] = journalOperations(state)
-  await repo.writeRebuildViews(lease, [first!])
+  const first = stateViews(state)[0]!
+  await repo.writeRebuildViews(lease, [
+    {
+      projector: 'journal',
+      projectorIndex: 0,
+      operation: 0,
+      op: putView(first.pk, first.sk, first.entityId, first.entityType, first.payload),
+    },
+  ])
   ensureEqual(await writer.highWatermark(world), 0n, 'the failed rebuild left the counter wiped')
   const forced = await repo.forceReleaseRebuild(lease.owner)
   ensure(forced.forceReleased, 'the generation is flagged force-released')
