@@ -116,6 +116,7 @@ export {
   ROW_PARTITION_PREFIX,
   allocations,
   checkScope,
+  isScope,
   counterPartitionKey,
   encodeAllocations,
   parseRowSortKey,

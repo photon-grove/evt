@@ -66,6 +66,17 @@ export function checkScope(scope: string): string {
   return scope
 }
 
+/** Whether a value is a valid scope ({@link checkScope}), without throwing. */
+export function isScope(scope: unknown): boolean {
+  try {
+    checkScope(scope as string)
+
+    return true
+  } catch {
+    return false
+  }
+}
+
 /** The partition key of a scope's journal rows. */
 export function rowPartitionKey(scope: string): string {
   return ROW_PARTITION_PREFIX + scope
