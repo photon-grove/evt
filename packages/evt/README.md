@@ -27,7 +27,7 @@ builds a bank account aggregate with it, end to end.
 | `@photon-grove/evt/memory`   | `MemRepository` and `MemViewRepository`, for tests and local use           |
 | `@photon-grove/evt/testing`  | `scenario` and `Fixture`, the given/when/then helpers over `MemRepository` |
 | `@photon-grove/evt/dynamodb` | `DynamoRepository`, `viewProjector`, `DynamoViewRepository`, item codecs   |
-| `@photon-grove/evt/postgres` | `PgRepository`, `PgViewRepository`, `ViewWriter`, the schema and its DDL   |
+| `@photon-grove/evt/postgres` | `PgRepository`, `PgViewRepository`, `JournalListener`, the schema and DDL  |
 | `@photon-grove/evt/journal`  | `Journal`, `JournalRepository`, `page` and `replay`: the journal           |
 
 ## DynamoDB
@@ -222,6 +222,13 @@ transaction, and each read is one statement that sees every committed transactio
 `ViewsNotConfiguredError`, and a journaled commit through it is refused before anything is declared.
 A PostgreSQL journal reads a compacted scope's floor, but compacting on PostgreSQL, and rebuilds
 under the rebuild lock, are still Rust only.
+
+Each journaled commit wakes listeners with `pg_notify`, once per scope it wrote, unless the
+repository is built with `wakeups: false`. A `JournalListener` (`@photon-grove/evt/postgres`) holds
+a dedicated connection that its `connect` function opens, and `next()` resolves `{kind: 'scope'}`
+for a notified scope, `{kind: 'connected'}` on every connection and `{kind: 'poll'}` at its poll
+interval (30 seconds by default). A wake-up isn't a delivery: page the scope from your cursor, and
+every scope you follow on `connected` and `poll`.
 
 ## Runtimes
 

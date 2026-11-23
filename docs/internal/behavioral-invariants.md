@@ -826,8 +826,18 @@ transaction as the events. The byte-level rules are in the
   still in flight. Without the views table every journal read fails with `ViewsNotConfigured`, and
   a journaled commit is refused (`expectedPayloadUnsupported` / the counter's compare-and-set is
   not applied) before the marker is touched. The journal's declarations read the manifest first
-  without a lock and take the exclusive lock only when they write. TypeScript sends no wake-ups
-  yet, and refuses to declare `journal-compaction` until compaction is ported to PostgreSQL.
+  without a lock and take the exclusive lock only when they write. TypeScript refuses to declare
+  `journal-compaction` until compaction is ported to PostgreSQL.
+- Wake-ups (X5): a commit that wrote journal rows through the views table runs `pg_notify` on
+  `{events}__evt_journal` with each scope once, in ascending byte order, after its view statements,
+  so PostgreSQL delivers them at `COMMIT` and drops them with a rollback. A commit that journals
+  nothing, a repository with wake-ups off (`with_wakeups(false)` / `wakeups: false`), compaction
+  and rebuilds notify nothing. A `JournalListener` reports `Connected` on every connection, `Poll`
+  at a fixed cadence from the last `Poll` or `Connected` ahead of any pending scope, checks the
+  connection with `SELECT 1` on the call after a `Poll` (bounded by the connect timeout, replacing
+  a connection that fails it), and ignores notifications on other channels or with an invalid
+  scope. The TypeScript listener keeps each pending scope once, takes one `next()` at a time, and
+  an abort loses no pending scope.
 
 ## Journal (X1, Rust-first)
 

@@ -10,6 +10,15 @@ export {
   outcomeRow,
   selectOutcomeSql,
 } from './outcome.js'
+export {
+  DEFAULT_CONNECT_TIMEOUT_MS,
+  DEFAULT_POLL_INTERVAL_MS,
+  JournalListener,
+  type JournalListenerOptions,
+  type PgListenConnection,
+  type PgNotification,
+  type Wakeup,
+} from './listener.js'
 export {POSTGRES_BACKEND, PgRepository, type PgRepositoryOptions} from './repository.js'
 export {type ViewStatement, type ViewWriter} from './views.js'
 export {PgViewRepository} from './view-repository.js'
@@ -26,6 +35,7 @@ export {
   SCHEMA_LOCK,
   entityTypeIndex,
   featuresTable,
+  journalChannel,
   outcomesTable,
   pgTables,
   rebuildGenerationTable,
