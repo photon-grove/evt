@@ -966,7 +966,16 @@ async function projectionRebuild(repo: Repository & EventLog & RebuildFence): Pr
   }).run(`${ns}-rebuild`, 60_000)
   ensureEqual(
     report,
-    {entities: 3, commits: 2, puts: 4, deletes: 0, batches: 1, events: 2},
+    {
+      entities: 3,
+      commits: 2,
+      puts: 4,
+      deletes: 0,
+      batches: 1,
+      events: 2,
+      journalRows: 0,
+      journalCounters: 0,
+    },
     'the rebuild report',
   )
   ensureEqual(

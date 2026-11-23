@@ -35,7 +35,12 @@ import {Journal, JournalRepository} from '@photon-grove/evt/journal'
 import {TestClock, compactionConformance} from './compaction-conformance.js'
 import {dynamoControls} from './controls.js'
 import {Checks, canonical} from './harness.js'
-import {journalConformance, journalStoreCases} from './journal-conformance.js'
+import {
+  type JournalRebuildTarget,
+  journalConformance,
+  journalRebuildConformance,
+  journalStoreCases,
+} from './journal-conformance.js'
 import {viewRepositoryConformance} from './view-conformance.js'
 
 // Only a local emulator: a loopback address or a .localhost name.
@@ -428,7 +433,7 @@ async function journal(tables: string[]): Promise<void> {
   await new DynamoRepository(client, table).initialize()
 
   const reader = new DynamoViewRepository(client, viewsTable)
-  await journalConformance(checks, {
+  const journalTarget: JournalRebuildTarget = {
     repo: new DynamoRepository(client, table, {viewsTable}),
     manifest: async () => dynamoControls(client, table).manifest(),
     views: {
@@ -438,7 +443,10 @@ async function journal(tables: string[]): Promise<void> {
       listViewsByPk: (pk) => reader.listViewsByPk(pk),
     },
     handle: () => new DynamoRepository(client, table, {viewsTable}),
-  })
+  }
+  await journalConformance(checks, journalTarget)
+  // The rebuild cases take the store-wide rebuild lock: after the others, on the same store.
+  await journalRebuildConformance(checks, journalTarget)
   await checks.case(
     'dynamodb journal: a strict writer refuses an uninitialized store before declaring',
     async () => {
@@ -501,7 +509,6 @@ async function compaction(tables: string[]): Promise<void> {
         }
       }
     },
-    setRebuild: async (state) => controls.setRebuild(state),
   })
 }
 

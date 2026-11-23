@@ -5,6 +5,8 @@
 import {type SerializedEvent, encodeEvent} from '../event.js'
 import {compareUtf8} from '../utf8.js'
 import type {ViewRow} from '../views.js'
+import {type ProjectedView, putView} from '../projection.js'
+import {PROJECTOR_NAME} from './projector.js'
 import {counterView, rowView} from './row.js'
 import {allocations, invalidJournal} from './scope.js'
 
@@ -69,4 +71,14 @@ export function stateViews(state: JournalState): ViewRow[] {
 
 function compare(a: bigint, b: bigint): number {
   return a < b ? -1 : a > b ? 1 : 0
+}
+
+/** The journal's rows and then its counters as rebuild puts, owned as the live commits own them. */
+export function journalOperations(state: JournalState): ProjectedView[] {
+  return stateViews(state).map((row, operation) => ({
+    projector: PROJECTOR_NAME,
+    projectorIndex: 0,
+    operation,
+    op: putView(row.pk, row.sk, row.entityId, row.entityType, row.payload),
+  }))
 }

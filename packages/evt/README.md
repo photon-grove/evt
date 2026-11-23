@@ -215,13 +215,22 @@ const page = await repository.page('account:a-1', 0n, 100)
   which it installs with `readManifest` and `readChunk` before paging on from the checkpoint, and
   allocation never goes below it. `beginCompaction`, `compact`, `renewCompaction`,
   `endCompaction` and `forceReleaseCompaction` run the steps by hand.
+- **Rebuild.** Every row and counter is derived from stored events, in any order, so the journal
+  rebuilds under the rebuild lock: `rebuildJournalWithLock(repository, events, leaseMs)` takes the
+  lock as `journal-rebuild`, writes the rows and counters in guarded batches, renewing the lease,
+  and releases it; `rebuildJournalWithLease` runs under a lease you took and renews it, throwing a
+  `RebuildFailure` with the batches it attempted; `rebuildJournal` writes under a lease without
+  renewing it. A rebuild restores rows a compaction deleted and leaves the compaction partition
+  alone. `new ProjectionRebuild(repository, {projectors, aggregates, journal})` rebuilds the
+  journal with the commit-wide views in one lease and one generation, from events it reads under
+  the lock.
 
 On PostgreSQL the rows and counters are rows of the views table, written in the commit's
 transaction, and each read is one statement that sees every committed transaction. A
 `PgRepository` without `viewsTable: true` holds no journal: its journal reads fail with a
 `ViewsNotConfiguredError`, and a journaled commit through it is refused before anything is declared.
 Compaction works there too: each batch is one transaction that locks the rows it names, under the
-rebuild epoch. Journal rebuilds under the rebuild lock are still Rust only.
+rebuild epoch, and so do the journal's rebuilds.
 
 Each journaled commit wakes listeners with `pg_notify`, once per scope it wrote, unless the
 repository is built with `wakeups: false`. A `JournalListener` (`@photon-grove/evt/postgres`) holds
@@ -333,8 +342,8 @@ of `AbortSignal`, which the DOM library, `@types/node`, and Bun's and Deno's typ
   batches of at most 99 while the lease is renewed. A failure before any write releases a lock the
   run acquired from a settled generation; once a write was attempted it keeps the lock until a run
   completes. `plan()` is the dry run, `onProgress` reports the batches, and `runWithLease` runs
-  under a lease you took, throwing a `RebuildFailure` with the batches it attempted. It has no
-  journal or diff mode.
+  under a lease you took, throwing a `RebuildFailure` with the batches it attempted. Its `journal`
+  option rebuilds the journal in the same run. It has no diff mode.
 - **Transactions.** `store.transaction()` commits several streams at once. `read(aggregate, id)`
   loads a stream of any aggregate type and returns a typed handle, `append(handle, events)` stages
   the events decided for it, and `commit({metadata})` stamps one commit ID on every event and

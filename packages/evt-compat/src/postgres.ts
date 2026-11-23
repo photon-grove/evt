@@ -46,7 +46,12 @@ import {
 import {postgresControls} from './controls.js'
 import {TestClock, compactionConformance} from './compaction-conformance.js'
 import {Checks} from './harness.js'
-import {journalConformance, journalStoreCases} from './journal-conformance.js'
+import {
+  type JournalRebuildTarget,
+  journalConformance,
+  journalRebuildConformance,
+  journalStoreCases,
+} from './journal-conformance.js'
 import {postgresViewDdl, postgresViewWriter} from './pgviews.js'
 import {viewRepositoryConformance} from './view-conformance.js'
 
@@ -581,7 +586,7 @@ async function viewsTableCases(): Promise<void> {
 async function journalCases(): Promise<void> {
   const repo = await tableLog()
   const reader = repo.viewRepository()
-  await journalConformance(checks, {
+  const journalTarget: JournalRebuildTarget = {
     repo,
     manifest: async () => controls(repo).manifest(),
     views: {
@@ -591,7 +596,10 @@ async function journalCases(): Promise<void> {
       listViewsByPk: (pk) => reader.listViewsByPk(pk),
     },
     handle: () => new PgRepository(pool, {...repoTables(repo), viewsTable: true}),
-  })
+  }
+  await journalConformance(checks, journalTarget)
+  // The rebuild cases take the store-wide rebuild lock: after the others, on the same store.
+  await journalRebuildConformance(checks, journalTarget)
   await journalStoreCases(checks, async () => {
     const fresh = await tableLog()
 
@@ -690,7 +698,6 @@ async function compactionCases(): Promise<void> {
         }
       }
     },
-    setRebuild: async (state) => controls(repo).setRebuild(state),
   })
 
   await checks.case(

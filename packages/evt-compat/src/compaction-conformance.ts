@@ -2,10 +2,8 @@
 // photon_evt::conformance::compaction_cases, keeping their names: the snapshot and the `410 Gone`
 // handoff, canonical chunks, the lease with takeover and force release, epoch fencing, the
 // allocation floor, and the refusals. Every case namespaces its scopes and streams, so a durable
-// table can be shared across runs. The cases declare `journal` and `journal-compaction` and set
-// the rebuild fence, so run them on a store of their own that nothing else is rebuilding.
-// TypeScript has no rebuild lifecycle yet: the cases set the fence's rows as a rebuild's begin and
-// end would, and put back the replayed rows a rebuild would write.
+// table can be shared across runs. The cases declare `journal` and `journal-compaction` and take
+// the rebuild lock, so run them on a store of their own that nothing else is rebuilding.
 // Every step depends on the ones before it, so the cases await in loops on purpose.
 /* oxlint-disable no-await-in-loop */
 
@@ -15,6 +13,8 @@ import {
   EvtError,
   type FeatureManifest,
   type Outcome,
+  type RebuildFence,
+  type RebuildLease,
   RebuildUnavailableError,
   type SerializedEvent,
   type SerializedSnapshot,
@@ -66,11 +66,10 @@ import {
   readManifest,
   releasedPayload,
   renewCompaction,
-  replay,
+  rebuildJournalWithLock,
   rowPartitionKey,
   rowSortKey,
   rowView,
-  stateViews,
 } from '@photon-grove/evt/journal'
 import {
   JOURNAL_MARKER,
@@ -79,7 +78,7 @@ import {
   type JournalMarker,
 } from '@photon-grove/evt/testing'
 
-import type {ManifestDraft, RebuildState} from './conformance.js'
+import type {ManifestDraft} from './conformance.js'
 import {type Checks, canonical} from './harness.js'
 
 /** The view rows a case reads and changes behind the engine's back, as another writer would. */
@@ -113,15 +112,13 @@ export class TestClock {
 /** What the compaction cases run against. */
 export interface CompactionTarget {
   /** A repository that writes views, reading `clock` as its compaction clock. */
-  readonly repo: JournalBackend & CompactionBackend
+  readonly repo: JournalBackend & CompactionBackend & RebuildFence
   readonly views: CompactionViews
   readonly clock: TestClock
   /** The store's feature manifest as stored. */
   manifest(): Promise<FeatureManifest | null>
   /** Changes the manifest as another writer would, and has the repository read it again. */
   declare(change: (draft: ManifestDraft) => void): Promise<void>
-  /** Sets the rebuild fence's rows, as a rebuild's lifecycle would. */
-  setRebuild(state: RebuildState): Promise<void>
 }
 
 /** The lease the cases compact under: a minute. */
@@ -366,17 +363,14 @@ async function compactionDeclared(target: CompactionTarget): Promise<number | nu
   return (await target.manifest())?.features.get(JOURNAL_COMPACTION_FEATURE) ?? null
 }
 
-// Begins a rebuild as its lifecycle would: the generation moves to odd under a held lock.
-async function beginRebuild(target: CompactionTarget): Promise<bigint> {
-  const settled = await target.repo.observeRebuildEpoch()
-  await target.setRebuild({generation: settled + 1n, lock: 'held'})
-
-  return settled + 1n
+// Begins a rebuild: the generation moves to odd under a held lock.
+function beginRebuild(target: CompactionTarget): Promise<RebuildLease> {
+  return target.repo.beginRebuild(`compaction-conformance-${namespace()}`, LEASE)
 }
 
-// Ends a rebuild as its lifecycle would: the generation moves to the next even one, unlocked.
-async function endRebuild(target: CompactionTarget, generation: bigint): Promise<void> {
-  await target.setRebuild({generation: generation + 1n, lock: null})
+// Ends a rebuild: the generation moves to the next even one, unlocked.
+async function endRebuild(target: CompactionTarget, lease: RebuildLease): Promise<void> {
+  await target.repo.endRebuild(lease)
 }
 
 async function snapshotAndGone(target: CompactionTarget): Promise<void> {
@@ -610,12 +604,9 @@ async function rebuildRestoresRows(target: CompactionTarget): Promise<void> {
   const manifest = await readManifest(repo, scope)
 
   // The rebuild derives every row from the stored events, the compacted ones included, and leaves
-  // the compaction partition alone. Until TypeScript has the rebuild lifecycle, the rows and
-  // counters a rebuild writes (the replayed state) are put back directly.
+  // the compaction partition alone.
   const events = await repo.events(new Stream(ns, 'a', 'ledger').id)
-  for (const row of stateViews(replay(events))) {
-    await views.putView(row)
-  }
+  await rebuildJournalWithLock(repo, events, LEASE)
   ensureEqual(await repo.readRows(scope, 0n, 100), live, 'the restored rows')
   ensureEqual(await readManifest(repo, scope), manifest, 'the manifest stays')
 

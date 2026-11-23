@@ -1,17 +1,23 @@
 // The journal's conformance cases, the TypeScript counterpart of Rust's
 // photon_evt::conformance::journal_cases, keeping their names. Each case namespaces its entity IDs,
-// types and scopes, so a durable backend can share one store across runs. The rebuild cases wait
-// for the rebuild lifecycle.
+// types and scopes, so a durable backend can share one store across runs. The rebuild cases take the
+// store-wide rebuild lock, so they run apart, in journalRebuildConformance.
 // Every step depends on the ones before it, so the cases await in loops on purpose.
 /* oxlint-disable no-await-in-loop */
 
 import {
   type CallOptions,
   type Commit,
+  type CommitProjector,
   type CommitReceipt,
+  type EventLog,
   EvtError,
   type FeatureManifest,
   type Outcome,
+  ProjectionRebuild,
+  RebuildFailure,
+  type RebuildFence,
+  RebuildUnavailableError,
   type SerializedEvent,
   type SerializedSnapshot,
   StoreNotInitializedError,
@@ -21,11 +27,15 @@ import {
   type ViewRow,
   commitTransactionWithReceipt,
   commitWithReceipt,
+  defineAggregate,
+  defineEvents,
   emptyMetadata,
   eventId,
   groupCommits,
   isConflict,
+  json,
   projectViews,
+  putView,
 } from '@photon-grove/evt'
 import {
   ALLOCATION_KEY,
@@ -33,6 +43,7 @@ import {
   JOURNAL_VERSION,
   type JournalBackend,
   type JournalPage,
+  type JournalRebuild,
   JournalRepository,
   type JournalRow,
   JournalRowTooLargeError,
@@ -43,6 +54,11 @@ import {
   counterPartitionKey,
   counterView,
   encodeAllocations,
+  journalOperations,
+  pageAtEpoch,
+  rebuildJournal,
+  rebuildJournalWithLease,
+  rebuildJournalWithLock,
   replay,
   rowPartitionKey,
   rowSize,
@@ -1308,4 +1324,366 @@ async function fullPagesShowMoreRows(repo: JournalBackend, views: JournalViews):
     }
     ensureEqual(seen, [1, 2, 3, 4, 5], `${name}: paging by 2 reads every row`)
   }
+}
+
+/** What the journal's rebuild cases need: a journal target whose repository fences rebuilds. */
+export interface JournalRebuildTarget extends JournalTarget {
+  readonly repo: JournalBackend & RebuildFence & EventLog
+}
+
+// The lease every rebuild case takes.
+const LEASE = 60_000
+
+/**
+ * Runs the journal's rebuild cases: the journal rebuilt under the lock and under a caller's lease,
+ * a force-released rebuild, and a projection rebuild that carries the journal. Each takes the
+ * store-wide rebuild lock, so run them where nothing else rebuilds, and they leave the fence
+ * settled.
+ */
+export async function journalRebuildConformance(
+  checks: Checks,
+  target: JournalRebuildTarget,
+): Promise<void> {
+  const {repo, views} = target
+  const cases: [string, () => Promise<void>][] = [
+    [
+      'a rebuild under the lock refuses live commits and reproduces the live journal',
+      () => rebuildUnderTheLock(repo, views),
+    ],
+    [
+      "a rebuild under a caller's lease renews it in place, and stops at a lost lease",
+      () => rebuildUnderACallersLease(repo, views),
+    ],
+    [
+      'a failed rebuild that wiped the counters keeps journaled commits refused after a force-release',
+      () => forceReleasedRebuildRefusesJournaledCommits(repo, views),
+    ],
+    [
+      'views and the journal rebuild under one lease, so readers see one generation',
+      () => viewsAndJournalUnderOneLease(repo, views),
+    ],
+    [
+      'a rebuild repairs a scope whose rows were lost, and the rows follow a lost counter',
+      () => rebuildRepairsGaps(repo, views),
+    ],
+    [
+      'rebuilding into an emptied scope restores it',
+      () => rebuildRestoresAnEmptiedScope(repo, views),
+    ],
+  ]
+
+  for (const [name, run] of cases) {
+    await checks.case(`journal rebuild: ${name}`, run)
+  }
+}
+
+type RebuildRepo = JournalBackend & RebuildFence & EventLog
+
+async function rebuildUnderTheLock(repo: RebuildRepo, views: JournalViews): Promise<void> {
+  const ns = namespace()
+  const writer = journaled(repo, journal(ns))
+  const [a, b] = [new Stream(ns, 'a', 'ledger'), new Stream(ns, 'b', 'ledger')]
+  const world = scopeName(ns, 'world')
+  await a.commit(writer, a.events(1, 3))
+  await b.commit(writer, b.events(1, 2))
+  const live = (await views.listViewsByPk(rowPartitionKey(world))).map(rowFields)
+  const counters = async () => {
+    const values = []
+    for (const name of ['world', 'place-a', 'place-b']) {
+      values.push(await writer.highWatermark(scopeName(ns, name)))
+    }
+    return values
+  }
+  const liveCounters = await counters()
+  const events = [...(await repo.events(a.id)), ...(await repo.events(b.id))]
+
+  // Wipe the derived state, as a rebuild starts from lost rows, then rebuild under the lock.
+  for (const row of await views.listViewsByPk(rowPartitionKey(world))) {
+    await views.deleteView(row.pk, row.sk)
+  }
+  await views.deleteView(counterPartitionKey(world), 'COUNTER')
+  const lease = await repo.beginRebuild(`${ns}-journal`, LEASE)
+
+  // A live journal commit is refused while the lock is held, and writes nothing.
+  await expectError(
+    b.commit(writer, b.events(3, 3)),
+    'a live journal commit during a rebuild',
+    coded('rebuildInProgress'),
+  )
+  ensureEqual((await repo.events(b.id)).length, 2, 'the refused commit wrote no event')
+  // Readers are fenced for the duration, and the epoch-checked reads say so.
+  await expectError(
+    pageAtEpoch(repo, world, 0n, 10),
+    'an epoch-checked page during a rebuild',
+    (error) => error instanceof RebuildUnavailableError,
+  )
+
+  await rebuildJournal(repo, events, lease)
+  await repo.endRebuild(lease)
+  ensureEqual(
+    (await views.listViewsByPk(rowPartitionKey(world))).map(rowFields),
+    live,
+    'the rebuilt rows are the live rows',
+  )
+  ensureEqual(await counters(), liveCounters, 'the rebuilt counters are the live counters')
+
+  // The lock is gone: live commits resume at the next position, and the epoch-checked page works.
+  await b.commit(writer, b.events(3, 3))
+  const page = await pageAtEpoch(repo, world, 0n, 10)
+  ensureEqual(page.rows.length, 6, 'the live commit continued the rebuilt scope')
+  ensure(page.caughtUp, 'the page is caught up')
+
+  // A lease that was lost writes nothing: the rebuild fences on owner and fencing token.
+  const stale = await repo.beginRebuild(`${ns}-journal`, LEASE)
+  await repo.endRebuild(stale)
+  await expectError(
+    rebuildJournal(repo, events, stale),
+    'a rebuild on a released lease',
+    coded('rebuildLeaseLost'),
+  )
+}
+
+// The caller's lease is renewed before the first batch and comes back renewed; a lease that was
+// lost stops the run at that renewal, before any write, and the failure says so.
+async function rebuildUnderACallersLease(repo: RebuildRepo, views: JournalViews): Promise<void> {
+  const ns = namespace()
+  const writer = journaled(repo, journal(ns))
+  const a = new Stream(ns, 'a', 'ledger')
+  const world = scopeName(ns, 'world')
+  await a.commit(writer, a.events(1, 3))
+  const live = (await views.listViewsByPk(rowPartitionKey(world))).map(rowFields)
+  const events = await repo.events(a.id)
+  for (const row of await views.listViewsByPk(rowPartitionKey(world))) {
+    await views.deleteView(row.pk, row.sk)
+  }
+
+  const owner = `${ns}-caller`
+  const taken = await repo.beginRebuild(owner, LEASE)
+  let rebuilt: JournalRebuild | null = null
+  let failure: unknown = null
+  try {
+    rebuilt = await rebuildJournalWithLease(repo, events, taken, LEASE * 2)
+  } catch (error) {
+    failure = error
+  }
+  const lease = rebuilt?.lease ?? taken
+  const state = await repo.rebuildState()
+  // End the lease before checking, so a failed check leaves the fence settled for the next case.
+  await repo.endRebuild(lease)
+  if (rebuilt === null) {
+    throw failure
+  }
+  ensureEqual(rebuilt.state.rows.length, 6, 'three rows in each of two scopes')
+  ensure(
+    lease.generation === taken.generation && lease.leaseExpiresAt > taken.leaseExpiresAt,
+    "the caller's lease was renewed",
+  )
+  ensure(
+    state.lock !== null && state.lock.owner === owner && state.lock.generation === lease.generation,
+    'the caller still held the lock after the run',
+  )
+  ensureEqual(
+    (await views.listViewsByPk(rowPartitionKey(world))).map(rowFields),
+    live,
+    'the rebuilt rows are the live rows',
+  )
+
+  // A lease that was lost fails its first renewal, before any write.
+  const stale = await repo.beginRebuild(owner, LEASE)
+  await repo.endRebuild(stale)
+  for (const row of await views.listViewsByPk(rowPartitionKey(world))) {
+    await views.deleteView(row.pk, row.sk)
+  }
+  const lost = await expectError(
+    rebuildJournalWithLease(repo, events, stale, LEASE),
+    'a rebuild on a released lease',
+    (error) => error instanceof RebuildFailure,
+  )
+  ensure(
+    lost instanceof RebuildFailure &&
+      lost.attempted === 0 &&
+      lost.error instanceof EvtError &&
+      lost.error.code === 'rebuildLeaseLost',
+    'a lost lease stops the run before its first write',
+  )
+  ensureEqual(
+    (await views.listViewsByPk(rowPartitionKey(world))).length,
+    0,
+    'nothing was written under the lost lease',
+  )
+}
+
+// A rebuild wipes the journal's rows and counters, writes its first batch, and fails; an operator
+// force-releases it. A journaled commit would now allocate from the wiped counters, so it's
+// refused, and writes nothing, until a rebuild runs to its end.
+async function forceReleasedRebuildRefusesJournaledCommits(
+  repo: RebuildRepo,
+  views: JournalViews,
+): Promise<void> {
+  const ns = namespace()
+  const writer = journaled(repo, journal(ns))
+  const stream = new Stream(ns, 'a', 'ledger')
+  const [world, place] = [scopeName(ns, 'world'), scopeName(ns, 'place-a')]
+  await stream.commit(writer, stream.events(1, 3))
+  const events = await repo.events(stream.id)
+  const state = replay(events)
+
+  // The rebuild wipes the derived state, writes its first batch, and fails without ending.
+  const lease = await repo.beginRebuild(`${ns}-failed`, LEASE)
+  for (const at of [world, place]) {
+    for (const row of await views.listViewsByPk(rowPartitionKey(at))) {
+      await views.deleteView(row.pk, row.sk)
+    }
+    await views.deleteView(counterPartitionKey(at), 'COUNTER')
+  }
+  const [first] = journalOperations(state)
+  await repo.writeRebuildViews(lease, [first!])
+  ensureEqual(await writer.highWatermark(world), 0n, 'the failed rebuild left the counter wiped')
+  const forced = await repo.forceReleaseRebuild(lease.owner)
+  ensure(forced.forceReleased, 'the generation is flagged force-released')
+
+  // The journaled commit is refused, and writes no event and no allocation.
+  await expectError(
+    stream.commit(writer, stream.events(4, 4)),
+    'a journaled commit after the force-release',
+    coded('rebuildInProgress'),
+  )
+  ensureEqual((await repo.events(stream.id)).length, 3, 'the refused commit wrote no event')
+  ensureEqual(await writer.highWatermark(world), 0n, 'the refused commit allocated nothing')
+  await expectError(
+    pageAtEpoch(repo, world, 0n, 10),
+    'an epoch-checked page after the force-release',
+    (error) => error instanceof RebuildUnavailableError && error.forceReleased,
+  )
+
+  // A rebuild that runs to its end restores the counters and settles the generation; the commit
+  // then continues each scope at the next position.
+  await rebuildJournalWithLock(repo, events, LEASE)
+  await stream.commit(writer, stream.events(4, 4))
+  for (const at of [world, place]) {
+    ensureEqual(await writer.highWatermark(at), 4n, `the commit continued ${at}`)
+  }
+  const page = await pageAtEpoch(repo, world, 0n, 10)
+  ensureEqual(positions(page), [1, 2, 3, 4], 'no position is held twice')
+  ensure(page.caughtUp, 'the page is caught up')
+}
+
+// A ledger whose state is its total and its entries, for the projection rebuild case.
+function ledgerAggregate(entityType: string) {
+  return defineAggregate({
+    type: entityType,
+    events: defineEvents({'ledger:added': {version: 1, codec: json<{amount: number}>()}}),
+    state: json<{total: number; entries: number}>(),
+    initial: () => ({total: 0, entries: 0}),
+    handle: () => ({kind: 'accept', events: []}),
+    apply: (state, event) => ({total: state.total + event.data.amount, entries: state.entries + 1}),
+  })
+}
+
+// One run rebuilds a projector's views and the journal from events it reads under its own lock, so
+// the generation moves once, from settled to settled.
+async function viewsAndJournalUnderOneLease(repo: RebuildRepo, views: JournalViews): Promise<void> {
+  const ns = namespace()
+  const writer = journaled(repo, journal(ns))
+  const [a, b] = [new Stream(ns, 'a', 'ledger'), new Stream(ns, 'b', 'ledger')]
+  const world = scopeName(ns, 'world')
+  const totals = `${ns}#totals`
+  await a.commit(writer, a.events(1, 2))
+  await b.commit(writer, b.events(1, 1))
+  const live = (await views.listViewsByPk(rowPartitionKey(world))).map(rowFields)
+  for (const row of await views.listViewsByPk(rowPartitionKey(world))) {
+    await views.deleteView(row.pk, row.sk)
+  }
+  await views.deleteView(counterPartitionKey(world), 'COUNTER')
+
+  const before = await repo.rebuildGeneration()
+  const totalsProjector: CommitProjector = {
+    name: 'ledger-totals',
+    project: (commit) =>
+      commit.streams.map((stream) =>
+        putView(totals, stream.entityId, stream.entityId, stream.entityType, stream.state),
+      ),
+  }
+  const report = await new ProjectionRebuild(repo, {
+    projectors: [totalsProjector],
+    aggregates: [ledgerAggregate(a.entityType)],
+    journal: journal(ns),
+  }).run(`${ns}-both`, LEASE)
+  ensureEqual(
+    [report.entities, report.events, report.journalRows, report.journalCounters, report.puts],
+    [2, 3, 6, 3, 11],
+    'two totals, and three events in two scopes each with three counters',
+  )
+  ensureEqual(
+    await repo.rebuildGeneration(),
+    {value: before.value + 2n, forceReleased: false},
+    'one lock covered both',
+  )
+  ensureEqual(
+    (await views.listViewsByPk(rowPartitionKey(world))).map(rowFields),
+    live,
+    'the rebuilt journal rows are the live rows',
+  )
+  ensureEqual(await writer.highWatermark(world), 3n, 'the world counter is restored')
+  for (const [stream, payload] of [
+    [a, '{"total":3,"entries":2}'],
+    [b, '{"total":1,"entries":1}'],
+  ] as const) {
+    const row = await views.getViewAt(totals, stream.id)
+    ensureEqual(row && new TextDecoder().decode(row.payload), payload, `the total of ${stream.id}`)
+  }
+}
+
+// Rows missing in the middle and at the tail are restored by a rebuild from the stored events, and
+// a lost counter doesn't hide rows: the watermark follows the rows a page finds.
+async function rebuildRepairsGaps(repo: RebuildRepo, views: JournalViews): Promise<void> {
+  const ns = namespace()
+  const writer = journaled(repo, journal(ns))
+  const a = new Stream(ns, 'a', 'ledger')
+  const world = scopeName(ns, 'world')
+  await a.commit(writer, a.events(1, 5))
+  for (const position of [3n, 5n]) {
+    await views.deleteView(rowPartitionKey(world), rowSortKey(position))
+  }
+  ensureEqual((await writer.page(world, 0n, 10)).gap, {from: 3n, to: 3n}, 'the gap')
+
+  await rebuildJournalWithLock(repo, await repo.events(a.id), LEASE)
+  const repaired = await writer.page(world, 0n, 10)
+  ensureEqual(positions(repaired), [1, 2, 3, 4, 5], 'repaired rows')
+  ensure(repaired.caughtUp, 'repaired')
+
+  await views.deleteView(counterPartitionKey(world), 'COUNTER')
+  ensureEqual(await writer.highWatermark(world), 0n, 'no counter row')
+  const uncounted = await writer.page(world, 0n, 10)
+  ensureEqual(uncounted.rows.length, 5, 'the rows are still read')
+  ensureEqual(uncounted.highWatermark, 5n, 'the watermark follows the rows')
+  ensure(uncounted.gap === null, 'no gap')
+}
+
+async function rebuildRestoresAnEmptiedScope(
+  repo: RebuildRepo,
+  views: JournalViews,
+): Promise<void> {
+  const ns = namespace()
+  const writer = journaled(repo, journal(ns))
+  const [a, b] = [new Stream(ns, 'a', 'ledger'), new Stream(ns, 'b', 'ledger')]
+  const world = scopeName(ns, 'world')
+  await a.commit(writer, a.events(1, 2))
+  await b.commit(writer, b.events(1, 3))
+  const events = [...(await repo.events(a.id)), ...(await repo.events(b.id))]
+  const live = (await views.listViewsByPk(rowPartitionKey(world))).map(rowFields)
+
+  for (const row of await views.listViewsByPk(rowPartitionKey(world))) {
+    await views.deleteView(row.pk, row.sk)
+  }
+  await views.deleteView(counterPartitionKey(world), 'COUNTER')
+  ensureEqual((await writer.page(world, 0n, 10)).rows.length, 0, 'the scope was wiped')
+
+  await rebuildJournalWithLock(repo, events, LEASE)
+  ensureEqual(
+    (await views.listViewsByPk(rowPartitionKey(world))).map(rowFields),
+    live,
+    'the rebuilt rows',
+  )
+  ensureEqual(await writer.highWatermark(world), 5n, 'the rebuilt counter')
 }

@@ -89,7 +89,14 @@ export {
   page,
   pageAtEpoch,
 } from './read.js'
-export {type JournalState, replay, stateViews} from './replay.js'
+export {
+  JOURNAL_REBUILD_OWNER,
+  type JournalRebuild,
+  rebuildJournal,
+  rebuildJournalWithLease,
+  rebuildJournalWithLock,
+} from './rebuild.js'
+export {type JournalState, journalOperations, replay, stateViews} from './replay.js'
 export {
   DEFAULT_MAX_ROW_BYTES,
   type JournalRow,
