@@ -679,10 +679,11 @@ The same swap works for PostgreSQL: `postgres.NewStore` (or `postgres.NewReposit
 ## The same model in TypeScript
 
 [`@photon-grove/evt`](https://github.com/photon-grove/evt/blob/main/packages/evt/README.md) is the
-TypeScript implementation of the same storage format. So far it has the core, multi-stream
-transactions with read fences, command outcomes, commit-wide projectors, the in-memory, DynamoDB
-and PostgreSQL backends, and the given/when/then helpers. The
-[feature matrix](../reference/feature-matrix.md) tracks what's left.
+TypeScript implementation of the same storage format. It has the core, multi-stream transactions
+with read fences, command outcomes, commit-wide projectors with fenced rebuilds, the view
+repository, the sync journal, the in-memory, DynamoDB and PostgreSQL backends, and the
+given/when/then helpers. The [feature matrix](../reference/feature-matrix.md) lists the few Rust
+features it leaves out.
 This section builds the Rust bank account again, with the same event types and payload JSON. Every
 TypeScript snippet is copied from
 [`packages/evt/examples/getting-started.ts`](https://github.com/photon-grove/evt/blob/main/packages/evt/examples/getting-started.ts)

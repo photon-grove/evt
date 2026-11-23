@@ -11,11 +11,13 @@ held to the fixtures Go and Rust generate, byte for byte.
 npm install @photon-grove/evt
 ```
 
-So far it has the core, multi-stream transactions with read fences, command outcomes,
-commit-wide projectors, the in-memory, DynamoDB and PostgreSQL backends, the view repository
-with its typed view codec, the journal on every backend, and the testing helpers. The
+It has the core, multi-stream transactions with read fences, command outcomes and fence-aware
+retry, commit-wide projectors with the fenced projection rebuild, enumeration and entity heads, the
+in-memory, DynamoDB and PostgreSQL backends (the PostgreSQL views table included), the view
+repository with its typed view codec, the sync journal with compaction on every backend, commit
+receipts, and the testing helpers. The
 [feature matrix](https://github.com/photon-grove/evt/blob/main/docs/reference/feature-matrix.md)
-tracks each one. The
+tracks each one, along with the few Rust features this package leaves out. The
 [getting started guide](https://github.com/photon-grove/evt/blob/main/docs/guide/getting-started.md#the-same-model-in-typescript)
 builds a bank account aggregate with it, end to end.
 
@@ -23,7 +25,7 @@ builds a bank account aggregate with it, end to end.
 
 | Import                       | Contents                                                                   |
 | ---------------------------- | -------------------------------------------------------------------------- |
-| `@photon-grove/evt`          | Aggregates, codecs, the `Store`, retry, `ViewCodec`, and the wire codecs   |
+| `@photon-grove/evt`          | The `Store`, aggregates, codecs, retry, projectors, `ProjectionRebuild`    |
 | `@photon-grove/evt/memory`   | `MemRepository` and `MemViewRepository`, for tests and local use           |
 | `@photon-grove/evt/testing`  | `scenario` and `Fixture`, the given/when/then helpers over `MemRepository` |
 | `@photon-grove/evt/dynamodb` | `DynamoRepository`, `viewProjector`, `DynamoViewRepository`, item codecs   |
@@ -419,8 +421,7 @@ any test runner, and Vitest and Jest show a diff.
 
 ## Sharing streams with Go and Rust
 
-A TypeScript writer and a Go or Rust writer can share a stream once the TypeScript backends ship, as
-long as they agree on these:
+A TypeScript writer and a Go or Rust writer can share a stream as long as they agree on these:
 
 - The event type strings, versions and payload JSON, and the aggregate state's JSON, because each
   language reads the others' snapshots. `json()` writes an object's properties in order, so declare
@@ -439,7 +440,8 @@ long as they agree on these:
 
 A TypeScript writer of an entity type that has commit-wide projectors registered in a Go or Rust
 service must register the same projectors, writing the same bytes, as every writer of the type
-does, and on PostgreSQL a view writer that issues the same statements.
+does, and on PostgreSQL the same view target: the views table, or a view writer that issues the
+same statements.
 
 The [known differences](https://github.com/photon-grove/evt/blob/main/docs/reference/storage-format.md#known-differences)
 between the languages are in the storage format, and

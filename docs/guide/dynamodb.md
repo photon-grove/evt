@@ -39,8 +39,8 @@ It takes the AWS SDK's low-level `DynamoDB` client, needs the same one-time init
 (`repository.initialize()`), and has `lazyInitialization`, `consistentRead`, `retention` and
 `viewsTable` options. It writes the per-entity view row ([Entity-views table](#entity-views-table)),
 and, with `viewsTable` set, the rows of a store's commit-wide projectors (`commitProjectors`), in
-the commit's transaction. It runs current-state projectors only so far: it refuses one that names
-a `history`, so don't point it at entity types whose commit-wide projectors are history-dependent.
+the commit's transaction. A store with history-dependent projectors declares their entity types
+through `declareHistoryDependent` once, before the first commit that runs them.
 
 ## Event-log table
 

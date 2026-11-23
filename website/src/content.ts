@@ -53,16 +53,16 @@ export const implementations: Implementation[] = [
     href: 'https://pkg.go.dev/github.com/photon-grove/evt/go',
     status: 'stable',
     statusLabel: 'Shipping',
-    body: 'The original module, with transactions, outcomes, fenced rebuilds and the evt-doctor CLI. The sync journal is Rust-only for now.',
+    body: 'The original module, with transactions, outcomes, fenced rebuilds and the evt-doctor CLI. It doesn\'t have the sync journal.',
   },
   {
     lang: 'ts',
     name: '@photon-grove/evt',
     registry: 'npm',
     href: npmUrl,
-    status: 'porting',
-    statusLabel: 'Being ported',
-    body: 'A third native implementation, built in phases. The core, command outcomes and retry are in, transactions and the durable backends are landing, and projectors, rebuilds and views come next.',
+    status: 'stable',
+    statusLabel: 'Shipping',
+    body: 'A third native implementation: transactions, outcomes, commit-wide projectors with fenced rebuilds, views and the sync journal, on all three backends.',
   },
 ]
 
@@ -361,7 +361,7 @@ const store = new Store(repository, {commitProjectors: [directory]})`,
     id: 'derived',
     title: 'Rebuild and sync',
     tagline: 'Derived state you can throw away',
-    body: 'Views are derived, so the log can reproduce them. Rust\'s and TypeScript\'s ProjectionRebuild rebuild commit-wide views behind a rebuild fence that keeps commits out until they settle, and Go\'s RebuildProjections does the same for per-entity views. In Rust, the sync journal also hands each scope an ordered, gap-checked feed for realtime clients.',
+    body: 'Views are derived, so the log can reproduce them. Rust\'s and TypeScript\'s ProjectionRebuild rebuild commit-wide views behind a rebuild fence that keeps commits out until they settle, and Go\'s RebuildProjections does the same for per-entity views. In Rust and TypeScript, the sync journal also hands each scope an ordered, gap-checked feed for realtime clients.',
     doc: 'guide/projections',
     code: {
       go: `lease, err := fence.Begin(ctx, owner, 10*time.Minute) // fence out writers and readers
@@ -433,7 +433,6 @@ export const capabilities: ContentCard[] = [
   {
     icon: 'view',
     title: 'Commit-wide projectors',
-    tag: 'Rust · Go',
     body: 'View rows commit in the same transaction as the events that caused them, at any key, across every stream the commit touched.',
     doc: 'guide/projections',
   },
@@ -446,28 +445,27 @@ export const capabilities: ContentCard[] = [
   {
     icon: 'journal',
     title: 'Sync journal',
-    tag: 'Rust',
+    tag: 'Rust · TS',
     body: 'Per-scope, gap-checked delivery rows written in the commit, with compaction and a 410 Gone handoff for clients that fall behind.',
     doc: 'reference/storage-format',
   },
   {
     icon: 'lambda',
     title: 'Lambda stream helpers',
-    tag: 'Rust',
-    body: 'photon-evt-lambda decodes DynamoDB Streams records into events, builds filter patterns, and returns partial-batch failures.',
+    tag: 'Rust · TS',
+    body: 'photon-evt-lambda and its TypeScript port decode DynamoDB Streams records into events, build filter patterns, and return partial-batch failures.',
     doc: 'guide/streams',
   },
   {
     icon: 'fence',
     title: 'Fenced rebuilds',
-    tag: 'Rust · Go',
     body: 'Replay the log into fresh view rows while a rebuild fence keeps commits out and tells readers when the views have settled.',
     doc: 'guide/projections',
   },
   {
     icon: 'compat',
     title: 'Three languages, one format',
-    body: 'Go and Rust write the same bytes, checked by golden fixtures and live interleaved runs. TypeScript is held to the same fixtures as it is built.',
+    body: 'Go, Rust and TypeScript write the same bytes, checked by golden fixtures and live interleaved runs.',
     doc: 'reference/storage-format',
   },
 ]
@@ -530,11 +528,12 @@ export const packages: PerLang<PackageEntry[]> = {
     {name: 'photon-evt-lambda', body: 'DynamoDB Streams decode, event-source filters, journal wake-ups and partial-batch failures.', href: 'https://docs.rs/photon-evt-lambda'},
   ],
   ts: [
-    {name: '@photon-grove/evt', body: 'Aggregates, codecs, upcasters, the Store, transactions, command outcomes, retry and the wire codecs.', href: `${pkgTs}#the-model`},
+    {name: '@photon-grove/evt', body: 'Aggregates, codecs, upcasters, the Store, transactions, command outcomes, retry, commit-wide projectors, ProjectionRebuild and the wire codecs.', href: `${pkgTs}#the-model`},
     {name: '/memory', body: 'MemRepository, the in-memory backend for tests and local development.', href: `${pkgTs}#entry-points`},
     {name: '/testing', body: 'scenario and Fixture, the given/when/then helpers over MemRepository.', href: `${pkgTs}#testing`},
-    {name: '/dynamodb', body: 'DynamoRepository on the AWS SDK\'s low-level client, and viewProjector.', href: `${pkgTs}#dynamodb`},
-    {name: '/postgres', body: 'PgRepository on any pg-shaped pool, and the schema it creates.', href: `${pkgTs}#postgresql`},
+    {name: '/dynamodb', body: 'DynamoRepository on the AWS SDK\'s low-level client, DynamoViewRepository and viewProjector.', href: `${pkgTs}#dynamodb`},
+    {name: '/postgres', body: 'PgRepository on any pg-shaped pool, the schema it creates, the views table and JournalListener.', href: `${pkgTs}#postgresql`},
+    {name: '/journal', body: 'The sync journal: scopes, high watermarks, gap-checked paging, rebuilds and compaction.', href: `${pkgTs}#journal`},
   ],
 }
 

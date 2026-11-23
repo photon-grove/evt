@@ -457,14 +457,6 @@ h3 {
   padding: 6px 8px;
 }
 
-.install-note {
-  color: #fcd34d;
-  font-family: var(--sans);
-  font-size: 0.74rem;
-  font-weight: 650;
-  letter-spacing: 0.02em;
-}
-
 .install-line {
   align-items: center;
   display: flex;

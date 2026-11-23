@@ -92,13 +92,13 @@ event items.
 
 The sync journal ([storage format](https://github.com/photon-grove/evt/blob/main/docs/reference/storage-format.md#journal)) writes its rows (`journal#<scope>`, 20-digit position)
 and counters (`journal-counter#<scope>`, `COUNTER`) as view rows, in the views table, in the same
-transaction as the events. The journal itself is Rust-only so far, but a TypeScript consumer can
-already wake on its writes. It does three things:
+transaction as the events, whether a Rust or a TypeScript writer (`@photon-grove/evt/journal`)
+committed them. A consumer wakes on those writes in three steps:
 
-1. Turns on the views table's stream. `KEYS_ONLY` is enough: wake-ups decode from the keys, so any
+1. Turn on the views table's stream. `KEYS_ONLY` is enough: wake-ups decode from the keys, so any
    view type works.
-2. Maps the stream to the function with a `JournalFilter` pattern, so only journal writes invoke it.
-3. Reads each woken scope from its own cursor until it is caught up, then stores the cursor.
+2. Map the stream to the function with a `JournalFilter` pattern, so only journal writes invoke it.
+3. Read each woken scope from its own cursor until it is caught up, then stores the cursor.
 
 ```ts
 import {JournalFilter, type StreamEvent, processWakeups} from '@photon-grove/evt-lambda'
