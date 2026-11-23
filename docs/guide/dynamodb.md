@@ -297,6 +297,19 @@ const page = await views.listViewsByPkPaged('handles', {limit: 50})
 // page.nextCursor continues the listing, in this process or in a Go or Rust one
 ```
 
+A repository that writes commit-wide views hands out a view repository over the same table, so a
+handler commits and reads its own rows through one repository: Rust's
+`DynamoRepository::view_repository()` and TypeScript's `DynamoRepository.viewRepository()` return a
+`DynamoViewRepository` over the configured views table and the repository's client, and refuse with
+a views-not-configured error when there is none. Rust's and TypeScript's `MemRepository` are their
+own view repositories, over the rows their commits write.
+
+```ts
+const repo = new DynamoRepository(new DynamoDB({}), 'events', {viewsTable: 'views'})
+// ...commit through a store over `repo` whose commit-wide projector writes handles/ada...
+const row = await repo.viewRepository().getViewAt('handles', 'ada') // the committed row
+```
+
 A page's cursor is padded base64url JSON of the last key, Go's byte for byte. Rust and TypeScript
 refuse a cursor that doesn't continue the same listing, which DynamoDB would refuse anyway, with an
 invalid-argument error before any request. TypeScript also refuses a lone surrogate in a row or a

@@ -15,6 +15,7 @@ import {
   StreamHeadDriftError,
   StreamHeadsNotMigratedError,
   UnsupportedFeatureError,
+  ViewsNotConfiguredError,
   emptyMetadata,
   eventId,
 } from '@photon-grove/evt'
@@ -41,7 +42,7 @@ import {
   journalRebuildConformance,
   journalStoreCases,
 } from './journal-conformance.js'
-import {viewRepositoryConformance} from './view-conformance.js'
+import {committedViewConformance, viewRepositoryConformance} from './view-conformance.js'
 
 // Only a local emulator: a loopback address or a .localhost name.
 const endpoint = process.env['AWS_ENDPOINT_URL'] ?? ''
@@ -347,6 +348,20 @@ async function viewRepository(tables: string[]): Promise<void> {
 
   const reader = new DynamoViewRepository(client, viewsTable)
   await viewRepositoryConformance(checks, 'dynamodb', reader)
+
+  // A repository's own view repository reads the views table its commits write.
+  const eventsTable = await freshTable(tables)
+  await new DynamoRepository(client, eventsTable).initialize()
+  const writer = new DynamoRepository(client, eventsTable, {viewsTable})
+  await committedViewConformance(checks, 'dynamodb', writer, writer.viewRepository())
+
+  await checks.case('dynamodb views: a repository with no views table has no view repository', () =>
+    refuses(
+      Promise.resolve().then(() => new DynamoRepository(client, eventsTable).viewRepository()),
+      ViewsNotConfiguredError,
+      'viewRepository without a views table',
+    ),
+  )
 
   await checks.case('dynamodb views: the row a commit projected is read back', async () => {
     const table = await freshTable(tables)

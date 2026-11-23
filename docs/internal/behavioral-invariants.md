@@ -117,6 +117,14 @@ nothing. PostgreSQL `text` cannot hold U+0000, so the same call has the same res
 (Go `conformance.RunViewRepositorySuite`, Rust `view_repository_cases`, TypeScript
 `viewRepositoryConformance` in `packages/evt-compat`).
 
+In Rust and TypeScript, the view repository a repository hands out (the in-memory repository
+itself; `view_repository()` / `viewRepository()` on DynamoDB, refused without a views table, and on
+PostgreSQL with the views table) reads the rows that repository's commits write, owner included,
+and a point read or partition page taken straight after a commit reflects its put, overwrite or
+delete (Rust `committed_view_cases`, TypeScript `committedViewConformance`, in memory and live on
+DynamoDB and PostgreSQL). A row written through the in-memory view repository is the row a later
+commit's owner check reads.
+
 TypeScript also refuses a lone surrogate there, which isn't UTF-8 and which Go and Rust strings
 can't hold. The view repository's other rules are the same in Rust and TypeScript;
 `compat/fixtures/views.json` pins Go's items, keys, queries and cursors, and where Go differs it
