@@ -289,6 +289,35 @@ describe('PgRepository', () => {
     const {client} = fake()
     expect(() => new PgRepository(client, {eventsTable: 'x; DROP TABLE y'})).toThrow(EvtError)
   })
+
+  // Rust's in-band PgStatement projectors aren't ported, so no projector group can carry
+  // operations here: commit-wide views are the PostgreSQL write path.
+  test.each([
+    ['carries in-band operations', {backend: 'postgres', operations: [{}], sizes: [8]}],
+    ['belongs to another backend', {backend: 'dynamodb', operations: [], sizes: []}],
+  ])('refuses a projector group that %s, before any write', async (_, group) => {
+    const {client, log} = fake()
+    const commit = new PgRepository(client).commit({
+      entityId: 'a',
+      events: [event(1)],
+      projections: [group],
+    })
+
+    await expect(commit).rejects.toMatchObject({code: 'invalidCommit'})
+    expect(log.some((text) => text.startsWith('INSERT'))).toBe(false)
+    expect(log).not.toContain('COMMIT')
+  })
+
+  test('accepts an empty PostgreSQL projector group', async () => {
+    const {client, log} = fake()
+    await new PgRepository(client).commit({
+      entityId: 'a',
+      events: [event(1)],
+      projections: [{backend: 'postgres', operations: [], sizes: []}],
+    })
+
+    expect(log).toContain('COMMIT')
+  })
 })
 
 // A view operation of the `handles` projector.
