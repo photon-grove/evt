@@ -212,7 +212,16 @@ describe('ProjectionRebuild current-state projectors', () => {
       aggregates: [ledger, {aggregate: ledger, entityType: 'renamed'}],
     }).run('rebuild-1', 60_000)
 
-    expect(report).toEqual({entities: 3, commits: 0, puts: 3, deletes: 0, batches: 1, events: 0})
+    expect(report).toEqual({
+      entities: 3,
+      commits: 0,
+      puts: 3,
+      deletes: 0,
+      batches: 1,
+      events: 0,
+      journalRows: 0,
+      journalCounters: 0,
+    })
     expect(payloadOf(repository, 'totals', 'a')).toBe('{"total":5}')
     expect(payloadOf(repository, 'totals', 'z')).toBe('{"total":34}')
     expect(repository.view('totals', 'r')).toMatchObject({entityId: 'r', entityType: 'renamed'})
@@ -271,6 +280,8 @@ describe('ProjectionRebuild history projectors', () => {
       deletes: 0,
       batches: 1,
       events: 3,
+      journalRows: 0,
+      journalCounters: 0,
     })
     expect(payloadOf(repository, 'last', 'a')).toBe('{"commit":"c2","total":3}')
     expect(payloadOf(repository, 'last', 'b')).toBe('{"commit":"c1","total":2}')
@@ -441,7 +452,16 @@ describe('ProjectionRebuild writes', () => {
     expect(progress).toEqual([
       {
         kind: 'planned',
-        report: {entities: 150, commits: 0, puts: 150, deletes: 0, batches: 0, events: 0},
+        report: {
+          entities: 150,
+          commits: 0,
+          puts: 150,
+          deletes: 0,
+          batches: 0,
+          events: 0,
+          journalRows: 0,
+          journalCounters: 0,
+        },
         batches: 2,
       },
       {kind: 'wrote', batch: 1, of: 2},

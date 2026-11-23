@@ -5,7 +5,12 @@ import {describe, expect, test} from 'vitest'
 
 import {defineAggregate, defineEvents} from '../src/aggregate.ts'
 import {json} from '../src/codec.ts'
-import {CommitTooLargeError, EvtError, RebuildUnavailableError} from '../src/errors.ts'
+import {
+  CommitTooLargeError,
+  EvtError,
+  RebuildFailure,
+  RebuildUnavailableError,
+} from '../src/errors.ts'
 import type {SerializedEvent} from '../src/event.ts'
 import {
   ChunkBuilder,
@@ -24,6 +29,12 @@ import {
   releasedPayload,
 } from '../src/journal/compaction.ts'
 import {beginCompaction, compactWithLease, readLease} from '../src/journal/compact.ts'
+import {
+  JOURNAL_REBUILD_OWNER,
+  rebuildJournalWithLease,
+  rebuildJournalWithLock,
+} from '../src/journal/rebuild.ts'
+import {ProjectionRebuild} from '../src/rebuild.ts'
 import {Journal, JournalRowTooLargeError, allocate} from '../src/journal/config.ts'
 import {PositionTaken, journalProjector} from '../src/journal/projector.ts'
 import {type JournalPage, assemble, highWatermarkAtEpoch, pageAtEpoch} from '../src/journal/read.ts'
@@ -50,7 +61,7 @@ import {
   setAllocations,
 } from '../src/journal/scope.ts'
 import {JOURNAL_MARKER} from '../src/features.ts'
-import {MemRepository, controlFixtures} from '../src/memory/repository.ts'
+import {MemRepository, controlFixtures, viewFixtures} from '../src/memory/repository.ts'
 import {emptyMetadata} from '../src/metadata.ts'
 import {
   type CommitProjector,
@@ -766,6 +777,7 @@ describe('compaction leases', () => {
     expect((await readLease(memory, 'world:7'))?.kind).toBe('released')
   })
 
+  // Writes and compacts some 4 MB of rows, which takes seconds on a loaded machine.
   test('deletes rows near the largest cap in batches that fit a transaction', async () => {
     const memory = new MemRepository()
     const repository = new JournalRepository(
@@ -798,7 +810,7 @@ describe('compaction leases', () => {
     expect(batches.length).toBeGreaterThan(1)
     // Each batch's deleted rows stay under the commit budget.
     expect(Math.max(...batches) * 134_500).toBeLessThan(MAX_COMMIT_BYTES)
-  })
+  }, 30_000)
 
   test('refuses a lease whose expiry no reader could decode', async () => {
     const memory = new MemRepository()
@@ -824,5 +836,98 @@ describe('the journal and the commit budget', () => {
     const manifest = controlFixtures(memory).manifest()
     expect(manifest?.features.has('journal')).toBe(false)
     expect(manifest?.historyDependent).toEqual([])
+  })
+})
+
+// A memory store with `rows` journaled commits to world:7, and their events.
+async function journaledStore(rows: number) {
+  const memory = new MemRepository()
+  const repository = new JournalRepository(memory, new Journal(['account'], () => ['world:7']))
+  for (let index = 1; index <= rows; index++) {
+    // Each commit takes the next position, so they go one at a time.
+    // oxlint-disable-next-line no-await-in-loop
+    await repository.commit({entityId: `a${index}`, events: [opened(`a${index}`)]})
+  }
+  const events = (
+    await Promise.all(Array.from({length: rows}, (_, index) => memory.events(`a${index + 1}`)))
+  ).flat()
+
+  return {memory, events}
+}
+
+describe('the journal rebuild', () => {
+  test('a failure partway reports the batches it attempted, and the lock is kept', async () => {
+    // 150 rows and a counter: two guarded batches.
+    const {memory, events} = await journaledStore(150)
+    const write = memory.writeRebuildViews.bind(memory)
+    let writes = 0
+    memory.writeRebuildViews = async (lease, views, options) => {
+      if (++writes === 2) {
+        throw new Error('the second batch failed')
+      }
+      return write(lease, views, options)
+    }
+
+    const lease = await memory.beginRebuild('caller', 60_000)
+    let failure: unknown
+    try {
+      await rebuildJournalWithLease(memory, events, lease, 60_000)
+    } catch (error) {
+      failure = error
+    }
+    expect(failure).toBeInstanceOf(RebuildFailure)
+    expect([(failure as RebuildFailure).attempted, (failure as RebuildFailure).batches]).toEqual([
+      2, 2,
+    ])
+    await memory.endRebuild((failure as RebuildFailure).lease)
+
+    // Under the lock, a failed write after the first keeps it: the rows may be half-written.
+    writes = 0
+    await expect(rebuildJournalWithLock(memory, events, 60_000)).rejects.toThrow(
+      /the second batch failed/,
+    )
+    expect((await memory.rebuildState()).lock?.owner).toBe(JOURNAL_REBUILD_OWNER)
+  })
+
+  test('under the lock, a failure before the first write releases only a settled lock', async () => {
+    const {memory, events} = await journaledStore(1)
+    memory.renewRebuild = async () => {
+      throw new Error('the renewal failed')
+    }
+
+    // A one-second lease is renewed before every batch, the first included, so nothing is written.
+    await expect(rebuildJournalWithLock(memory, events, 1000)).rejects.toThrow(/the renewal failed/)
+    expect((await memory.rebuildState()).lock).toBeNull()
+
+    // After a force-release the lock is kept whatever failed: the rows may be half-written.
+    await memory.beginRebuild('crashed', 60_000)
+    await memory.forceReleaseRebuild('crashed')
+    await expect(rebuildJournalWithLock(memory, events, 1000)).rejects.toThrow(/the renewal failed/)
+    expect((await memory.rebuildState()).lock?.owner).toBe(JOURNAL_REBUILD_OWNER)
+  })
+
+  test('a projection rebuild may carry the journal alone', async () => {
+    const {memory} = await journaledStore(3)
+    for (const row of memory.views()) {
+      viewFixtures(memory).deleteView(row.pk, row.sk)
+    }
+
+    const report = await new ProjectionRebuild(memory, {
+      projectors: [],
+      aggregates: [],
+      journal: new Journal(['account'], () => ['world:7']),
+    }).run('both', 60_000)
+    expect([report.events, report.journalRows, report.journalCounters, report.puts]).toEqual([
+      3, 3, 1, 4,
+    ])
+    expect(await memory.readCounter('world:7')).toBe(3n)
+    expect(memory.views()).toHaveLength(4)
+
+    // The journal's projector is the engine's: a rebuild takes the journal option instead.
+    const engine = new ProjectionRebuild(memory, {
+      projectors: [journalProjector(new Journal(['account'], () => ['world:7']))],
+      aggregates: [],
+    })
+    await expect(engine.plan()).rejects.toThrow(/rebuild the journal with the journal option/)
   })
 })

@@ -792,8 +792,9 @@ export class PgRepository
     checkRebuildViewBatch(views)
     const built = this.#buildViews(views)
     if (this.#viewsTable) {
-      await this.#ensureStreamHeads(options)
-      await this.#ensureViewsDeclared(options)
+      // A rebuild's writes are the journal's own too, so they accept a journal table on any handle.
+      await this.#ensureStreamHeads(options, true)
+      await this.#ensureViewsDeclared(options, true)
     }
 
     await this.#transaction(options, {indeterminate: false, views: true}, async (run) => {

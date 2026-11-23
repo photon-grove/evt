@@ -11,7 +11,12 @@ import {
 import {TestClock, compactionConformance} from './compaction-conformance.js'
 import {conformance, markerConformance} from './conformance.js'
 import {Checks} from './harness.js'
-import {journalConformance, journalStoreCases} from './journal-conformance.js'
+import {
+  type JournalRebuildTarget,
+  journalConformance,
+  journalRebuildConformance,
+  journalStoreCases,
+} from './journal-conformance.js'
 import {viewRepositoryConformance} from './view-conformance.js'
 
 const checks = new Checks()
@@ -28,7 +33,7 @@ await viewRepositoryConformance(checks, 'memory', new MemViewRepository())
 // The journal accepts the store it wraps, so it gets one of its own.
 const journaled = new MemRepository()
 const rows = viewFixtures(journaled)
-await journalConformance(checks, {
+const journalTarget: JournalRebuildTarget = {
   repo: journaled,
   manifest: async () => controlFixtures(journaled).manifest(),
   views: {
@@ -37,7 +42,10 @@ await journalConformance(checks, {
     deleteView: async (pk, sk) => rows.deleteView(pk, sk),
     listViewsByPk: async (pk) => journaled.views().filter((row) => row.pk === pk),
   },
-})
+}
+await journalConformance(checks, journalTarget)
+// The rebuild cases take the store-wide rebuild lock: after the others, on the same store.
+await journalRebuildConformance(checks, journalTarget)
 await journalStoreCases(checks, () => {
   const fresh = new MemRepository()
 
@@ -61,7 +69,6 @@ await compactionConformance(checks, {
   declare: async (change) => {
     compactedControls.declare(change)
   },
-  setRebuild: async (state) => compactedControls.setRebuild(state),
 })
 
 checks.report()

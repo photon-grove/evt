@@ -1,7 +1,7 @@
 // The full projection rebuild (ADR 0004; storage format, "Rebuild fence"): commit-wide projectors
 // replayed over the event log, their rows written in guarded batches under the rebuild fence, and
-// compacted streams seeded from their snapshots. It follows Rust's `ProjectionRebuild`, without
-// its journal and diff modes.
+// compacted streams seeded from their snapshots, and the journal when it's given. It follows Rust's
+// `ProjectionRebuild`, without its diff mode.
 
 import {type Aggregate, replayEvent} from './aggregate.js'
 import {type EventLog, isEventLog} from './enumerate.js'
@@ -42,6 +42,8 @@ import {
   isRebuildFence,
 } from './rebuild-fence.js'
 import {type CallOptions, MAX_COMMIT_BYTES, type Repository} from './repository.js'
+import type {Journal} from './journal/config.js'
+import {journalOperations, replay as replayJournal} from './journal/replay.js'
 import {MAX_COMMIT_ITEM_BYTES} from './snapshots.js'
 import {Store} from './store.js'
 import {compareUtf8} from './utf8.js'
@@ -69,6 +71,14 @@ export interface ProjectionRebuildOptions {
    * guarded batch. A dry run reports nothing.
    */
   readonly onProgress?: ((progress: RebuildProgress) => void) | undefined
+  /**
+   * The journal the table commits with, rebuilt in the same run under the same lease: its rows
+   * and counters derived from every event of its entity types, read under the lock, and written in
+   * the same guarded batches after the projectors' rows, so one generation covers both. With a
+   * journal there may be no projectors and no aggregate types: the run rebuilds the journal alone.
+   * Like the journal's own rebuild, it restores rows a compaction deleted.
+   */
+  readonly journal?: Journal | undefined
 }
 
 /** What a {@link ProjectionRebuild} did. */
@@ -83,8 +93,15 @@ export interface RebuildReport {
   readonly deletes: number
   /** Guarded batches written (`writeRebuildViews` calls). */
   readonly batches: number
-  /** Events read from the log: every event of the types the history-dependent projectors name. */
+  /**
+   * Events read from the log: every event of the types the history-dependent projectors name and
+   * the journal reads, each counted once.
+   */
   readonly events: number
+  /** Journal rows the events imply, with a journal. */
+  readonly journalRows: number
+  /** Journal counters the events imply, with a journal. */
+  readonly journalCounters: number
 }
 
 /** What a dry run ({@link ProjectionRebuild.plan}) found. */
@@ -171,6 +188,7 @@ export class ProjectionRebuild {
   readonly #projectors: readonly CommitProjector[]
   readonly #scopes: readonly Scope[]
   readonly #onProgress: ((progress: RebuildProgress) => void) | undefined
+  readonly #journal: Journal | null
 
   constructor(repository: Repository & EventLog & RebuildFence, options: ProjectionRebuildOptions) {
     this.#repository = repository
@@ -181,6 +199,7 @@ export class ProjectionRebuild {
         : {aggregate: entry, entityType: entry.type},
     )
     this.#onProgress = options.onProgress
+    this.#journal = options.journal ?? null
   }
 
   /**
@@ -198,20 +217,12 @@ export class ProjectionRebuild {
   async run(owner: string, leaseMs: number, options: CallOptions = {}): Promise<RebuildReport> {
     this.#check()
 
-    const held = await this.#take(owner, leaseMs, options)
+    const held = await takeRebuildLock(this.#repository, owner, leaseMs, options)
     let result: RebuildRun
     try {
       result = await this.#fenced(held.lease, leaseMs, held.taken, options)
     } catch (error) {
-      const failure = error as RebuildFailure
-      if (held.fromSettled && failure.attempted === 0) {
-        // The rows were complete when the run began and it attempted no write, so settling the
-        // generation is safe. It runs even after an abort, as cleanup. A failed release (a lost
-        // lease, say) leaves the lock to lapse: the run's own error is the one to report.
-        await this.#repository.endRebuild(failure.lease).catch(() => {})
-      }
-
-      throw failure.error
+      return failRebuildLock(this.#repository, held, error as RebuildFailure)
     }
 
     // Every row is written: settling the generation runs even after an abort, so a finished
@@ -271,17 +282,18 @@ export class ProjectionRebuild {
     if (!isEventLog(repository as Repository) || !isRebuildFence(repository)) {
       throw invalid('a projection rebuild needs a repository that enumerates its log and fences')
     }
-    if (this.#projectors.length === 0) {
-      throw invalid('a projection rebuild needs at least one commit-wide projector')
+    const journal = this.#journal !== null
+    if (this.#projectors.length === 0 && !journal) {
+      throw invalid('a projection rebuild needs at least one commit-wide projector or a journal')
     }
     const engine = this.#projectors.find(isEngineProjector)
     if (engine !== undefined) {
       throw invalid(
-        `projector ${JSON.stringify(engine.name)} reads engine metadata (the journal's), ` +
-          'which a projection rebuild does not replay',
+        `projector ${JSON.stringify(engine.name)} reads engine metadata (the journal's); ` +
+          'rebuild the journal with the journal option',
       )
     }
-    if (this.#scopes.length === 0) {
+    if (this.#scopes.length === 0 && this.#projectors.length > 0) {
       throw invalid('a projection rebuild needs at least one aggregate type')
     }
     const seen = new Set<string>()
@@ -306,44 +318,6 @@ export class ProjectionRebuild {
 
   #scope(entityType: string): Scope {
     return this.#scopes.find((scope) => scope.entityType === entityType)!
-  }
-
-  // Takes the lock, reading the generation just before the begin to tell an acquire from a
-  // settled generation from a takeover or an acquire after a force-release. A begin whose result
-  // is unknown is begun again only once a fresh read shows it can no longer apply; every other
-  // outcome, a failed read and a begin the read shows applied included, is returned as the
-  // indeterminate error, since the owner token may be shared and only the caller knows.
-  async #take(
-    owner: string,
-    leaseMs: number,
-    options: CallOptions,
-  ): Promise<{lease: RebuildLease; fromSettled: boolean; taken: number}> {
-    const repository = this.#repository
-    // Each round reads, then begins, after the one before it lost.
-    /* oxlint-disable no-await-in-loop */
-    for (let round = 0; round < MAX_REBUILD_BEGIN_ATTEMPTS; round++) {
-      const before = await repository.rebuildGeneration(options)
-      let lease: RebuildLease
-      try {
-        lease = await repository.beginRebuild(owner, leaseMs, options)
-      } catch (error) {
-        if (error instanceof RebuildBeginIndeterminateError) {
-          const held = await repository.rebuildState(options).then(
-            (state) => holdsRebuildBegun(error.lease, error.observed, state),
-            () => null,
-          )
-          if (held === false) {
-            continue
-          }
-        }
-        throw error
-      }
-
-      return {lease, fromSettled: acquiredFromSettled(lease, before), taken: Date.now()}
-    }
-    /* oxlint-enable no-await-in-loop */
-
-    throw new RebuildConflictError(MAX_REBUILD_BEGIN_ATTEMPTS)
   }
 
   // Rebuilds under `lease`, last taken or renewed at `renewed` (null renews it first). Any failure
@@ -385,16 +359,35 @@ export class ProjectionRebuild {
 
     // Each step needs the one before it, and renews the lease between them.
     /* oxlint-disable no-await-in-loop */
-    const events: SerializedEvent[][] = []
+    // Every event the history replay and the journal read, each type read once. The history
+    // replay's types must run from sequence 1 to their heads; the journal's rows are a function of
+    // the stored allocations, whatever was compacted.
+    const events = new Map<string, SerializedEvent[]>()
     for (const entityType of historyTypes) {
-      events.push(await this.#wholeHistory(entityType, options))
+      events.set(entityType, await this.#wholeHistory(entityType, options))
       await output.keepAlive()
     }
-    output.report.events = events.reduce((sum, each) => sum + each.length, 0)
+    for (const entityType of this.#journal?.entityTypes ?? []) {
+      if (!events.has(entityType)) {
+        events.set(entityType, await this.#allEvents(entityType, options))
+        await output.keepAlive()
+      }
+    }
+    output.report.events = [...events.values()].reduce((sum, each) => sum + each.length, 0)
 
+    const journal =
+      this.#journal === null
+        ? null
+        : replayJournal(this.#journal.entityTypes.flatMap((type) => events.get(type) ?? []))
     const replayed =
-      history.length === 0 ? null : await this.#replayHistory(history, events.flat(), output)
-    events.length = 0
+      history.length === 0
+        ? null
+        : await this.#replayHistory(
+            history,
+            historyTypes.flatMap((type) => events.get(type) ?? []),
+            output,
+          )
+    events.clear()
 
     if (current.length > 0) {
       const store = new Store(this.#repository)
@@ -425,6 +418,24 @@ export class ProjectionRebuild {
         output.plan(unconditioned(item))
       }
     }
+
+    if (journal !== null) {
+      output.report.journalRows = journal.rows.length
+      output.report.journalCounters = journal.counters.length
+      for (const item of journalOperations(journal)) {
+        output.plan(item)
+      }
+    }
+  }
+
+  // Every stored event of one type, in no particular order, for the journal.
+  async #allEvents(entityType: string, options: CallOptions): Promise<SerializedEvent[]> {
+    const events: SerializedEvent[] = []
+    for await (const batch of this.#repository.streamAllEvents({entityType}, options)) {
+      events.push(...batch)
+    }
+
+    return events
   }
 
   // Replays every commit of `events`, the history-dependent projectors' types, folding each
@@ -532,11 +543,81 @@ export class ProjectionRebuild {
   }
 }
 
+/**
+ * Takes the rebuild lock as `owner`, reading the generation just before the begin to tell an
+ * acquire from a settled generation from a takeover or an acquire after a force-release. A begin
+ * whose result is unknown is begun again only once a fresh read shows it can no longer apply; every
+ * other outcome, a failed read and a begin the read shows applied included, is thrown as the
+ * indeterminate error, since the owner token may be shared and only the caller knows. Internal: a
+ * projection rebuild and the journal's rebuild share it.
+ */
+export async function takeRebuildLock(
+  repository: RebuildFence,
+  owner: string,
+  leaseMs: number,
+  options: CallOptions,
+): Promise<{lease: RebuildLease; fromSettled: boolean; taken: number}> {
+  // Each round reads, then begins, after the one before it lost.
+  /* oxlint-disable no-await-in-loop */
+  for (let round = 0; round < MAX_REBUILD_BEGIN_ATTEMPTS; round++) {
+    const before = await repository.rebuildGeneration(options)
+    let lease: RebuildLease
+    try {
+      lease = await repository.beginRebuild(owner, leaseMs, options)
+    } catch (error) {
+      if (error instanceof RebuildBeginIndeterminateError) {
+        const held = await repository.rebuildState(options).then(
+          (state) => holdsRebuildBegun(error.lease, error.observed, state),
+          () => null,
+        )
+        if (held === false) {
+          continue
+        }
+      }
+      throw error
+    }
+
+    return {lease, fromSettled: acquiredFromSettled(lease, before), taken: Date.now()}
+  }
+  /* oxlint-enable no-await-in-loop */
+
+  throw new RebuildConflictError(MAX_REBUILD_BEGIN_ATTEMPTS)
+}
+
+/**
+ * Ends a run that failed under a lock {@link takeRebuildLock} took, and throws the run's error. The
+ * lock is released only when it was acquired from a settled generation and no write was attempted:
+ * the rows were complete when the run began, so settling the generation is safe. Otherwise it is
+ * kept, since the rows may be half-written. The release runs even after an abort, as cleanup, and a
+ * failed release (a lost lease, say) leaves the lock to lapse: the run's own error is the one to
+ * report. Internal: a projection rebuild and the journal's rebuild share it.
+ */
+export async function failRebuildLock(
+  repository: RebuildFence,
+  held: {readonly fromSettled: boolean},
+  failure: RebuildFailure,
+): Promise<never> {
+  if (held.fromSettled && failure.attempted === 0) {
+    await repository.endRebuild(failure.lease).catch(() => {})
+  }
+
+  throw failure.error
+}
+
 // A rebuild's planned operations, checked across the whole run, then written in guarded batches
 // under the lease, or only collected for a dry run.
 class Output {
   readonly planned: ProjectedView[] = []
-  readonly report: Counts = {entities: 0, commits: 0, puts: 0, deletes: 0, batches: 0, events: 0}
+  readonly report: Counts = {
+    entities: 0,
+    commits: 0,
+    puts: 0,
+    deletes: 0,
+    batches: 0,
+    events: 0,
+    journalRows: 0,
+    journalCounters: 0,
+  }
   // The batches the plan splits into, once it's complete.
   batches = 0
   readonly #fence: Renewing | null
@@ -605,8 +686,8 @@ class Output {
   }
 }
 
-// A lease a rebuild renews as it goes, and the guarded batches it attempted under it.
-class Renewing {
+/** A lease a rebuild renews as it goes, and the guarded batches it attempted under it. Internal. */
+export class Renewing {
   lease: RebuildLease
   // The batches attempted, a failed one included: it may have applied.
   attempted = 0
@@ -668,7 +749,7 @@ function unconditioned(item: ProjectedView): ProjectedView {
 // Splits rebuild operations into guarded batches in order: each at most 99 operations whose sizes,
 // with the lease guard, fit the commit byte budget. An operation too large for any batch gets one
 // of its own, which the write refuses (the plan already refused it).
-function rebuildBatches(views: readonly ProjectedView[]): ProjectedView[][] {
+export function rebuildBatches(views: readonly ProjectedView[]): ProjectedView[][] {
   const batches: ProjectedView[][] = []
   let start = 0
   while (start < views.length) {
@@ -690,7 +771,7 @@ function rebuildBatches(views: readonly ProjectedView[]): ProjectedView[][] {
 }
 
 // Refuses a renewal under one second, before anything is read.
-function checkRenew(renewMs: number): void {
+export function checkRenew(renewMs: number): void {
   if (!Number.isSafeInteger(renewMs) || renewMs < 1000) {
     throw invalid('a rebuild lease is renewed for at least one second, in whole milliseconds')
   }

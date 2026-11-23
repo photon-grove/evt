@@ -858,9 +858,10 @@ transaction as the events. The byte-level rules are in the
 ## Journal (X1, Rust-first)
 
 Rust (`photon-evt` with the `journal` cargo feature), and TypeScript (`@photon-grove/evt/journal`)
-on its in-memory, DynamoDB and PostgreSQL (views table) repositories, which holds every rule below except the rebuild's,
-whose lifecycle it doesn't have yet: its projector's seal is a module-private set of the engine's
-own projectors, and a journal writer is a handle the journal added to a module-private set. Go
+on its in-memory, DynamoDB and PostgreSQL (views table) repositories, which holds every rule below: its projector's seal is a module-private set of the engine's
+own projectors, a journal writer is a handle the journal added to a module-private set, and its
+rebuilds are `rebuildJournalWithLock`, `rebuildJournalWithLease`, `rebuildJournal` and
+`ProjectionRebuild`'s `journal` option. Go
 does not implement the journal and
 refuses a table that declares it (`UnsupportedFeatureError` on the first commit after the
 declaration; `evt-doctor migrate-heads` refuses it as well). The stored shapes are in the
@@ -942,7 +943,7 @@ declaration; `evt-doctor migrate-heads` refuses it as well). The stored shapes a
 
 The stored shapes are in the [storage format](../reference/storage-format.md#journal-compaction).
 TypeScript holds every rule below on its in-memory, DynamoDB and PostgreSQL (views table)
-repositories, except the ones about a rebuild, whose lifecycle it doesn't have yet. Its rebuild-epoch read is the repositories'
+repositories. Its rebuild-epoch read is the repositories'
 `observeRebuildEpoch`, and its compaction marker check and declaration accept the journal's
 features on any handle, since compaction is the journal's own.
 

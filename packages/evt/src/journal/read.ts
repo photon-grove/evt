@@ -1,6 +1,7 @@
 // Reading the journal: highWatermark and page, with gap detection (storage format, "Reads").
 
-import {EvtError, RebuildEpochChangedError} from '../errors.js'
+import {EvtError} from '../errors.js'
+import {type RebuildFence, readAtRebuildEpoch} from '../rebuild-fence.js'
 import type {CallOptions} from '../repository.js'
 import type {JournalRow} from './row.js'
 import {type JournalCompactionStore, manifestGone, readManifest} from './compaction.js'
@@ -175,11 +176,8 @@ export function assemble(
   }
 }
 
-/** A journal store that reads the rebuild generation, for the epoch-checked reads. */
-export interface EpochStore extends JournalCompactionStore {
-  /** The settled rebuild generation; an odd one throws a `RebuildUnavailableError`. */
-  observeRebuildEpoch(options?: CallOptions): Promise<bigint>
-}
+/** A journal store that runs the rebuild fence, for the epoch-checked reads. */
+export type EpochStore = JournalCompactionStore & RebuildFence
 
 /**
  * {@link highWatermark} under the rebuild epoch check: it fails with a `RebuildUnavailableError`
@@ -212,17 +210,10 @@ export function pageAtEpoch(
 }
 
 // Observes the generation, reads, and verifies the generation again: the read counts only then.
-async function atEpoch<T>(
+function atEpoch<T>(
   store: EpochStore,
   read: () => Promise<T>,
   options: CallOptions | undefined,
 ): Promise<T> {
-  const epoch = await store.observeRebuildEpoch(options)
-  const value = await read()
-  const current = await store.observeRebuildEpoch(options)
-  if (current !== epoch) {
-    throw new RebuildEpochChangedError(epoch, current)
-  }
-
-  return value
+  return readAtRebuildEpoch(store, read, options)
 }
