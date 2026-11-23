@@ -12,15 +12,17 @@
 // `KEYS_ONLY` included. They also name no table: the same helpers work unchanged on a stream of a
 // dedicated journal table, should one hold the rows.
 
-import {type PatternField, StringRule, encodePattern} from './filter.js'
+import type {Item} from '@photon-grove/evt/dynamodb'
 import {
   COUNTER_PARTITION_PREFIX,
   COUNTER_SORT_KEY,
   ROW_PARTITION_PREFIX,
   isScope,
   parseRowSortKey,
-  readCounter,
-} from './journal-keys.js'
+  readCounter as readCounterRow,
+} from '@photon-grove/evt/journal'
+
+import {type PatternField, StringRule, encodePattern} from './filter.js'
 import {
   type StreamRecord,
   eventName,
@@ -72,7 +74,7 @@ export function decodeWakeup(record: StreamRecord): JournalWakeup | undefined {
   let position: bigint | undefined
   if (pk.startsWith(ROW_PARTITION_PREFIX)) {
     scope = pk.slice(ROW_PARTITION_PREFIX.length)
-    position = parseRowSortKey(sk)
+    position = parseRowSortKey(sk) ?? undefined
     if (!isScope(scope) || position === undefined) {
       return undefined
     }
@@ -240,4 +242,78 @@ export class JournalFilter {
       this.#rule().matchesAttribute(keys, 'pk')
     )
   }
+}
+
+const encoder = new TextEncoder()
+
+/**
+ * Reads the position a counter item holds, checking it is the counter row of `scope`: undefined
+ * when the item is not a well-formed view row, is another row, or its payload is not
+ * `{"scope":…,"position":…}` naming the scope. The payload is read by the journal's own counter
+ * decoder in `@photon-grove/evt/journal`.
+ */
+export function readCounter(scope: string, item: Item): bigint | undefined {
+  const row = viewRow(item)
+  if (row === undefined) {
+    return undefined
+  }
+
+  try {
+    return readCounterRow(scope, {
+      pk: row.pk,
+      sk: row.sk,
+      entityId: row.entityId,
+      entityType: row.entityType,
+      payload: encoder.encode(row.payload),
+    })
+  } catch {
+    return undefined
+  }
+}
+
+// A views-table item's text fields, as the Rust crate's view row decoder reads them: a missing or
+// NULL attribute is empty, a string or number is its text, anything else is malformed, and a `ttl`
+// must be an int64.
+function viewRow(
+  item: Item,
+): {pk: string; sk: string; entityId: string; entityType: string; payload: string} | undefined {
+  const fields: Record<string, string> = {}
+  for (const name of ['pk', 'sk', 'entityID', 'entityType', 'payload']) {
+    const value = Object.hasOwn(item, name) ? item[name] : undefined
+    if (value === undefined || 'NULL' in value) {
+      fields[name] = ''
+    } else if ('S' in value) {
+      fields[name] = value.S
+    } else if ('N' in value) {
+      fields[name] = value.N
+    } else {
+      return undefined
+    }
+  }
+
+  const ttl = Object.hasOwn(item, 'ttl') ? item['ttl'] : undefined
+  if (ttl !== undefined && !('NULL' in ttl)) {
+    if (!('N' in ttl) || !isInt64(ttl.N)) {
+      return undefined
+    }
+  }
+
+  return {
+    pk: fields['pk']!,
+    sk: fields['sk']!,
+    entityId: fields['entityID']!,
+    entityType: fields['entityType']!,
+    payload: fields['payload']!,
+  }
+}
+
+// An i64 as Rust's `str::parse` reads it: an optional sign, then at least one digit.
+function isInt64(text: string): boolean {
+  if (!/^[+-]?\d+$/.test(text)) {
+    return false
+  }
+
+  const value = BigInt(text)
+
+  return value >= -(1n << 63n) && value < 1n << 63n
 }

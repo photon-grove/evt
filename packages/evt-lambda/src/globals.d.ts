@@ -5,8 +5,14 @@
 // declarations, as packages/evt/src/globals.d.ts does: tsconfig.test.json checks src/ against
 // Node's types instead.
 
-// The package itself uses no global beyond ES2022. @photon-grove/evt's declarations name
-// AbortSignal (its call options take one), so the compiler needs the type to read them.
+// The package itself uses TextEncoder (a counter's payload as the journal's decoder reads it), and
+// @photon-grove/evt's declarations name AbortSignal (its call options take one), so the compiler
+// needs the type to read them.
+declare class TextEncoder {
+  readonly encoding: string
+  encode(input?: string): Uint8Array<ArrayBuffer>
+}
+
 interface AbortSignal {
   readonly aborted: boolean
   readonly reason: unknown

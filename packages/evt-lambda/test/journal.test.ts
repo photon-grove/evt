@@ -1,10 +1,16 @@
 // Journal wake-ups: rows and counters of a views-table stream, filtered and coalesced by scope.
 import {stringifyJson} from '@photon-grove/evt'
+import {parseRowSortKey, rowSortKey} from '@photon-grove/evt/journal'
 import {describe, expect, test} from 'vitest'
 
 import {failureResponse, processWakeups} from '../src/batch.ts'
-import {JournalFilter, type JournalWakeup, coalesceWakeups, decodeWakeup} from '../src/journal.ts'
-import {parseRowSortKey, readCounter, rowSortKey} from '../src/journal-keys.ts'
+import {
+  JournalFilter,
+  type JournalWakeup,
+  coalesceWakeups,
+  decodeWakeup,
+  readCounter,
+} from '../src/journal.ts'
 import {type StreamEvent, itemFromStream, streamRecord} from '../src/record.ts'
 import {counterItem, keysOf, keysOnly, lambdaMatches, rowSk} from './helpers.ts'
 
@@ -108,9 +114,9 @@ describe('the journal keys', () => {
     expect(rowSortKey(4n)).toBe('00000000000000000004')
     expect(parseRowSortKey('00000000000000000004')).toBe(4n)
     expect(parseRowSortKey('18446744073709551615')).toBe(18_446_744_073_709_551_615n)
-    expect(parseRowSortKey('18446744073709551616')).toBeUndefined()
-    expect(parseRowSortKey('0000000000000000004')).toBeUndefined()
-    expect(parseRowSortKey('+0000000000000000004')).toBeUndefined()
+    expect(parseRowSortKey('18446744073709551616')).toBeNull()
+    expect(parseRowSortKey('0000000000000000004')).toBeNull()
+    expect(parseRowSortKey('+0000000000000000004')).toBeNull()
   })
 
   test('a counter payload reads as the Rust journal reads it', () => {
