@@ -1164,3 +1164,60 @@ describe('PgRepository journal compaction', () => {
     expect(new PgRepository(client, {viewsTable: true, clock: () => 1_999}).compactionNow()).toBe(1)
   })
 })
+
+// A journal row in `scope` at `position`, as the journal's projector puts it.
+function journalRow(scope: string, position: string): ViewOperation {
+  return putView(`journal#${scope}`, position, 'a', 'journal', '{}', {condition: 'absent'})
+}
+
+// A commit carrying the journal's rows in scopes U+1F600, U+FFFD and U+1F600 again (UTF-8 bytes
+// put U+FFFD first, UTF-16 code units the other way), and a view of its own.
+function journaledCommit(repo: PgRepository): Promise<void> {
+  const rows = [
+    journalRow('\u{1F600}', '1'),
+    journalRow('\uFFFD', '1'),
+    journalRow('\u{1F600}', '2'),
+  ]
+  const views: ProjectedView[] = [
+    {projector: 'own', projectorIndex: 0, operation: 0, op: putView('k', 'v', 'a', 'l', '{}')},
+    ...rows.map((op, operation) => ({
+      projector: 'journal',
+      projectorIndex: 1,
+      operation,
+      op,
+    })),
+  ]
+
+  return repo.commit({entityId: 'a', events: [event(1)], views})
+}
+
+describe('PgRepository journal wake-ups', () => {
+  test('notifies each journaled scope once, in byte order, after the views', async () => {
+    const {client, log, values} = tableStore()
+    await journaledCommit(new PgRepository(client, {viewsTable: true}))
+    const notify = log.findIndex((text) => text.includes('pg_notify'))
+    expect(log[notify]).toBe(
+      'SELECT pg_notify($1, scope) FROM jsonb_array_elements_text($2::jsonb) ' +
+        'WITH ORDINALITY AS s(scope, n) ORDER BY n',
+    )
+    expect(values[notify]).toEqual(['evt_events__evt_journal', '["\uFFFD","\u{1F600}"]'])
+    expect(transaction(log).slice(-3)).toEqual([
+      'INSERT INTO evt_events__evt_views (pk,',
+      'SELECT pg_notify($1, scope) FROM',
+      'COMMIT',
+    ])
+  })
+
+  test('sends nothing with wakeups off, or for a commit that journals nothing', async () => {
+    const off = tableStore()
+    await journaledCommit(new PgRepository(off.client, {viewsTable: true, wakeups: false}))
+    const quiet = tableStore()
+    await commitViews(
+      new PgRepository(quiet.client, {viewsTable: true}),
+      putView('k', 'v', 'a', 'l', '{}'),
+    )
+    for (const {log} of [off, quiet]) {
+      expect(log.some((text) => text.includes('pg_notify'))).toBe(false)
+    }
+  })
+})

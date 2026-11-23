@@ -280,11 +280,32 @@ const next = await page(repository, 'account:acct-1', 0n, 100)
 A repository without the views table holds no journal: its journal reads fail with
 `ViewsNotConfigured`, and a journaled commit through it is refused before anything is declared.
 
-In Rust, each journaled commit runs `pg_notify` per scope it wrote, and a `JournalListener` (one
-dedicated connection) turns those into wake-ups: page the scope it names, and every scope on
-`Connected` and `Poll`, since a notification sent while the listener was disconnected is lost.
-`with_wakeups(false)` turns the notifications off for a deployment that only polls. TypeScript
-commits don't notify yet, so a listener sees them only on its `Connected` and `Poll` backstop.
+Each journaled commit runs `pg_notify` per scope it wrote, and a `JournalListener` (one dedicated
+connection) turns those into wake-ups: page the scope it names, and every scope on `Connected` and
+`Poll`, since a notification sent while the listener was disconnected is lost. `with_wakeups(false)`
+(TypeScript: `wakeups: false`) turns the notifications off for a deployment that only polls. In
+TypeScript the listener takes a function that opens its dedicated connection, such as a `pg`
+`Client`, never a pooled one:
+
+```ts
+import {Client} from 'pg'
+import {JournalListener} from '@photon-grove/evt/postgres'
+
+const listener = new JournalListener({
+  connect: async () => {
+    const client = new Client(url)
+    await client.connect()
+    return client
+  },
+})
+for (;;) {
+  const wakeup = await listener.next() // {kind: 'scope', scope} | {kind: 'connected'} | {kind: 'poll'}
+  // page wakeup.scope from its cursor, or every scope you follow on 'connected' and 'poll'
+}
+```
+
+`next()` rejects when it can't connect, and the next call tries again, so back off between
+failures. The listener keeps each notified scope once until a call reports it.
 
 ## Local development
 

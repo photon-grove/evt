@@ -5,7 +5,7 @@
 // in loops on purpose.
 /* oxlint-disable no-await-in-loop */
 import process from 'node:process'
-import {Pool} from 'pg'
+import {Client, Pool} from 'pg'
 
 import {
   CommitTooLargeError,
@@ -29,7 +29,13 @@ import {
 } from '@photon-grove/evt'
 import {Journal, JournalRepository} from '@photon-grove/evt/journal'
 import {JOURNAL_MARKER} from '@photon-grove/evt/testing'
-import {type PgClient, PgRepository, type ViewWriter} from '@photon-grove/evt/postgres'
+import {
+  JournalListener,
+  type PgClient,
+  PgRepository,
+  type ViewWriter,
+  type Wakeup,
+} from '@photon-grove/evt/postgres'
 
 import {
   type ControlFixtures,
@@ -81,6 +87,7 @@ try {
   await postgresCases()
   await viewsTableCases()
   await journalCases()
+  await wakeupCases()
   await compactionCases()
 } finally {
   for (const events of logs) {
@@ -755,6 +762,117 @@ function raceLease(token: string): ViewRow {
 
 function json(value: unknown): string {
   return JSON.stringify(value)
+}
+
+// Journal wake-ups on PostgreSQL (ADR 0008), as Rust's postgres_journal_wakeups runs them: a
+// journaled commit through the views table notifies its scopes at COMMIT; a refused commit and
+// `wakeups: false` notify nothing; a listener whose connection drops reconnects and says so; and
+// neither steady traffic nor a backlog holds back the poll.
+async function wakeupCases(): Promise<void> {
+  await checks.case('postgres journal: wake-ups', async () => {
+    const repo = await tableLog()
+    const names = repoTables(repo)
+    const journal = new Journal(['ledger'], (event) => [`ledger:${event.entityId}`])
+    const journaled = new JournalRepository(repo, journal)
+    const quiet = new JournalRepository(
+      new PgRepository(pool, {...names, viewsTable: true, wakeups: false}),
+      journal,
+    )
+    const application = `${names.eventsTable}-listener`
+    const listener = new JournalListener({
+      eventsTable: names.eventsTable,
+      pollIntervalMs: 500,
+      connect: async () => {
+        const client = new Client({connectionString: url, application_name: application})
+        await client.connect()
+
+        return client
+      },
+    })
+    try {
+      ensure(listener.channel === `${names.eventsTable}__evt_journal`, 'the channel')
+      ensureWakeup(await listener.next(), {kind: 'connected'}, 'the first call connects')
+
+      // A journaled commit wakes its scope.
+      await journaled.commit({entityId: 'a', events: [ledgerEvent('a', 1)]})
+      ensureWakeup(await listener.next(), {kind: 'scope', scope: 'ledger:a'}, 'a commit wakes')
+
+      // A refused commit and a repository with wake-ups off notify nothing.
+      await refuses(
+        journaled.commit({entityId: 'a', events: [ledgerEvent('a', 1)]}),
+        Error,
+        'a conflicting commit',
+      )
+      await quiet.commit({entityId: 'b', events: [ledgerEvent('b', 1)]})
+      ensureWakeup(await listener.next(), {kind: 'poll'}, 'nothing woke before the poll')
+
+      // The connection drops: the listener reconnects, says so, and hears later commits.
+      await pool.query(
+        'SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = $1',
+        [application],
+      )
+      const deadline = Date.now() + 10_000
+      for (;;) {
+        ensure(Date.now() < deadline, 'the listener reconnects within 10 s')
+        const wakeup = await listener.next().catch(() => null)
+        if (wakeup?.kind === 'connected') {
+          break
+        }
+        ensure(wakeup === null || wakeup.kind === 'poll', `before the reconnect: ${show(wakeup)}`)
+      }
+      await journaled.commit({entityId: 'a', events: [ledgerEvent('a', 2)]})
+      ensureWakeup(await listener.next(), {kind: 'scope', scope: 'ledger:a'}, 'heard again')
+
+      // Steady notifications never starve the backstop.
+      let polled = false
+      for (let sequence = 3; sequence < 13; sequence++) {
+        await journaled.commit({entityId: 'a', events: [ledgerEvent('a', sequence)]})
+        await delay(150)
+        for (;;) {
+          const wakeup = await listener.next({signal: AbortSignal.timeout(50)}).catch(() => null)
+          if (wakeup === null) {
+            break
+          }
+          polled ||= wakeup.kind === 'poll'
+        }
+      }
+      ensure(polled, 'a poll arrives at its cadence under steady traffic')
+
+      // Nor does a backlog: one commit wakes 30 scopes, and once the poll is overdue it comes
+      // first, then every scope.
+      const fanning = new JournalRepository(
+        repo,
+        new Journal(['ledger'], (event) =>
+          Array.from({length: 30}, (_, i) => `fan:${event.entityId}:${i}`),
+        ),
+      )
+      while ((await listener.next()).kind !== 'poll') {
+        // Drains to the next poll.
+      }
+      await fanning.commit({entityId: 'c', events: [ledgerEvent('c', 1)]})
+      await delay(700)
+      ensureWakeup(await listener.next(), {kind: 'poll'}, 'the overdue poll comes first')
+      let woken = 0
+      for (;;) {
+        const wakeup = await listener.next({signal: AbortSignal.timeout(200)}).catch(() => null)
+        if (wakeup === null) {
+          break
+        }
+        woken += wakeup.kind === 'scope' ? 1 : 0
+      }
+      ensure(woken === 30, `every scope of the backlog follows: got ${woken}`)
+    } finally {
+      await listener.close()
+    }
+  })
+}
+
+function ensureWakeup(got: Wakeup, want: Wakeup, what: string): void {
+  ensure(show(got) === show(want), `${what}: got ${show(got)}, want ${show(want)}`)
+}
+
+function show(wakeup: Wakeup | null): string {
+  return JSON.stringify(wakeup)
 }
 
 function delay(ms: number): Promise<void> {

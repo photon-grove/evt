@@ -79,7 +79,9 @@ import {
   meets,
   writeKey,
 } from '../journal/compaction.js'
+import {PROJECTOR_NAME as JOURNAL_PROJECTOR} from '../journal/projector.js'
 import type {JournalRow} from '../journal/row.js'
+import {ROW_PARTITION_PREFIX} from '../journal/scope.js'
 import {decodeMetadata, emptyMetadata, encodeMetadata} from '../metadata.js'
 import {type Outcome, checkCommandId} from '../outcome.js'
 import {type ProjectedView, REASON_CONDITION_FAILED} from '../projection.js'
@@ -113,6 +115,7 @@ import {
   SCHEMA_LOCK,
   featuresLockKey,
   featuresTable,
+  journalChannel,
   outcomesTable,
   pgTables,
   rebuildGenerationTable,
@@ -167,6 +170,14 @@ export interface PgRepositoryOptions {
    * views elsewhere refuses the store. The database must be `UTF8`. Rust's `with_views_table()`.
    */
   viewsTable?: boolean
+  /**
+   * Whether a commit that writes journal rows through the views table wakes listeners: it runs
+   * `pg_notify` on `{events}__evt_journal` once per scope it wrote, delivered at `COMMIT` and
+   * dropped with a rollback (read them with a `JournalListener`). On by default; `false` is for a deployment
+   * that only polls, since a notifying commit takes a cluster-wide lock at `COMMIT`. Rust's
+   * `with_wakeups`.
+   */
+  wakeups?: boolean
   /** The clock rebuild leases expire by, in Unix milliseconds as `Date.now` gives them. */
   clock?: () => number
 }
@@ -212,6 +223,8 @@ export class PgRepository
   readonly #clock: () => number
   // Whether commits write their views to the views table, which #viewRepository reads.
   readonly #viewsTable: boolean
+  // Whether a journaled commit through the views table notifies its scopes.
+  readonly #wakeups: boolean
   readonly #viewRepository: PgViewRepository
 
   // The manifest version this writer validated, or null until it validates.
@@ -231,6 +244,7 @@ export class PgRepository
     this.#viewWriter = options.viewWriter
     this.#clock = options.clock ?? Date.now
     this.#viewsTable = options.viewsTable === true
+    this.#wakeups = options.wakeups !== false
     if (this.#viewsTable && this.#viewWriter !== undefined) {
       throw new EvtError(
         'invalidArgument',
@@ -502,6 +516,11 @@ export class PgRepository
       // After the events, so a writer that lost a race fails on its head (a conflict) before it
       // reaches a view row, and before the snapshots.
       await execViews(run, views)
+      // Wakes the listeners of every scope the commit journaled: delivered at COMMIT, in commit
+      // order, and dropped with a rollback.
+      if (this.#wakeups && this.#viewsTable) {
+        await this.#notify(run, transaction.views)
+      }
       for (const stream of transaction.streams) {
         await this.#writeCommitSnapshot(run, stream)
       }
@@ -509,6 +528,28 @@ export class PgRepository
         await this.#insertOutcome(run, outcome)
       }
     })
+  }
+
+  // Notifies the journal channel of every scope the commit's journal rows belong to, each once, in
+  // ascending byte order, in one statement. A commit that journals nothing sends nothing.
+  async #notify(run: Statement, views: readonly ProjectedView[]): Promise<void> {
+    const scopes = new Set<string>()
+    for (const {projector, op} of views) {
+      if (projector === JOURNAL_PROJECTOR && op.pk.startsWith(ROW_PARTITION_PREFIX)) {
+        scopes.add(op.pk.slice(ROW_PARTITION_PREFIX.length))
+      }
+    }
+    if (scopes.size === 0) {
+      return
+    }
+
+    const ordered = [...scopes]
+    ordered.sort(compareUtf8)
+    await run(
+      'SELECT pg_notify($1, scope) FROM jsonb_array_elements_text($2::jsonb) ' +
+        'WITH ORDINALITY AS s(scope, n) ORDER BY n',
+      [journalChannel(this.#tables), JSON.stringify(ordered)],
+    )
   }
 
   // A commit's view statements, or a refusal when there are views and nowhere to write them.

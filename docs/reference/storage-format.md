@@ -3868,8 +3868,8 @@ commit-wide rows never split across two tables.
 configured `with_views_table()`. Implemented: the journal's commits, its reads, its compaction and
 its wake-ups, with the shared journal, journal-rebuild and compaction conformance suites on
 PostgreSQL. TypeScript's `PgRepository` with `viewsTable: true` implements the commits, the
-reads and the compaction, with the journal and compaction conformance cases on PostgreSQL; it
-sends no wake-ups yet, so a listener reads its commits on `Connected` and `Poll`. The [journal](#journal) and its
+reads and the compaction, with the journal and compaction conformance cases on PostgreSQL, and the
+wake-ups, with its own `JournalListener`. The [journal](#journal) and its
 [compaction](#journal-compaction) are specified backend-neutrally above. This section pins the
 PostgreSQL statements.
 
@@ -3964,6 +3964,13 @@ SELECT pg_notify('evt_events__evt_journal', $1);   -- $1: the scope itself, not 
 - Compaction and rebuild do not notify. A compaction moves no reader's position, and a rebuild
   changes the generation, which a reader detects on its next read.
 - `with_wakeups(false)` turns the notifications off for a deployment that only polls.
+- TypeScript (`PgRepository` with `viewsTable: true`, `wakeups: false` to turn them off) sends the
+  same notifications in one statement, the scopes as one JSON array:
+  `SELECT pg_notify($1, scope) FROM jsonb_array_elements_text($2::jsonb) WITH ORDINALITY AS s(scope, n) ORDER BY n`.
+  Its `JournalListener` (`@photon-grove/evt/postgres`) has the same wake-ups (`scope`, `connected`,
+  `poll`), defaults and health check over a dedicated connection the caller opens. Its driver reads
+  notifications between calls too, so it keeps each pending scope once rather than one wake-up per
+  notification.
 
 ## Stream envelope
 

@@ -826,8 +826,7 @@ transaction as the events. The byte-level rules are in the
   still in flight. Without the views table every journal read fails with `ViewsNotConfigured`, and
   a journaled commit is refused (`expectedPayloadUnsupported` / the counter's compare-and-set is
   not applied) before the marker is touched. The journal's declarations read the manifest first
-  without a lock and take the exclusive lock only when they write. TypeScript sends no wake-ups
-  yet.
+  without a lock and take the exclusive lock only when they write.
 - Journal compaction on PostgreSQL writes each batch in one READ COMMITTED transaction: with an
   epoch, the rebuild fence's shared lock and the generation check (`epochChanged` otherwise); the
   named rows locked `FOR UPDATE`, the scope's `LEASE` row first and the rest by `(pk, sk)` bytes;
@@ -836,6 +835,16 @@ transaction as the events. The byte-level rules are in the
   and a delete guarded by its owner. A refusal rolls the whole batch back. Batches of one scope
   serialize on its lease row, which is what makes an absent key safe to check; a serialization
   failure or deadlock is transient. Rust and TypeScript run the same protocol.
+- Wake-ups (X5): a commit that wrote journal rows through the views table runs `pg_notify` on
+  `{events}__evt_journal` with each scope once, in ascending byte order, after its view statements,
+  so PostgreSQL delivers them at `COMMIT` and drops them with a rollback. A commit that journals
+  nothing, a repository with wake-ups off (`with_wakeups(false)` / `wakeups: false`), compaction
+  and rebuilds notify nothing. A `JournalListener` reports `Connected` on every connection, `Poll`
+  at a fixed cadence from the last `Poll` or `Connected` ahead of any pending scope, checks the
+  connection with `SELECT 1` on the call after a `Poll` (bounded by the connect timeout, replacing
+  a connection that fails it), and ignores notifications on other channels or with an invalid
+  scope. The TypeScript listener keeps each pending scope once, takes one `next()` at a time, and
+  an abort loses no pending scope.
 
 ## Journal (X1, Rust-first)
 
