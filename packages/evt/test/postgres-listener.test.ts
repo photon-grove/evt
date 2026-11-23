@@ -121,12 +121,12 @@ describe('JournalListener', () => {
   })
 
   test('polls at its interval, ahead of pending scopes, and then checks the connection', async () => {
-    const {listener, opened} = listening({pollIntervalMs: 30})
+    const {listener, opened} = listening({pollIntervalMs: 100})
     await listener.next()
     expect(await listener.next()).toEqual({kind: 'poll'})
 
     const connection = opened[0]!
-    await delay(40)
+    await delay(120)
     connection.notify(CHANNEL, 'a')
     expect(await listener.next()).toEqual({kind: 'poll'})
     expect(await listener.next()).toEqual(scope('a'))
@@ -137,7 +137,7 @@ describe('JournalListener', () => {
   })
 
   test('replaces a connection that fails its check or does not answer it', async () => {
-    const {listener, opened} = listening({pollIntervalMs: 20, connectTimeoutMs: 30})
+    const {listener, opened} = listening({pollIntervalMs: 150, connectTimeoutMs: 30})
     await listener.next()
     expect(await listener.next()).toEqual({kind: 'poll'})
     opened[0]!.answer = async () => {
@@ -211,7 +211,7 @@ describe('JournalListener', () => {
   })
 
   test('an abort during the health check runs it again on the next call', async () => {
-    const {listener, opened} = listening({pollIntervalMs: 20})
+    const {listener, opened} = listening({pollIntervalMs: 150})
     await listener.next()
     expect(await listener.next()).toEqual({kind: 'poll'})
     const connection = opened[0]!
