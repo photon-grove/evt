@@ -53,7 +53,7 @@ import {
   journalStoreCases,
 } from './journal-conformance.js'
 import {postgresViewDdl, postgresViewWriter} from './pgviews.js'
-import {viewRepositoryConformance} from './view-conformance.js'
+import {committedViewConformance, viewRepositoryConformance} from './view-conformance.js'
 
 // The local-only placeholder credentials infra/local-postgres creates.
 const url = process.env['DATABASE_URL'] || 'postgres://evt:evt@localhost:5432/evt_local'
@@ -362,6 +362,10 @@ async function viewsTableCases(): Promise<void> {
   const noise = noiseSource()
   const reader = (await tableLog()).viewRepository()
   await viewRepositoryConformance(checks, 'postgres', reader)
+
+  // A repository's own view repository reads the views table its commits write.
+  const writer = await tableLog()
+  await committedViewConformance(checks, 'postgres', writer, writer.viewRepository())
 
   await checks.case('postgres views: payloads are exact and keys order by bytes', async () => {
     // The payload is text, not jsonb: whitespace and key order survive.

@@ -5,7 +5,14 @@ import {DynamoDB} from '@aws-sdk/client-dynamodb'
 import {describe, expect, test} from 'vitest'
 
 import {json} from '../src/codec.ts'
-import {EvtError, TransientError} from '../src/errors.ts'
+import {
+  EvtError,
+  ProjectorOperationError,
+  TransientError,
+  ViewsNotConfiguredError,
+} from '../src/errors.ts'
+import type {DynamoClient} from '../src/dynamodb/client.ts'
+import {DynamoRepository} from '../src/dynamodb/repository.ts'
 import {
   type BatchGetItemInput,
   type BatchWriteItemInput,
@@ -14,7 +21,11 @@ import {
   type ViewQueryInput,
 } from '../src/dynamodb/view-repository.ts'
 import type {Item} from '../src/dynamodb/item.ts'
+import {MemRepository} from '../src/memory/repository.ts'
 import {MemViewRepository} from '../src/memory/views.ts'
+import {eventId} from '../src/event.ts'
+import {emptyMetadata} from '../src/metadata.ts'
+import {putView} from '../src/projection.ts'
 import {ViewCodec, ViewDecodeError, decodeJsonView} from '../src/viewcodec.ts'
 import {type ViewRow, decodeViewCursor, encodeViewCursor} from '../src/views.ts'
 
@@ -89,7 +100,8 @@ describe('DynamoViewRepository', () => {
     const requests = client.writes.map((write) => write.RequestItems['views'] ?? [])
     expect(requests.map((chunk) => chunk.length)).toEqual([25, 25, 11])
     const items = requests.flat().map((request) => request.PutRequest!.Item)
-    const at = (sk: string): Item[] => items.filter((written) => (written['sk'] as {S: string}).S === sk)
+    const at = (sk: string): Item[] =>
+      items.filter((written) => (written['sk'] as {S: string}).S === sk)
     expect(at('s0')).toEqual([expect.objectContaining({payload: {S: '{"last":true}'}})])
     expect(at('VIEW')).toEqual([expect.objectContaining({payload: {S: '{"b":2}'}})])
   })
@@ -203,6 +215,91 @@ describe('MemViewRepository', () => {
     const read = await repo.getViewAt('p', 's')
     read!.payload[2] = 0x63
     expect(decoder.decode((await repo.getViewAt('p', 's'))!.payload)).toBe('{"a":1}')
+  })
+})
+
+// Commits one event to `owner`, putting the row handles/ada with `payload`.
+function commit(repo: MemRepository, owner: string, payload: string): Promise<void> {
+  return repo.commit({
+    entityId: owner,
+    events: [
+      {
+        id: eventId(owner, 1n),
+        sequence: 1n,
+        type: 'ledger:added',
+        version: 1,
+        entityId: owner,
+        entityType: 'ledger',
+        payload: encoder.encode('{}'),
+        metadata: {...emptyMetadata(), timestamp: '2026-01-02T03:04:05Z'},
+      },
+    ],
+    views: [
+      {
+        projector: 'p',
+        projectorIndex: 0,
+        operation: 0,
+        op: putView('handles', 'ada', owner, 'ledger', payload),
+      },
+    ],
+  })
+}
+
+describe('MemRepository as a view repository', () => {
+  test('a commit and a view read see the same rows', async () => {
+    const repo = new MemRepository()
+    await commit(repo, 'a', '{"n":1}')
+
+    expect(await repo.getViewAt('handles', 'ada')).toEqual({
+      pk: 'handles',
+      sk: 'ada',
+      entityId: 'a',
+      entityType: 'ledger',
+      payload: encoder.encode('{"n":1}'),
+      ttl: 0,
+    })
+    expect(repo.view('handles', 'ada')).toEqual(await repo.getViewAt('handles', 'ada'))
+  })
+
+  test("a row written outside a commit is the one a commit's owner check reads", async () => {
+    const repo = new MemRepository()
+    await repo.putView({...row('handles', 'ada'), entityId: 'b'})
+
+    await expect(commit(repo, 'a', '{}')).rejects.toBeInstanceOf(ProjectorOperationError)
+    await repo.deleteView('handles', 'ada')
+    await commit(repo, 'a', '{}')
+    expect((await repo.listViewsByEntityType('ledger')).map((found) => found.entityId)).toEqual([
+      'a',
+    ])
+  })
+})
+
+describe('DynamoRepository.viewRepository', () => {
+  test('reads its views table through its client', () => {
+    const client = new DynamoDB({region: 'us-west-2'})
+    const repo = new DynamoRepository(client, 'events', {viewsTable: 'views'})
+    expect(repo.viewRepository().table).toBe('views')
+  })
+
+  test('is refused without a views table, or with a client that cannot batch', () => {
+    const client = new DynamoDB({region: 'us-west-2'})
+    expect(() => new DynamoRepository(client, 'events').viewRepository()).toThrow(
+      ViewsNotConfiguredError,
+    )
+    expect(() => new DynamoRepository(client, 'events', {viewsTable: ''}).viewRepository()).toThrow(
+      ViewsNotConfiguredError,
+    )
+
+    const unbatched: DynamoClient = {
+      getItem: async () => ({}),
+      putItem: async () => ({}),
+      query: async () => ({Items: []}),
+      scan: async () => ({Items: []}),
+      transactWriteItems: async () => ({}),
+    }
+    expect(() =>
+      new DynamoRepository(unbatched, 'events', {viewsTable: 'views'}).viewRepository(),
+    ).toThrow(TypeError)
   })
 })
 

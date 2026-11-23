@@ -95,6 +95,8 @@ import {
   transactionSizes,
 } from '../repository.js'
 import {compareUtf8} from '../utf8.js'
+import type {PageOptions, ViewPage, ViewRepository, ViewRow} from '../views.js'
+import {MemViewRepository, viewRowsOf} from './views.js'
 
 interface Stream {
   /** The stream's events by sequence. Compaction deletes from it. */
@@ -150,8 +152,14 @@ let viewsOf: (repo: MemRepository) => Map<string, Map<string, ViewRow>>
  * A fresh store is initialized by its first commit or snapshot write, which declares stream-heads
  * on its feature manifest, so {@link initialize} is needed only where code treats every backend
  * alike.
+ *
+ * It is also the {@link ViewRepository} over its own view rows, the ones its commits write, so a
+ * handler can commit and then read its own rows through one repository, as with Rust's
+ * `MemRepository`. A row written through it is the row a later commit's owner check reads.
  */
-export class MemRepository implements OutcomeRepository, StoreInitializer, EventLog, RebuildFence {
+export class MemRepository
+  implements OutcomeRepository, StoreInitializer, EventLog, RebuildFence, ViewRepository
+{
   readonly #streams = new Map<string, Stream>()
   readonly #controls: Controls = {
     manifest: null,
@@ -161,8 +169,9 @@ export class MemRepository implements OutcomeRepository, StoreInitializer, Event
   // The command outcomes by command ID, kept as the DynamoDB item, so a read decodes and
   // validates exactly what a live backend's would.
   readonly #outcomes = new Map<string, Item>()
-  // The commit-wide view rows, by pk and then sk.
-  readonly #views = new Map<string, Map<string, ViewRow>>()
+  // The view repository over the view rows, and those rows, by pk and then sk.
+  readonly #viewRepository = new MemViewRepository()
+  readonly #views = viewRowsOf(this.#viewRepository)
 
   constructor(options: MemRepositoryOptions = {}) {
     this.#clock = options.clock ?? Date.now
@@ -331,6 +340,54 @@ export class MemRepository implements OutcomeRepository, StoreInitializer, Event
     return rows
   }
 
+  async getView(pk: string, options?: CallOptions): Promise<ViewRow | null> {
+    return this.#viewRepository.getView(pk, options)
+  }
+
+  async getViewAt(pk: string, sk: string, options?: CallOptions): Promise<ViewRow | null> {
+    return this.#viewRepository.getViewAt(pk, sk, options)
+  }
+
+  async putView(row: ViewRow, options?: CallOptions): Promise<void> {
+    return this.#viewRepository.putView(row, options)
+  }
+
+  async putViews(rows: readonly ViewRow[], options?: CallOptions): Promise<void> {
+    return this.#viewRepository.putViews(rows, options)
+  }
+
+  async deleteView(pk: string, sk: string, options?: CallOptions): Promise<void> {
+    return this.#viewRepository.deleteView(pk, sk, options)
+  }
+
+  async batchGetViews(pks: readonly string[], options?: CallOptions): Promise<ViewRow[]> {
+    return this.#viewRepository.batchGetViews(pks, options)
+  }
+
+  async batchGetViewsAt(
+    pks: readonly string[],
+    sk: string,
+    options?: CallOptions,
+  ): Promise<ViewRow[]> {
+    return this.#viewRepository.batchGetViewsAt(pks, sk, options)
+  }
+
+  async listViewsByPk(pk: string, options?: CallOptions): Promise<ViewRow[]> {
+    return this.#viewRepository.listViewsByPk(pk, options)
+  }
+
+  async listViewsByPkPaged(pk: string, options?: PageOptions): Promise<ViewPage> {
+    return this.#viewRepository.listViewsByPkPaged(pk, options)
+  }
+
+  async listViewsByEntityType(entityType: string, options?: CallOptions): Promise<ViewRow[]> {
+    return this.#viewRepository.listViewsByEntityType(entityType, options)
+  }
+
+  async listViewsByEntityTypePaged(entityType: string, options?: PageOptions): Promise<ViewPage> {
+    return this.#viewRepository.listViewsByEntityTypePaged(entityType, options)
+  }
+
   async outcome(commandId: string, options?: CallOptions): Promise<Outcome | null> {
     options?.signal?.throwIfAborted()
     checkCommandId(commandId)
@@ -431,6 +488,7 @@ export class MemRepository implements OutcomeRepository, StoreInitializer, Event
           entityId: op.owner,
           entityType: op.entityType,
           payload: copy(op.payload),
+          ttl: 0,
         })
       } else {
         partition.delete(op.sk)
@@ -762,7 +820,6 @@ export class MemRepository implements OutcomeRepository, StoreInitializer, Event
     return observeRebuildEpoch(this, options)
   }
 
-
   static {
     streamsOf = (repo) => repo.#streams
     controlsOf = (repo) => repo.#controls
@@ -877,16 +934,6 @@ function derivedHead(stream: Stream): bigint {
 // A stored head of 0 is an absent head.
 function drift(entityId: string, stored: bigint, derived: bigint): StreamHeadDriftError {
   return new StreamHeadDriftError(entityId, stored > 0n ? stored : null, derived)
-}
-
-/** A commit-wide view row: its keys, its owner stream, its entity type, and its payload. */
-export interface ViewRow {
-  readonly pk: string
-  readonly sk: string
-  /** The stream that owns the row. */
-  readonly entityId: string
-  readonly entityType: string
-  readonly payload: Uint8Array
 }
 
 /** What a conformance suite needs to make a stream drift, which no repository call can do. */
@@ -1008,7 +1055,11 @@ export function controlFixtures(repo: MemRepository): ControlFixtures {
         generation: {value, forceReleased: state.lock === 'forceReleased'},
         lock:
           state.lock === 'held'
-            ? {owner: 'conformance', generation: value, leaseExpiresAt: fenceNow(clockOf(repo)) + 300}
+            ? {
+                owner: 'conformance',
+                generation: value,
+                leaseExpiresAt: fenceNow(clockOf(repo)) + 300,
+              }
             : null,
       }
     },
