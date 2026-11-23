@@ -835,8 +835,15 @@ transaction as the events. The byte-level rules are in the
   still in flight. Without the views table every journal read fails with `ViewsNotConfigured`, and
   a journaled commit is refused (`expectedPayloadUnsupported` / the counter's compare-and-set is
   not applied) before the marker is touched. The journal's declarations read the manifest first
-  without a lock and take the exclusive lock only when they write. TypeScript refuses to declare
-  `journal-compaction` until compaction is ported to PostgreSQL.
+  without a lock and take the exclusive lock only when they write.
+- Journal compaction on PostgreSQL writes each batch in one READ COMMITTED transaction: with an
+  epoch, the rebuild fence's shared lock and the generation check (`epochChanged` otherwise); the
+  named rows locked `FOR UPDATE`, the scope's `LEASE` row first and the rest by `(pk, sk)` bytes;
+  every expectation and delete owner checked before any write, the first failure in request order
+  refused; then the writes, an `absent` put as a plain insert whose key violation refuses the batch
+  and a delete guarded by its owner. A refusal rolls the whole batch back. Batches of one scope
+  serialize on its lease row, which is what makes an absent key safe to check; a serialization
+  failure or deadlock is transient. Rust and TypeScript run the same protocol.
 - Wake-ups (X5): a commit that wrote journal rows through the views table runs `pg_notify` on
   `{events}__evt_journal` with each scope once, in ascending byte order, after its view statements,
   so PostgreSQL delivers them at `COMMIT` and drops them with a rollback. A commit that journals
@@ -934,8 +941,8 @@ declaration; `evt-doctor migrate-heads` refuses it as well). The stored shapes a
 ## Journal compaction (X2, Rust-first)
 
 The stored shapes are in the [storage format](../reference/storage-format.md#journal-compaction).
-TypeScript holds every rule below on its in-memory and DynamoDB repositories, except the ones about
-a rebuild, whose lifecycle it doesn't have yet. Its rebuild-epoch read is the repositories'
+TypeScript holds every rule below on its in-memory, DynamoDB and PostgreSQL (views table)
+repositories, except the ones about a rebuild, whose lifecycle it doesn't have yet. Its rebuild-epoch read is the repositories'
 `observeRebuildEpoch`, and its compaction marker check and declaration accept the journal's
 features on any handle, since compaction is the journal's own.
 

@@ -40,6 +40,7 @@ import {
   checkRebuildOwner,
   checkRebuildViewBatch,
   fenceNow,
+  observeRebuildEpoch,
   planRebuildBegin,
   rebuildLeaseSeconds,
 } from '../rebuild-fence.js'
@@ -64,11 +65,20 @@ import {
   missingHistoryDependent,
   withHistoryDependent,
   withJournal,
+  withJournalCompaction,
   withStreamHeads,
   withoutJournal,
 } from '../features.js'
 import {int64Argument} from '../fields.js'
-import type {JournalStore} from '../journal/read.js'
+import {
+  type CompactionStore,
+  type CompactionWrite,
+  type CompactionWritten,
+  LEASE_SORT_KEY,
+  checkCompactionWrites,
+  meets,
+  writeKey,
+} from '../journal/compaction.js'
 import {PROJECTOR_NAME as JOURNAL_PROJECTOR} from '../journal/projector.js'
 import type {JournalRow} from '../journal/row.js'
 import {ROW_PARTITION_PREFIX} from '../journal/scope.js'
@@ -91,8 +101,8 @@ import {
   rankFailures,
   transactionSizes,
 } from '../repository.js'
-import {compareUtf8, utf8Length} from '../utf8.js'
-import type {ViewRow} from '../views.js'
+import {compareUtf8, utf8Decode, utf8Length} from '../utf8.js'
+import {type ViewRow, checkViewRow, checkViewText, viewTtl} from '../views.js'
 import type {PgClient, PgResult} from './client.js'
 import {readCompactionRow, readCounters, readLastPosition, readRows} from './journal.js'
 import {manifestWrite} from './marker.js'
@@ -136,7 +146,7 @@ import {
   viewConditionFailed,
   viewsTableStatements,
 } from './views.js'
-import {PgViewRepository, checkViewsEncoding} from './view-repository.js'
+import {PgViewRepository, VIEW_COLUMNS, checkViewsEncoding, viewRowFrom} from './view-repository.js'
 
 /** The tables a {@link PgRepository} stores its event log in. */
 export interface PgRepositoryOptions {
@@ -205,7 +215,7 @@ const UNIQUE_VIOLATION = '23505'
  * no declaration can take while the write is open, and validates it again when it changed.
  */
 export class PgRepository
-  implements OutcomeRepository, StoreInitializer, EventLog, RebuildFence, JournalStore
+  implements OutcomeRepository, StoreInitializer, EventLog, RebuildFence, CompactionStore
 {
   readonly #client: PgClient
   readonly #tables: PgTables
@@ -298,12 +308,18 @@ export class PgRepository
    * manifest's exclusive lock, and resolves `true` when this call declared it. A store that
    * already declares it is left alone. Run {@link PgRepository.ensureSchema} first.
    */
-  async initialize(options?: CallOptions): Promise<boolean> {
+  initialize(options?: CallOptions): Promise<boolean> {
+    return this.#initialize(options, isJournalWriter(this))
+  }
+
+  // The initialization, accepting the journal's features with `journaling`: a journal writer's
+  // own, or journal compaction's, which any handle runs.
+  async #initialize(options: CallOptions | undefined, journaling: boolean): Promise<boolean> {
     try {
       return await this.#transaction(options, false, async (run) => {
         await run(ENGINE_LOCK_EXCLUSIVE, [featuresLockKey(this.#tables)])
         const manifest = await this.#readManifest(run)
-        checkSupported(manifest, isJournalWriter(this))
+        checkSupported(manifest, journaling)
         if (declaresStreamHeads(manifest)) {
           return false
         }
@@ -1116,6 +1132,145 @@ export class PgRepository
     return readCompactionRow(this.#client, this.#journalTable(), scope, sk, options)
   }
 
+  /**
+   * One journal compaction transaction (storage format, "Journal on PostgreSQL"), at READ
+   * COMMITTED:
+   *
+   * 1. with an epoch, the rebuild fence's shared lock and the generation check;
+   * 2. the rows the writes name locked `FOR UPDATE` in the one order every batch uses: the scope's
+   *    lease row first, then the rest by `(pk, sk)` bytes;
+   * 3. every expectation (and a delete's owner) checked against what step 2 read, the first
+   *    failing write in request order refused;
+   * 4. the writes in step 2's order, each guarded again: an `absent` put is a plain insert, whose
+   *    key violation (a row that appeared since step 2) refuses the batch, and a delete removes
+   *    the owner's row only.
+   *
+   * Anything refused rolls the whole batch back. `FOR UPDATE` can't lock an absent row, so an
+   * absent key is safe to check only because every batch of a scope puts or checks its lease row
+   * first, which serializes the batches before they read any other key. A serialization failure
+   * or a deadlock is a `TransientError`.
+   */
+  async writeCompaction(
+    epoch: bigint | null,
+    writes: readonly CompactionWrite[],
+    options?: CallOptions,
+  ): Promise<CompactionWritten> {
+    options?.signal?.throwIfAborted()
+    checkCompactionWrites(writes)
+    const table = this.#journalTable()
+    // What the table can't store is refused before any statement, as on DynamoDB.
+    const payloads = writes.map(compactionTexts)
+    // Compaction is the journal's own: any handle accepts a journal store for it. A store compacted
+    // before its first commit still records where its views live.
+    await this.#ensureStreamHeads(options, true)
+    await this.#ensureViewsDeclared(options, true)
+
+    try {
+      await this.#transaction(options, false, async (run) => {
+        if (epoch !== null) {
+          await run(ENGINE_LOCK_SHARED, [rebuildLockKey(this.#tables)])
+          if ((await this.#readGeneration(run, false)).value !== epoch) {
+            throw new CompactionRefusal({kind: 'epochChanged'})
+          }
+        }
+
+        const order = writes.map((_, at) => at)
+        order.sort((a, b) => compareCompactionKeys(writeKey(writes[a]!), writeKey(writes[b]!)))
+        const stored = new Map<number, ViewRow | null>()
+        for (const at of order) {
+          const {pk, sk} = writeKey(writes[at]!)
+          const rows = await run(
+            `SELECT ${VIEW_COLUMNS} FROM ${table} WHERE pk = $1 AND sk = $2 FOR UPDATE`,
+            [pk, sk],
+          )
+          stored.set(at, rows[0] === undefined ? null : viewRowFrom(rows[0]))
+        }
+
+        for (const [at, write] of writes.entries()) {
+          const row = stored.get(at) ?? null
+          const met =
+            write.kind === 'delete'
+              ? row === null || row.entityId === write.owner
+              : meets(write.expect, row)
+          if (!met) {
+            throw new CompactionRefusal({kind: 'refused', at})
+          }
+        }
+
+        for (const at of order) {
+          await this.#applyCompactionWrite(run, table, writes[at]!, payloads[at]!, at)
+        }
+      })
+    } catch (error) {
+      if (error instanceof CompactionRefusal) {
+        return error.written
+      }
+
+      throw error
+    }
+
+    return {kind: 'written'}
+  }
+
+  /** The clock journal compaction reads, in whole Unix seconds. */
+  compactionNow(): number {
+    return Math.floor(this.#clock() / 1000)
+  }
+
+  /**
+   * The settled rebuild generation a compaction run works under: even, 0 with no generation row. An
+   * odd one is a `RebuildUnavailableError`.
+   */
+  observeRebuildEpoch(options?: CallOptions): Promise<bigint> {
+    return observeRebuildEpoch(this, options)
+  }
+
+  // One write of a compaction batch, guarded again in its own statement. A put that expects no row
+  // is a plain insert: a violation of the table's key refuses the batch.
+  async #applyCompactionWrite(
+    run: Statement,
+    table: string,
+    write: CompactionWrite,
+    payload: string | null,
+    at: number,
+  ): Promise<void> {
+    if (write.kind === 'check') {
+      return
+    }
+    if (write.kind === 'delete') {
+      await run(`DELETE FROM ${table} WHERE pk = $1 AND sk = $2 AND entity_id = $3`, [
+        write.pk,
+        write.sk,
+        write.owner,
+      ])
+      return
+    }
+
+    const {row} = write
+    const values = [row.pk, row.sk, row.entityId, row.entityType, payload, viewTtl(row).toString()]
+    const insert =
+      `INSERT INTO ${table} (pk, sk, entity_id, entity_type, payload, ttl) ` +
+      'VALUES ($1, $2, $3, $4, $5, $6::bigint)'
+    if (write.expect.kind !== 'absent') {
+      await run(
+        `${insert} ON CONFLICT (pk, sk) DO UPDATE SET entity_id = EXCLUDED.entity_id, ` +
+          'entity_type = EXCLUDED.entity_type, payload = EXCLUDED.payload, ttl = EXCLUDED.ttl',
+        values,
+      )
+      return
+    }
+
+    try {
+      await run(insert, values)
+    } catch (error) {
+      if (sqlState(error) === UNIQUE_VIOLATION && constraintOf(error) === `${table}_pkey`) {
+        throw new CompactionRefusal({kind: 'refused', at})
+      }
+
+      throw error
+    }
+  }
+
   /** The journal's declarations on this store's manifest. Internal. */
   readonly [JOURNAL_MARKER]: JournalMarker = {
     declareJournal: async (types, options) => {
@@ -1159,13 +1314,30 @@ export class PgRepository
       )
       checkSupported(manifest, true)
     },
-    // Until journal compaction is ported to PostgreSQL, nothing declares it here: a writer that
-    // doesn't model it would read compacted rows as a gap, so it refuses a store that declares it.
     declareCompaction: async (options) => {
       options?.signal?.throwIfAborted()
-      throw new UnsupportedFeatureError([
-        {name: JOURNAL_COMPACTION_FEATURE, version: JOURNAL_COMPACTION_VERSION},
-      ])
+      // Read first, without a lock: a store that declares it needs no exclusive lock.
+      const observed = await this.#readManifest((statement, values) =>
+        this.#read(statement, values),
+      )
+      checkSupported(observed, true)
+      if (observed?.features.get(JOURNAL_COMPACTION_FEATURE) === JOURNAL_COMPACTION_VERSION) {
+        return
+      }
+
+      try {
+        await this.#transaction(options, false, async (run) => {
+          await run(ENGINE_LOCK_EXCLUSIVE, [featuresLockKey(this.#tables)])
+          const manifest = await this.#readManifest(run)
+          checkSupported(manifest, true)
+          if (manifest?.features.get(JOURNAL_COMPACTION_FEATURE) !== JOURNAL_COMPACTION_VERSION) {
+            await this.#writeManifest(run, manifest, withJournalCompaction(manifest))
+          }
+        })
+      } finally {
+        // A declaration moved the version: the next write reads it again.
+        this.#validated = null
+      }
     },
   }
 
@@ -1219,23 +1391,29 @@ export class PgRepository
   // Makes sure the store is ready for this writer's first write: it declares stream-heads. A
   // writer initializes a store whose manifest lacks it, which refuses one that holds data. It runs
   // before the write's transaction, which holds the shared lock a declaration would wait for.
-  async #ensureStreamHeads(options: CallOptions | undefined): Promise<void> {
+  async #ensureStreamHeads(
+    options: CallOptions | undefined,
+    journaling = isJournalWriter(this),
+  ): Promise<void> {
     if (this.#validated !== null) {
       return
     }
 
     const manifest = await this.#readManifest((statement, values) => this.#read(statement, values))
     this.#refuseForeignViews(manifest)
-    checkSupported(manifest, isJournalWriter(this))
+    checkSupported(manifest, journaling)
     if (!declaresStreamHeads(manifest)) {
-      await this.initialize(options)
+      await this.#initialize(options, journaling)
     }
   }
 
   // Declares postgres-views on a store whose views live in the views table, once per writer, after
   // checking the database is UTF8. It runs before the write's transaction, which holds the shared
   // lock a declaration would wait for, and the commit checks the declaration again under that lock.
-  async #ensureViewsDeclared(options: CallOptions | undefined): Promise<void> {
+  async #ensureViewsDeclared(
+    options: CallOptions | undefined,
+    journaling = isJournalWriter(this),
+  ): Promise<void> {
     if (!this.#viewsTable || this.#viewsDeclared) {
       return
     }
@@ -1259,7 +1437,7 @@ export class PgRepository
         const manifest = await this.#readManifest(run)
         // A version of postgres-views other than this package's is unsupported, like any feature
         // this package doesn't model, and nothing is declared on such a store.
-        checkSupported(manifest, isJournalWriter(this))
+        checkSupported(manifest, journaling)
         if (!manifest?.features.has(POSTGRES_VIEWS_FEATURE)) {
           await this.#writeManifest(run, manifest, withPostgresViews(manifest))
         }
@@ -1597,6 +1775,66 @@ function withPostgresViews(manifest: FeatureManifest | null): FeatureManifest {
     historyDependent: manifest?.historyDependent ?? [],
     retention: manifest?.retention ?? [],
   }
+}
+
+// A compaction batch refused inside its transaction, which rolls it back.
+class CompactionRefusal extends Error {
+  readonly written: CompactionWritten
+
+  constructor(written: CompactionWritten) {
+    super('journal compaction refused')
+    this.written = written
+  }
+}
+
+// The lock order of a compaction batch: the lease row first, then the rest by (pk, sk) bytes.
+function compareCompactionKeys(a: {pk: string; sk: string}, b: {pk: string; sk: string}): number {
+  const lease = Number(a.sk !== LEASE_SORT_KEY) - Number(b.sk !== LEASE_SORT_KEY)
+
+  return lease || compareUtf8(a.pk, b.pk) || compareUtf8(a.sk, b.sk)
+}
+
+// A put's payload as the text the views table stores, after checking every payload a write sends
+// or compares is UTF-8; null for a write that sends none.
+// The keys, owners and entity types are checked as every view row is, as DynamoDB checks them.
+function compactionTexts(write: CompactionWrite): string | null {
+  if (write.kind !== 'delete' && write.expect.kind === 'payload') {
+    compactionText(write.expect.payload)
+  }
+  if (write.kind !== 'put') {
+    for (const [field, value] of [
+      ['pk', write.pk],
+      ['sk', write.sk],
+      ...(write.kind === 'delete' ? [['owner', write.owner] as const] : []),
+    ] as const) {
+      checkViewText(value, field)
+    }
+
+    return null
+  }
+
+  const payload = compactionText(write.row.payload)
+  checkViewRow(write.row)
+
+  return payload
+}
+
+function compactionText(bytes: Uint8Array): string {
+  try {
+    return utf8Decode(bytes, 'compaction payload')
+  } catch {
+    throw new EvtError('invalidArgument', 'a compaction payload must be UTF-8')
+  }
+}
+
+// The constraint a driver error names: `pg` and PGlite call it `constraint`.
+function constraintOf(error: unknown): string | null {
+  const name =
+    typeof error === 'object' && error !== null
+      ? (error as {constraint?: unknown}).constraint
+      : undefined
+
+  return typeof name === 'string' ? name.toLowerCase() : null
 }
 
 // A stored head of 0 is an absent head.

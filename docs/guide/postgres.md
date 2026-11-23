@@ -265,8 +265,8 @@ DynamoDB item, so the budget refuses the same commits on both backends. The repo
 `postgres-views` marker feature before its first commit, after which a Go writer, or a Rust or
 TypeScript repository without the views table, refuses the store instead of putting views somewhere
 else. The [sync journal](../reference/storage-format.md#journal) works on PostgreSQL through the same
-table: wrap the repository in a `JournalRepository` and it journals, pages and (in Rust) compacts as
-it does on DynamoDB, with the same rows, so a Rust and a TypeScript writer share one journal:
+table: wrap the repository in a `JournalRepository` and it journals, pages and compacts as it does
+on DynamoDB, with the same rows, so a Rust and a TypeScript writer share one journal:
 
 ```ts
 import {Journal, JournalRepository, page} from '@photon-grove/evt/journal'

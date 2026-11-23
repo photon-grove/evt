@@ -715,7 +715,8 @@ export type CompactionWritten =
 
 /**
  * A journal store that also reads a scope's compaction rows, so it can tell a compacted range
- * from a gap. `MemRepository` and `DynamoRepository` (with a views table) implement it.
+ * from a gap. `MemRepository`, `DynamoRepository` (with a views table) and `PgRepository` (with
+ * `viewsTable: true`) implement it.
  */
 export interface JournalCompactionStore extends JournalStore {
   /** The row at `sortKey` in the scope's compaction partition, strongly consistent, or null. */
@@ -724,7 +725,8 @@ export interface JournalCompactionStore extends JournalStore {
 
 /**
  * A journal store that also writes a scope's compaction rows, under the rebuild epoch.
- * `MemRepository` and `DynamoRepository` (with a views table) implement it.
+ * `MemRepository`, `DynamoRepository` (with a views table) and `PgRepository` (with
+ * `viewsTable: true`) implement it.
  */
 export interface CompactionStore extends JournalCompactionStore {
   /**

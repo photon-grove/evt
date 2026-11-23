@@ -220,8 +220,8 @@ On PostgreSQL the rows and counters are rows of the views table, written in the 
 transaction, and each read is one statement that sees every committed transaction. A
 `PgRepository` without `viewsTable: true` holds no journal: its journal reads fail with a
 `ViewsNotConfiguredError`, and a journaled commit through it is refused before anything is declared.
-A PostgreSQL journal reads a compacted scope's floor, but compacting on PostgreSQL, and journal
-rebuilds under the rebuild lock, are still Rust only.
+Compaction works there too: each batch is one transaction that locks the rows it names, under the
+rebuild epoch. Journal rebuilds under the rebuild lock are still Rust only.
 
 Each journaled commit wakes listeners with `pg_notify`, once per scope it wrote, unless the
 repository is built with `wakeups: false`. A `JournalListener` (`@photon-grove/evt/postgres`) holds
