@@ -12,11 +12,13 @@ import {
   OutcomeConflictError,
   ProjectorOperationError,
   RebuildInProgressError,
+  RebuildLeaseLostError,
   SequenceGapError,
   StreamHeadDriftError,
   StreamHeadsNotMigratedError,
 } from '../errors.js'
 import type {Item} from '../dynamodb/item.js'
+import {type EventLog, type StreamFilter, matchesFilter} from '../enumerate.js'
 import {outcomeFromItem, outcomeItem} from '../dynamodb/outcome.js'
 import type {SerializedEvent, SerializedSnapshot} from '../event.js'
 import {
@@ -24,13 +26,56 @@ import {
   checkSupported,
   checkWritable,
   declaresStreamHeads,
+  JOURNAL_COMPACTION_FEATURE,
+  JOURNAL_COMPACTION_VERSION,
+  JOURNAL_MARKER,
+  checkJournalWriter,
+  type JournalMarker,
+  declaredAnything,
+  isJournalWriter,
+  journalDeclaration,
   entityTypeSet,
+  missingHistoryDependent,
+  withHistoryDependent,
+  withJournal,
+  withJournalCompaction,
   withStreamHeads,
+  withoutJournal,
 } from '../features.js'
 import {int64Argument} from '../fields.js'
+import {
+  type CompactionWrite,
+  type CompactionWritten,
+  checkCompactionWrites,
+  compactionPartitionKey,
+  meets,
+  writeKey,
+} from '../journal/compaction.js'
+import {type JournalRow, journalRowFromView, readCounter} from '../journal/row.js'
+import {
+  COUNTER_SORT_KEY,
+  counterPartitionKey,
+  parseRowSortKey,
+  rowPartitionKey,
+  rowSortKey,
+} from '../journal/scope.js'
 import type {Metadata} from '../metadata.js'
 import {type Outcome, checkCommandId} from '../outcome.js'
-import {REASON_CONDITION_FAILED, type ViewOperation} from '../projection.js'
+import {type ProjectedView, REASON_CONDITION_FAILED, type ViewOperation} from '../projection.js'
+import {
+  type RebuildFence,
+  type RebuildGeneration,
+  type RebuildLease,
+  type RebuildLock,
+  type RebuildState as RebuildRows,
+  checkRebuildOwner,
+  checkRebuildViewBatch,
+  fenceNow,
+  holdsRebuildLock,
+  observeRebuildEpoch,
+  planRebuildBegin,
+  rebuildLeaseSeconds,
+} from '../rebuild-fence.js'
 import {
   type CallOptions,
   type Commit,
@@ -44,6 +89,7 @@ import {
   checkNotReserved,
   commitAsTransaction,
   isEmptyTransaction,
+  isReserved,
   normalizeTransaction,
   rankFailures,
   transactionSizes,
@@ -60,26 +106,41 @@ interface Stream {
   head: bigint
 }
 
-/** The state of the rebuild fence's two rows that a commit's lock check reads. */
-export interface RebuildState {
+/** The rebuild fence's rows as a conformance suite sets them, in the commit check's terms. */
+export interface RebuildFixture {
   /** The generation counter: odd while a rebuild holds the store or after a force-release. */
   generation: bigint
   /**
-   * The lock row: a rebuild's lease, the item a force-release leaves in its place, or none. A
-   * commit is refused while either exists, and while the generation is odd.
+   * The lock row: a rebuild's lease (owner `conformance`, five minutes on the repository's clock),
+   * the item a force-release leaves in its place (which flags the generation), or none. A commit
+   * is refused while a lease is held and while the generation is odd.
    */
   lock: 'held' | 'forceReleased' | null
+}
+
+/**
+ * @deprecated The fence's fixture rows, renamed {@link RebuildFixture}. The package root's
+ * `RebuildState` is the fence's state, a different type.
+ */
+export type RebuildState = RebuildFixture
+
+/** Options of a {@link MemRepository}. */
+export interface MemRepositoryOptions {
+  /** The clock rebuild leases expire by, in Unix milliseconds as `Date.now` gives them. */
+  clock?: () => number
 }
 
 // The store-wide control rows: the feature marker and the rebuild fence.
 interface Controls {
   manifest: FeatureManifest | null
-  rebuild: RebuildState
+  rebuild: {generation: RebuildGeneration; lock: RebuildLock | null}
 }
 
 // Read a repository's private state, for the fixtures. The class's static block sets them.
 let streamsOf: (repo: MemRepository) => Map<string, Stream>
 let controlsOf: (repo: MemRepository) => Controls
+let clockOf: (repo: MemRepository) => () => number
+let viewsOf: (repo: MemRepository) => Map<string, Map<string, ViewRow>>
 
 /**
  * An in-memory {@link Repository}. Every call copies what it stores and what it returns, so a
@@ -92,23 +153,124 @@ let controlsOf: (repo: MemRepository) => Controls
  * on its feature manifest, so {@link initialize} is needed only where code treats every backend
  * alike.
  *
- * It is also the {@link ViewRepository} over its own commit-wide view rows, so a handler can
- * commit and then read its own rows through one repository. A row written outside a commit is one
- * a later commit's owner check reads.
+ * It is also the {@link ViewRepository} over its own view rows, the ones its commits write, so a
+ * handler can commit and then read its own rows through one repository, as with Rust's
+ * `MemRepository`. A row written through it is the row a later commit's owner check reads.
  */
-export class MemRepository implements OutcomeRepository, StoreInitializer, ViewRepository {
+export class MemRepository
+  implements OutcomeRepository, StoreInitializer, EventLog, RebuildFence, ViewRepository
+{
   readonly #streams = new Map<string, Stream>()
-  readonly #controls: Controls = {manifest: null, rebuild: {generation: 0n, lock: null}}
+  readonly #controls: Controls = {
+    manifest: null,
+    rebuild: {generation: {value: 0n, forceReleased: false}, lock: null},
+  }
+  readonly #clock: () => number
   // The command outcomes by command ID, kept as the DynamoDB item, so a read decodes and
   // validates exactly what a live backend's would.
   readonly #outcomes = new Map<string, Item>()
-  // The view repository over the commit-wide view rows, and those rows, by pk and then sk.
+  // The view repository over the view rows, and those rows, by pk and then sk.
   readonly #viewRepository = new MemViewRepository()
   readonly #views = viewRowsOf(this.#viewRepository)
 
+  constructor(options: MemRepositoryOptions = {}) {
+    this.#clock = options.clock ?? Date.now
+  }
+
+  async rebuildState(options?: CallOptions): Promise<RebuildRows> {
+    options?.signal?.throwIfAborted()
+    const {generation, lock} = this.#controls.rebuild
+
+    return {generation: {...generation}, lock: lock && {...lock}}
+  }
+
+  async rebuildGeneration(options?: CallOptions): Promise<RebuildGeneration> {
+    options?.signal?.throwIfAborted()
+
+    return {...this.#controls.rebuild.generation}
+  }
+
+  async beginRebuild(owner: string, leaseMs: number, options?: CallOptions): Promise<RebuildLease> {
+    options?.signal?.throwIfAborted()
+    checkRebuildOwner(owner)
+    const seconds = rebuildLeaseSeconds(leaseMs)
+    const rebuild = this.#controls.rebuild
+    const now = fenceNow(this.#clock)
+    const plan = planRebuildBegin(rebuild, now)
+    const generation = rebuild.generation.value + plan.increment
+    // An acquire or a takeover leaves the force-release flag as it was: only an end clears it.
+    rebuild.generation = {...rebuild.generation, value: generation}
+    rebuild.lock = {owner, generation, leaseExpiresAt: now + seconds}
+
+    return {...rebuild.lock}
+  }
+
+  async renewRebuild(
+    lease: RebuildLease,
+    leaseMs: number,
+    options?: CallOptions,
+  ): Promise<RebuildLease> {
+    options?.signal?.throwIfAborted()
+    checkRebuildOwner(lease.owner)
+    const seconds = rebuildLeaseSeconds(leaseMs)
+    const rebuild = this.#controls.rebuild
+    if (!holdsRebuildLock(lease, rebuild.lock)) {
+      throw new RebuildLeaseLostError(lease.owner)
+    }
+    rebuild.lock = {...rebuild.lock!, leaseExpiresAt: fenceNow(this.#clock) + seconds}
+
+    return {...rebuild.lock}
+  }
+
+  async endRebuild(lease: RebuildLease, options?: CallOptions): Promise<RebuildGeneration> {
+    options?.signal?.throwIfAborted()
+    checkRebuildOwner(lease.owner)
+    const rebuild = this.#controls.rebuild
+    if (!holdsRebuildLock(lease, rebuild.lock)) {
+      throw new RebuildLeaseLostError(lease.owner)
+    }
+    rebuild.lock = null
+    rebuild.generation = {value: rebuild.generation.value + 1n, forceReleased: false}
+
+    return {...rebuild.generation}
+  }
+
+  async forceReleaseRebuild(owner: string, options?: CallOptions): Promise<RebuildGeneration> {
+    options?.signal?.throwIfAborted()
+    checkRebuildOwner(owner)
+    const rebuild = this.#controls.rebuild
+    if (rebuild.lock === null || rebuild.lock.owner !== owner) {
+      throw new RebuildLeaseLostError(owner)
+    }
+    rebuild.lock = null
+    rebuild.generation = {value: rebuild.generation.value + 2n, forceReleased: true}
+
+    return {...rebuild.generation}
+  }
+
+  async writeRebuildViews(
+    lease: RebuildLease,
+    views: readonly ProjectedView[],
+    options?: CallOptions,
+  ): Promise<void> {
+    options?.signal?.throwIfAborted()
+    checkRebuildOwner(lease.owner)
+    checkRebuildViewBatch(views)
+    const lock = this.#controls.rebuild.lock
+    if (!holdsRebuildLock(lease, lock) || lock!.leaseExpiresAt <= fenceNow(this.#clock)) {
+      throw new RebuildLeaseLostError(lease.owner)
+    }
+    for (const view of views) {
+      if (!this.#viewHolds(view.op)) {
+        throw new ProjectorOperationError(view, REASON_CONDITION_FAILED)
+      }
+    }
+    this.#applyViews(views)
+  }
+
   async initialize(options?: CallOptions): Promise<boolean> {
     options?.signal?.throwIfAborted()
-    checkSupported(this.#controls.manifest)
+    checkSupported(this.#controls.manifest, isJournalWriter(this))
     if (declaresStreamHeads(this.#controls.manifest)) {
       return false
     }
@@ -137,6 +299,25 @@ export class MemRepository implements OutcomeRepository, StoreInitializer, ViewR
   /** It writes commit-wide view operations, to its own rows. */
   writesViews(): boolean {
     return true
+  }
+
+  /** It applies a view put's expected-payload condition. */
+  appliesExpectedPayload(): boolean {
+    return true
+  }
+
+  /**
+   * Adds the entity types to the feature manifest's historyDependent set in one declaration, so
+   * {@link compactBelow} refuses them. Types already declared are left alone, and a store that
+   * declares an unsupported feature is refused first.
+   */
+  async declareHistoryDependent(types: readonly string[], options?: CallOptions): Promise<void> {
+    options?.signal?.throwIfAborted()
+    checkSupported(this.#controls.manifest, isJournalWriter(this))
+    const missing = missingHistoryDependent(this.#controls.manifest, types)
+    if (missing.length > 0) {
+      this.#controls.manifest = withHistoryDependent(this.#controls.manifest, missing)
+    }
   }
 
   /** The view row at `pk` and `sk`, or null when there is none. */
@@ -228,7 +409,7 @@ export class MemRepository implements OutcomeRepository, StoreInitializer, ViewR
     const retention = this.#controls.manifest?.retention ?? []
     checkFenceRetention(transaction, (entityType) => retention.includes(entityType))
     const {rebuild} = this.#controls
-    if (rebuild.lock !== null || rebuild.generation % 2n !== 0n) {
+    if (rebuild.lock !== null || rebuild.generation.value % 2n !== 0n) {
       throw new RebuildInProgressError()
     }
 
@@ -290,7 +471,15 @@ export class MemRepository implements OutcomeRepository, StoreInitializer, ViewR
       }
       this.#streams.set(entityId, held)
     }
-    for (const {op} of transaction.views) {
+    this.#applyViews(transaction.views)
+    if (outcome !== null && recorded !== null) {
+      this.#outcomes.set(outcome.commandId, recorded)
+    }
+  }
+
+  // Writes view operations whose conditions held.
+  #applyViews(views: readonly ProjectedView[]): void {
+    for (const {op} of views) {
       const partition = this.#views.get(op.pk) ?? new Map<string, ViewRow>()
       if (op.kind === 'put') {
         partition.set(op.sk, {
@@ -304,14 +493,7 @@ export class MemRepository implements OutcomeRepository, StoreInitializer, ViewR
       } else {
         partition.delete(op.sk)
       }
-      if (partition.size === 0) {
-        this.#views.delete(op.pk)
-      } else {
-        this.#views.set(op.pk, partition)
-      }
-    }
-    if (outcome !== null && recorded !== null) {
-      this.#outcomes.set(outcome.commandId, recorded)
+      this.#views.set(op.pk, partition)
     }
   }
 
@@ -320,6 +502,11 @@ export class MemRepository implements OutcomeRepository, StoreInitializer, ViewR
   #viewHolds(op: ViewOperation): boolean {
     const stored = this.#views.get(op.pk)?.get(op.sk)
     const owned = stored === undefined || stored.entityId === op.owner
+    // The engine's compare-and-set: the owner's row, holding exactly the bytes it read.
+    const expected = op.expectedPayload
+    if (expected !== null && expected !== undefined) {
+      return stored !== undefined && owned && sameBytes(stored.payload, expected)
+    }
     switch (op.condition) {
       case 'none':
         return owned
@@ -345,6 +532,50 @@ export class MemRepository implements OutcomeRepository, StoreInitializer, ViewR
     return this.#sorted(entityId)
       .filter((event) => event.sequence > after)
       .map(cloneEvent)
+  }
+
+  /** Each entity's events come whole, in one batch. */
+  readonly batchesByEntity = true
+
+  /**
+   * Every entity's events, one batch per entity, entities ascending by ID bytes and events by
+   * sequence, a stream's type being its events'. The reserved namespaces are skipped. It reads the
+   * log as it stands when each batch is taken.
+   */
+  async *streamAllEvents(
+    filter?: StreamFilter,
+    options?: CallOptions,
+  ): AsyncGenerator<SerializedEvent[]> {
+    options?.signal?.throwIfAborted()
+    const ids = [...this.#streams.keys()].filter((entityId) => !isReserved(entityId))
+    ids.sort(compareUtf8)
+    for (const entityId of ids) {
+      options?.signal?.throwIfAborted()
+      const events = this.#sorted(entityId)
+      if (events.length > 0 && matchesFilter(filter, events[0]!.entityType)) {
+        yield events.map(cloneEvent)
+      }
+    }
+  }
+
+  async entityHeads(entityType?: string, options?: CallOptions): Promise<Map<string, bigint>> {
+    options?.signal?.throwIfAborted()
+    const heads = new Map<string, bigint>()
+    const ids = [...this.#streams.keys()].filter((entityId) => !isReserved(entityId))
+    ids.sort(compareUtf8)
+    for (const entityId of ids) {
+      const stream = this.#streams.get(entityId)!
+      const events = this.#sorted(entityId)
+      const type = events[0]?.entityType ?? stream.snapshot?.entityType ?? ''
+      const last = events.at(-1)?.sequence ?? 0n
+      const covered = stream.snapshot?.eventSequence ?? 0n
+      const head = last > covered ? last : covered
+      if (head > 0n && (entityType === undefined || type === entityType)) {
+        heads.set(entityId, head)
+      }
+    }
+
+    return heads
   }
 
   async latest(entityId: string, n: number, options?: CallOptions): Promise<SerializedEvent[]> {
@@ -407,7 +638,7 @@ export class MemRepository implements OutcomeRepository, StoreInitializer, ViewR
 
     // Compaction validates the manifest, but never declares stream-heads itself.
     const {manifest} = this.#controls
-    checkWritable(manifest)
+    checkWritable(manifest, isJournalWriter(this))
 
     const stream = this.#streams.get(entityId)
     const snapshot = stream?.snapshot
@@ -432,15 +663,174 @@ export class MemRepository implements OutcomeRepository, StoreInitializer, ViewR
     return deleted
   }
 
+  /** A scope's journal counter: 0 when it has none. */
+  async readCounter(scope: string, options?: CallOptions): Promise<bigint> {
+    options?.signal?.throwIfAborted()
+    const row = this.#views.get(counterPartitionKey(scope))?.get(COUNTER_SORT_KEY)
+
+    return row === undefined ? 0n : readCounter(scope, row)
+  }
+
+  /** Several scopes' journal counters, in the order given. */
+  async readCounters(scopes: readonly string[], options?: CallOptions): Promise<bigint[]> {
+    options?.signal?.throwIfAborted()
+
+    return Promise.all(scopes.map((scope) => this.readCounter(scope)))
+  }
+
+  /** The highest position with a journal row in the scope: 0 when it has none. */
+  async readLastPosition(scope: string, options?: CallOptions): Promise<bigint> {
+    options?.signal?.throwIfAborted()
+    const pk = rowPartitionKey(scope)
+    const keys = [...(this.#views.get(pk)?.keys() ?? [])]
+    if (keys.length === 0) {
+      return 0n
+    }
+    keys.sort(compareUtf8)
+    const last = keys.at(-1)!
+    const position = parseRowSortKey(last)
+    if (position === null) {
+      throw new EvtError('invalidRecord', `journal row ${pk}/${last} has no position`)
+    }
+
+    return position
+  }
+
+  /** Up to `limit` journal rows of the scope above `after`, ascending by sort key. */
+  async readRows(
+    scope: string,
+    after: bigint,
+    limit: number,
+    options?: CallOptions,
+  ): Promise<JournalRow[]> {
+    options?.signal?.throwIfAborted()
+    const above = rowSortKey(after)
+    const rows = [...(this.#views.get(rowPartitionKey(scope))?.values() ?? [])].filter(
+      (row) => compareUtf8(row.sk, above) > 0,
+    )
+    rows.sort((a, b) => compareUtf8(a.sk, b.sk))
+
+    return rows.slice(0, limit).map((row) => journalRowFromView(scope, copyRow(row)))
+  }
+
+  /** The journal's declarations on this store's manifest. Internal. */
+  readonly [JOURNAL_MARKER]: JournalMarker = {
+    declareJournal: async (types, options) => {
+      options?.signal?.throwIfAborted()
+      checkJournalWriter(this)
+      // A store that holds data without stream-heads is refused by the commit, which takes the
+      // declaration back.
+      const {manifest} = this.#controls
+      checkSupported(manifest, isJournalWriter(this))
+      const declared = journalDeclaration(manifest, types)
+      // The feature, then the history, a declaration each.
+      if (declared.journal) {
+        this.#controls.manifest = withJournal(this.#controls.manifest, {journal: true, history: []})
+      }
+      if (declared.history.length > 0) {
+        this.#controls.manifest = withJournal(this.#controls.manifest, {
+          journal: false,
+          history: declared.history,
+        })
+      }
+
+      return declared
+    },
+    retractJournal: async (declared, options) => {
+      checkJournalWriter(this)
+      options?.signal?.throwIfAborted()
+      checkSupported(this.#controls.manifest, isJournalWriter(this))
+      if (declaredAnything(declared)) {
+        this.#controls.manifest = withoutJournal(this.#controls.manifest, declared)
+      }
+    },
+    checkCompactionMarker: async (options) => {
+      options?.signal?.throwIfAborted()
+      checkSupported(this.#controls.manifest, true)
+    },
+    declareCompaction: async (options) => {
+      options?.signal?.throwIfAborted()
+      const {manifest} = this.#controls
+      checkSupported(manifest, true)
+      if (manifest?.features.get(JOURNAL_COMPACTION_FEATURE) !== JOURNAL_COMPACTION_VERSION) {
+        this.#controls.manifest = withJournalCompaction(manifest)
+      }
+    },
+  }
+
+  /** A row of a scope's journal compaction partition, or null. */
+  async readCompactionRow(
+    scope: string,
+    sortKey: string,
+    options?: CallOptions,
+  ): Promise<ViewRow | null> {
+    options?.signal?.throwIfAborted()
+
+    return this.view(compactionPartitionKey(scope), sortKey)
+  }
+
+  /**
+   * One journal compaction transaction: every write's expectation (a delete's owner) against the
+   * rows as they are, and the rebuild epoch, then the writes, or nothing.
+   */
+  async writeCompaction(
+    epoch: bigint | null,
+    writes: readonly CompactionWrite[],
+    options?: CallOptions,
+  ): Promise<CompactionWritten> {
+    options?.signal?.throwIfAborted()
+    checkCompactionWrites(writes)
+    if (epoch !== null && epoch !== this.#controls.rebuild.generation.value) {
+      return {kind: 'epochChanged'}
+    }
+    for (const [at, write] of writes.entries()) {
+      const {pk, sk} = writeKey(write)
+      const stored = this.#views.get(pk)?.get(sk) ?? null
+      const met =
+        write.kind === 'delete'
+          ? stored === null || stored.entityId === write.owner
+          : meets(write.expect, stored)
+      if (!met) {
+        return {kind: 'refused', at}
+      }
+    }
+    for (const write of writes) {
+      if (write.kind === 'put') {
+        const partition = this.#views.get(write.row.pk) ?? new Map<string, ViewRow>()
+        partition.set(write.row.sk, copyRow(write.row))
+        this.#views.set(write.row.pk, partition)
+      } else if (write.kind === 'delete') {
+        this.#views.get(write.pk)?.delete(write.sk)
+      }
+    }
+
+    return {kind: 'written'}
+  }
+
+  /** The clock journal compaction reads, in whole Unix seconds. */
+  compactionNow(): number {
+    return Math.floor(this.#clock() / 1000)
+  }
+
+  /**
+   * The settled rebuild generation: even, 0 for a store no rebuild ever held. An odd one is a
+   * `RebuildUnavailableError`.
+   */
+  observeRebuildEpoch(options?: CallOptions): Promise<bigint> {
+    return observeRebuildEpoch(this, options)
+  }
+
   static {
     streamsOf = (repo) => repo.#streams
     controlsOf = (repo) => repo.#controls
+    clockOf = (repo) => repo.#clock
+    viewsOf = (repo) => repo.#views
   }
 
   // Refuses a write to a store whose manifest declares an unsupported pair, and declares
   // stream-heads on a store without it, as its first writer, when the store holds no data.
   #checkManifest(): void {
-    checkSupported(this.#controls.manifest)
+    checkSupported(this.#controls.manifest, isJournalWriter(this))
     if (!declaresStreamHeads(this.#controls.manifest)) {
       this.#declareStreamHeads()
     }
@@ -560,6 +950,33 @@ export interface HeadFixtures {
  * Hooks that corrupt a repository's heads, for conformance suites only: a stream they touch
  * drifts, and every later write to it fails.
  */
+/** What the journal's conformance cases need to change a store's view rows outside a commit. */
+export interface ViewFixtures {
+  /** Writes or replaces a row, as another writer would. */
+  putView(row: ViewRow): void
+  /** Deletes a row, if there is one. */
+  deleteView(pk: string, sk: string): void
+}
+
+/**
+ * Changes a repository's view rows outside a commit, as another writer (a restore, a lost row)
+ * would, for the journal's conformance cases only.
+ */
+export function viewFixtures(repo: MemRepository): ViewFixtures {
+  const views = viewsOf(repo)
+
+  return {
+    putView(row) {
+      const partition = views.get(row.pk) ?? new Map<string, ViewRow>()
+      partition.set(row.sk, {...row, payload: copy(row.payload)})
+      views.set(row.pk, partition)
+    },
+    deleteView(pk, sk) {
+      views.get(pk)?.delete(sk)
+    },
+  }
+}
+
 export function headFixtures(repo: MemRepository): HeadFixtures {
   const streams = streamsOf(repo)
 
@@ -597,7 +1014,9 @@ export interface ControlFixtures {
   /** Changes the manifest in one declaration, bumping its version by one, and returns it. */
   declare(change: (draft: ManifestDraft) => void): FeatureManifest
   /** Sets the rebuild fence's rows, as a rebuild's lifecycle would. */
-  setRebuild(state: RebuildState): void
+  setRebuild(state: RebuildFixture): void
+  /** Sets the rebuild fence's rows exactly. */
+  setRebuildState(state: RebuildRows): void
 }
 
 /**
@@ -631,7 +1050,22 @@ export function controlFixtures(repo: MemRepository): ControlFixtures {
     },
     setRebuild(state) {
       int64Argument(state.generation, 'generation')
-      controls.rebuild = {...state}
+      const value = state.generation
+      controls.rebuild = {
+        generation: {value, forceReleased: state.lock === 'forceReleased'},
+        lock:
+          state.lock === 'held'
+            ? {
+                owner: 'conformance',
+                generation: value,
+                leaseExpiresAt: fenceNow(clockOf(repo)) + 300,
+              }
+            : null,
+      }
+    },
+    setRebuildState(state) {
+      int64Argument(state.generation.value, 'generation')
+      controls.rebuild = {generation: {...state.generation}, lock: state.lock && {...state.lock}}
     },
   }
 }
@@ -673,4 +1107,12 @@ function cloneSnapshot(snapshot: SerializedSnapshot): SerializedSnapshot {
 // A copy of the bytes. Not slice(): a Node Buffer's slice is a view of the same memory.
 function copy(bytes: Uint8Array): Uint8Array {
   return new Uint8Array(bytes)
+}
+
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  return a.length === b.length && a.every((byte, index) => byte === b[index])
+}
+
+function copyRow(row: ViewRow): ViewRow {
+  return {...row, payload: copy(row.payload)}
 }

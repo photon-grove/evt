@@ -5,9 +5,13 @@ export {
   type HeadFixtures,
   type ManifestDraft,
   MemRepository,
+  type MemRepositoryOptions,
+  type RebuildFixture,
   type RebuildState,
+  type ViewFixtures,
   controlFixtures,
   headFixtures,
+  viewFixtures,
 } from './repository.js'
 export {MemViewRepository} from './views.js'
 export type {ViewRow} from '../views.js'

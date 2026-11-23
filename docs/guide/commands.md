@@ -116,7 +116,12 @@ identity. Note that `IdempotencyKeyReuse` does carry the stored outcome, so an e
 serves several principals should answer it without echoing the error's outcome.
 
 A lost race on the outcome row is resolved the same way and never surfaces as a generic conflict.
-The loser returns only the winner's stored outcome. A first execution returns its rejection in the
+The loser returns only the winner's stored outcome. On DynamoDB the loser can instead be cancelled
+with `TransactionConflict` while the winner is still committing: the store then polls the outcome
+row briefly (up to 150 ms) when DynamoDB reports the conflict on the outcome item, and reads it once
+otherwise.
+If the winner's row isn't visible yet, the attempt fails with the transient error and the next
+attempt, or a resend of the command ID, replays it. A first execution returns its rejection in the
 stored (decoded) form, so its `Details` equal a replay's.
 
 ## Limits

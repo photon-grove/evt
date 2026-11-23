@@ -28,6 +28,7 @@ Both sides implement the same account domain: `go/internal/compat/account.go` an
 | `go -C go test ./internal/compat`              | The Go output still matches the fixtures.                                                                      |
 | `cargo test -p evt-compat`               | The Rust output matches the fixtures byte for byte, running every step in Rust against `MemRepository`.        |
 | `moon run evt-ts:test evt-ts:runtimes`   | The TypeScript fixture runner (`packages/evt-compat`) reproduces the vectors it covers so far, and its conformance suite passes against `MemRepository`, on Node, Bun and Deno. It generates no fixtures. |
+| `moon run evt-lambda:test evt-lambda:runtimes` | `@photon-grove/evt-lambda` reproduces every `lambda.json` vector (`packages/evt-compat/src/lambda.ts`) on Node, Bun and Deno. |
 | `scripts/compat-integration.sh dynamo`   | Go and Rust take turns writing the same streams in the local DynamoDB emulator, then both verify every stream. Two passes over the scenarios TypeScript supports come first, in which the TypeScript driver stands in for Go, then for Rust. |
 | `scripts/compat-integration.sh postgres` | The same against local PostgreSQL, TypeScript passes included.                                                 |
 
@@ -55,12 +56,12 @@ scenarios it supports, and `step --as go|rust` executes that language's steps of
 and stamps that language's name, so the streams match the fixtures unchanged. Each of its two
 passes has its own run ID and takes only those scenarios: the other language's driver writes its
 own steps of them, limited by `step -scenarios` (Go) or `--scenarios` (Rust), and Go, Rust and
-TypeScript verify them, then Go and Rust compare their enumerations. TypeScript verifies what each
+TypeScript verify them, then Go, Rust and TypeScript compare their enumerations (`enumerate`). TypeScript verifies what each
 backend stores, as Go does: the DynamoDB items and the SNS messages they publish, or the PostgreSQL
-event, snapshot and head rows. The other scenarios would only repeat the Go and Rust pass, and Moto
+event, snapshot and head rows, and the view rows. Its passes also run the exclusive scenarios it
+supports, after the interleaved ones, with it standing in. The other scenarios would only repeat the Go and Rust pass, and Moto
 copies a table for every action of a transaction, so a fuller table slows every pass: the
-TypeScript passes run first, while the tables are smallest. TypeScript doesn't join the
-enumeration check yet. Its driver refuses any `AWS_ENDPOINT_URL` or `DATABASE_URL` whose host
+TypeScript passes run first, while the tables are smallest. Its driver refuses any `AWS_ENDPOINT_URL` or `DATABASE_URL` whose host
 isn't a loopback address or a `.localhost` name, so a compose service name won't do.
 
 The live runs need the local stacks from [CONTRIBUTING.md](../CONTRIBUTING.md#integration-tests). Moon
@@ -127,7 +128,8 @@ stored payloads changed, and update the spec.
    across its steps: a rebuild lock or a declared feature refuses every other scenario's commits. The interleaved run skips it, and
    `scripts/compat-integration.sh` runs it alone afterwards, one step at a time (`evt-compat steps
    -only NAME`, `step -only NAME`, and `exclusive` in the Go driver. The Rust driver takes the same
-   arguments). `rebuild` owner tokens are scoped to the run and scenario like command IDs (a step that presents a lease rebuilds it from the store: the lock's fencing generation when it names the scoped owner), and a
+   arguments, and the TypeScript driver `step --only NAME` and `exclusive`, listing the exclusive
+   scenarios it supports, which its passes run with it standing in). `rebuild` owner tokens are scoped to the run and scenario like command IDs (a step that presents a lease rebuilds it from the store: the lock's fencing generation when it names the scoped owner), and a
    `writeViews` step writes one view row in the partition `rebuild-<entity ID>`. The fixture runs
    advance an injected clock for `wait`, and the live runs sleep.
 

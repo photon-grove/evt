@@ -1,5 +1,42 @@
 # Changelog
 
+## [0.2.2](https://github.com/photon-grove/evt/compare/evt-ts-v0.2.1...evt-ts-v0.2.2) (2026-11-23)
+
+
+### Features
+
+* **ts:** add the engine's expected-payload view condition ([#319](https://github.com/photon-grove/evt/issues/319)) ([021a2d3](https://github.com/photon-grove/evt/commit/021a2d31b454845eb9b80443c58ef8dada4bbfe8))
+* **ts:** add the view repository and the typed view codec ([#309](https://github.com/photon-grove/evt/issues/309)) ([0cd8733](https://github.com/photon-grove/evt/commit/0cd873311290603cc9e789e49f6663b9921afbf0))
+* **ts:** apply the expected-payload condition on the PostgreSQL views table ([#322](https://github.com/photon-grove/evt/issues/322)) ([6c39dc7](https://github.com/photon-grove/evt/commit/6c39dc7084880aebe4e7e5d42ba78c583ff5876c))
+* **ts:** declare history-dependent types and run the feature-marker scenario ([#317](https://github.com/photon-grove/evt/issues/317)) ([444e9d0](https://github.com/photon-grove/evt/commit/444e9d09e8779930341b38d989158d1a4a045e1e))
+* **ts:** enumerate the event log, report entity heads, seed from snapshots ([#321](https://github.com/photon-grove/evt/issues/321)) ([c74869a](https://github.com/photon-grove/evt/commit/c74869a73106a4a8f3e5d4f05db0c1e8f839e0b9))
+* **ts:** journal compaction on the memory and DynamoDB repositories ([#324](https://github.com/photon-grove/evt/issues/324)) ([e913199](https://github.com/photon-grove/evt/commit/e91319991ac26be5575aff38befb18c237e53fe2))
+* **ts:** journal compaction on the PostgreSQL views table ([#330](https://github.com/photon-grove/evt/issues/330)) ([553d3ff](https://github.com/photon-grove/evt/commit/553d3ffbbaead51d0c745f3561866394c6a2f317))
+* **ts:** journal on the memory and DynamoDB repositories ([#323](https://github.com/photon-grove/evt/issues/323)) ([558b7db](https://github.com/photon-grove/evt/commit/558b7db05463ee8c24f9d19260b1ed5b3fa7ee7b))
+* **ts:** journal on the PostgreSQL views table ([#326](https://github.com/photon-grove/evt/issues/326)) ([44576de](https://github.com/photon-grove/evt/commit/44576dedc514e700908e40355df9d9bf921d0fa7))
+* **ts:** port photon-evt-lambda as @photon-grove/evt-lambda ([#310](https://github.com/photon-grove/evt/issues/310)) ([e010e7a](https://github.com/photon-grove/evt/commit/e010e7aaa0371057d2d7ce72258703afeff17c3e))
+* **ts:** rebuild commit-wide projectors from the log behind the rebuild fence ([#327](https://github.com/photon-grove/evt/issues/327)) ([cca4289](https://github.com/photon-grove/evt/commit/cca428990269e34d3e1b679316ce5444dff03f58))
+* **ts:** return commits' events as stored through commit receipts ([#318](https://github.com/photon-grove/evt/issues/318)) ([bffebb1](https://github.com/photon-grove/evt/commit/bffebb11419ab029854c79bb88f8b8fa287f29f9))
+* **ts:** run the rebuild fence's lifecycle on every backend ([#325](https://github.com/photon-grove/evt/issues/325)) ([19add0f](https://github.com/photon-grove/evt/commit/19add0fa1ad2d57b84782dad0e000dd9637c32c2))
+* **ts:** wake PostgreSQL journal listeners through NOTIFY ([#328](https://github.com/photon-grove/evt/issues/328)) ([73780fa](https://github.com/photon-grove/evt/commit/73780fa26d887447db16a0b4e7266147961d342c))
+* **ts:** write commit-wide views on PostgreSQL through a view writer ([#312](https://github.com/photon-grove/evt/issues/312)) ([d57275e](https://github.com/photon-grove/evt/commit/d57275e0d7620e289e49e7ab9657cb3f8adb3ed5))
+* **ts:** write commit-wide views to the PostgreSQL views table ([#320](https://github.com/photon-grove/evt/issues/320)) ([00adc1f](https://github.com/photon-grove/evt/commit/00adc1fa65eb2544af192fe1bb9cddf1f1c21d84))
+
+
+### Bug Fixes
+
+* **ts:** poll briefly after a TransactionConflict on the outcome put ([#329](https://github.com/photon-grove/evt/issues/329)) ([827dbd5](https://github.com/photon-grove/evt/commit/827dbd565bbb6d6159b680588b71f465167a33bd))
+
+## [0.2.1](https://github.com/photon-grove/evt/compare/evt-ts-v0.2.0...evt-ts-v0.2.1) (2026-11-21)
+
+
+### Features
+
+* **ts:** add commit-wide projectors in memory and on DynamoDB ([#305](https://github.com/photon-grove/evt/issues/305)) ([2cf3b1e](https://github.com/photon-grove/evt/commit/2cf3b1e33c0ba4a7e0ee2c2f58ec989b2efe3e13))
+* **ts:** record command outcome rows on every backend ([#294](https://github.com/photon-grove/evt/issues/294)) ([cce0bc1](https://github.com/photon-grove/evt/commit/cce0bc1d7fd92cb42867bd84652e026b0501b4a7))
+* **ts:** run commands with durable outcomes, replay and recovery ([#296](https://github.com/photon-grove/evt/issues/296)) ([6513801](https://github.com/photon-grove/evt/commit/6513801e10e42b5e5833a0ce601eab2b77e3c9ed))
+* **ts:** run multi-stream commands under fence-aware retry ([#302](https://github.com/photon-grove/evt/issues/302)) ([e0ce0aa](https://github.com/photon-grove/evt/commit/e0ce0aac458bc815ddefb187a56a28787aef5328))
+
 ## [0.2.0](https://github.com/photon-grove/evt/compare/evt-ts-v0.1.2...evt-ts-v0.2.0) (2026-11-05)
 
 

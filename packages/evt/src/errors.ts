@@ -4,6 +4,7 @@
 
 import type {Outcome} from './outcome.js'
 import type {ProjectedView} from './projection.js'
+import type {RebuildLease} from './rebuild-fence.js'
 
 /**
  * What went wrong:
@@ -58,7 +59,8 @@ import type {ProjectedView} from './projection.js'
  *   so the command ran, but no outcome row says how. Nothing was written.
  * - `invalidViewOperation`: a commit-wide projector's view operation is malformed, or names an
  *   owner the commit didn't write. Nothing was written.
- * - `viewKeyTooLong`: a view operation's `pk` is over 2048 UTF-8 bytes or its `sk` over 1024.
+ * - `viewKeyTooLong`: a view operation's `pk` is over 2048 UTF-8 bytes or its `sk` over 1024, or,
+ *   on PostgreSQL's views table, its entity type, `pk` and `sk` are over 2600 together.
  * - `duplicateViewKey`: two view operations of one commit name the same row.
  * - `reservedViewKey`: a view operation's `pk` is in a partition the engine keeps for itself.
  * - `projector`: a commit-wide projector threw. Nothing was written.
@@ -69,8 +71,35 @@ import type {ProjectedView} from './projection.js'
  * - `viewsUnsupported`: a store has commit-wide projectors, and its repository doesn't write view
  *   operations.
  * - `historyDeclarationUnsupported`: a history-dependent projector needs its entity types declared
- *   in the store's feature manifest, which this package can't do yet.
+ *   in the store's feature manifest, and the repository has no `declareHistoryDependent`.
  * - `commitOrder`: stored commits have no order every stream agrees with.
+ * - `sharedViewKey`: a rebuild met one view row written for two different owner streams, whose
+ *   commits have no order the log keeps. Nothing was written.
+ * - `rebuildFailed`: a projection rebuild under a caller's lease failed. The rebuild's own error is
+ *   the `cause`, with how many guarded batches it attempted.
+ * - `rebuildLockHeld`: another rebuild holds an unexpired lease on the rebuild lock.
+ * - `rebuildLeaseLost`: the caller's rebuild lease no longer holds the lock: it was taken over,
+ *   force-released or ended.
+ * - `rebuildConflict`: the rebuild lock kept changing while a rebuild tried to take it. Retryable.
+ * - `rebuildBeginIndeterminate`: taking the rebuild lock may or may not have succeeded.
+ * - `rebuildStateInvalid`: the rebuild lock and generation rows disagree.
+ * - `rebuildUnavailable`: derived state is unavailable while the rebuild generation is odd.
+ *   Retryable.
+ * - `rebuildEpochChanged`: the rebuild generation changed during a read of derived state.
+ *   Retryable.
+ * - `invalidJournal`: a journal configuration, scope or stored allocation is invalid, such as an
+ *   empty or oversized scope, or a malformed allocation in an event's metadata. Nothing was
+ *   written.
+ * - `journalRowTooLarge`: a journal row is over the configured size cap. Nothing was written.
+ * - `expectedPayloadUnsupported`: the journal was asked to commit through a repository that
+ *   doesn't apply the expected-payload view condition its counters need. Nothing was written.
+ * - `journalGone`: a journal page asked for rows below the scope's compaction floor: install the
+ *   snapshot it names.
+ * - `journalSnapshotMoved`: a compaction snapshot's chunk is missing or doesn't match its
+ *   manifest. Retryable: read the manifest again.
+ * - `foreignJournalRow`: a row in a journal compaction partition isn't the engine's.
+ * - `compactionLeaseHeld`: another compaction holds the scope's unexpired lease.
+ * - `compactionLeaseLost`: a compaction's lease no longer matches: it lapsed or was taken.
  */
 export type EvtErrorCode =
   | 'invalidJson'
@@ -113,6 +142,23 @@ export type EvtErrorCode =
   | 'viewsUnsupported'
   | 'historyDeclarationUnsupported'
   | 'commitOrder'
+  | 'sharedViewKey'
+  | 'rebuildFailed'
+  | 'rebuildLockHeld'
+  | 'rebuildLeaseLost'
+  | 'rebuildConflict'
+  | 'rebuildBeginIndeterminate'
+  | 'rebuildStateInvalid'
+  | 'rebuildUnavailable'
+  | 'rebuildEpochChanged'
+  | 'invalidJournal'
+  | 'journalRowTooLarge'
+  | 'expectedPayloadUnsupported'
+  | 'journalGone'
+  | 'journalSnapshotMoved'
+  | 'foreignJournalRow'
+  | 'compactionLeaseHeld'
+  | 'compactionLeaseLost'
 
 export class EvtError extends Error {
   override readonly name: string = 'EvtError'
@@ -326,14 +372,23 @@ export class TransientError extends EvtError {
    * `TransactionConflict`), so the winner may be another attempt of the same command.
    */
   readonly transactionConflict: boolean
+  /**
+   * The transaction conflict was on the commit's outcome put, which only another attempt of the
+   * same command writes: its transaction was still committing, so its row may appear shortly.
+   */
+  readonly outcomeRow: boolean
 
-  constructor(detail: string, options?: {cause?: unknown; transactionConflict?: boolean}) {
+  constructor(
+    detail: string,
+    options?: {cause?: unknown; transactionConflict?: boolean; outcomeRow?: boolean},
+  ) {
     super(
       'transient',
       `transient failure: ${detail}`,
       options && 'cause' in options ? {cause: options.cause} : undefined,
     )
     this.transactionConflict = options?.transactionConflict ?? false
+    this.outcomeRow = options?.outcomeRow ?? false
   }
 }
 
@@ -347,6 +402,128 @@ export class RebuildInProgressError extends EvtError {
 
   constructor() {
     super('rebuildInProgress', 'a projection rebuild is in progress')
+  }
+}
+
+/** Another rebuild holds an unexpired lease on the rebuild lock. */
+export class RebuildLockHeldError extends EvtError {
+  override readonly name = 'RebuildLockHeldError'
+  override readonly code = 'rebuildLockHeld'
+  readonly owner: string
+  /** When the holder's lease expires, in Unix seconds. */
+  readonly leaseExpiresAt: number
+
+  constructor(owner: string, leaseExpiresAt: number) {
+    super(
+      'rebuildLockHeld',
+      `the rebuild lock is held by ${JSON.stringify(owner)} until ${leaseExpiresAt} (Unix seconds)`,
+    )
+    this.owner = owner
+    this.leaseExpiresAt = leaseExpiresAt
+  }
+}
+
+/** The rebuild lease no longer holds the lock: it was taken over, force-released or ended. */
+export class RebuildLeaseLostError extends EvtError {
+  override readonly name = 'RebuildLeaseLostError'
+  override readonly code = 'rebuildLeaseLost'
+  readonly owner: string
+
+  constructor(owner: string) {
+    super('rebuildLeaseLost', `rebuild owner ${JSON.stringify(owner)} does not hold the lock`)
+    this.owner = owner
+  }
+}
+
+/** The rebuild lock kept changing while a rebuild tried to take it. Retryable. */
+export class RebuildConflictError extends EvtError {
+  override readonly name = 'RebuildConflictError'
+  override readonly code = 'rebuildConflict'
+  readonly attempts: number
+
+  constructor(attempts: number) {
+    super('rebuildConflict', `the rebuild lock kept changing; gave up after ${attempts} attempts`)
+    this.attempts = attempts
+  }
+}
+
+/**
+ * Taking the rebuild lock may or may not have succeeded: the write's result is unknown. `lease` is
+ * the lease it would have taken, and `observed` the generation it read before.
+ */
+export class RebuildBeginIndeterminateError extends EvtError {
+  override readonly name = 'RebuildBeginIndeterminateError'
+  override readonly code = 'rebuildBeginIndeterminate'
+  readonly lease: {
+    readonly owner: string
+    readonly generation: bigint
+    readonly leaseExpiresAt: number
+  }
+  readonly observed: bigint
+
+  constructor(
+    lease: {readonly owner: string; readonly generation: bigint; readonly leaseExpiresAt: number},
+    observed: bigint,
+    cause: unknown,
+  ) {
+    super(
+      'rebuildBeginIndeterminate',
+      `rebuild begin for ${JSON.stringify(lease.owner)} may or may not have taken the lock: ` +
+        messageOf(cause),
+      {cause},
+    )
+    this.lease = lease
+    this.observed = observed
+  }
+}
+
+/** The rebuild lock and generation rows disagree, which no lifecycle step leaves. */
+export class RebuildStateInvalidError extends EvtError {
+  override readonly name = 'RebuildStateInvalidError'
+  override readonly code = 'rebuildStateInvalid'
+  readonly detail: string
+
+  constructor(detail: string) {
+    super('rebuildStateInvalid', `the rebuild lock and generation disagree: ${detail}`)
+    this.detail = detail
+  }
+}
+
+/**
+ * Derived state is unavailable: the rebuild generation is odd, because a rebuild holds the store
+ * or a force-released one left it so. Retryable, once a rebuild ends.
+ */
+export class RebuildUnavailableError extends EvtError {
+  override readonly name = 'RebuildUnavailableError'
+  override readonly code = 'rebuildUnavailable'
+  readonly generation: bigint
+  readonly forceReleased: boolean
+
+  constructor(generation: bigint, forceReleased: boolean) {
+    super(
+      'rebuildUnavailable',
+      `derived state is unavailable: rebuild generation ${generation} is odd` +
+        (forceReleased ? ' (left by a force-release)' : ''),
+    )
+    this.generation = generation
+    this.forceReleased = forceReleased
+  }
+}
+
+/** The rebuild generation changed while derived state was read, so the read may mix two. */
+export class RebuildEpochChangedError extends EvtError {
+  override readonly name = 'RebuildEpochChangedError'
+  override readonly code = 'rebuildEpochChanged'
+  readonly observed: bigint
+  readonly current: bigint
+
+  constructor(observed: bigint, current: bigint) {
+    super(
+      'rebuildEpochChanged',
+      `the rebuild generation changed from ${observed} to ${current} during the read`,
+    )
+    this.observed = observed
+    this.current = current
   }
 }
 
@@ -612,18 +789,21 @@ export class DuplicateCommandError extends EvtError {
   }
 }
 
-/** A view operation's key is over its limit: `pk` 2048 UTF-8 bytes, `sk` 1024. */
+/**
+ * A view operation's key is over its limit: `pk` 2048 UTF-8 bytes, `sk` 1024, and, on a
+ * PostgreSQL repository writing to its views table, the entity type, `pk` and `sk` 2600 together.
+ */
 export class ViewKeyTooLongError extends EvtError {
   override readonly name = 'ViewKeyTooLongError'
   override readonly code = 'viewKeyTooLong'
-  readonly field: 'pk' | 'sk'
+  readonly field: 'pk' | 'sk' | 'entity type, pk and sk'
   readonly length: number
   readonly max: number
   readonly projector: string
   readonly operation: number
 
   constructor(
-    field: 'pk' | 'sk',
+    field: 'pk' | 'sk' | 'entity type, pk and sk',
     length: number,
     max: number,
     projector: string,
@@ -762,6 +942,65 @@ export class CommitOrderError extends EvtError {
   }
 }
 
+/**
+ * A rebuild met one view row written for two different owner streams. Their commits have no
+ * order the log keeps, so a replay can't tell which write came last and refuses rather than guess.
+ */
+export class SharedViewKeyError extends EvtError {
+  override readonly name = 'SharedViewKeyError'
+  override readonly code = 'sharedViewKey'
+  readonly pk: string
+  readonly sk: string
+  /** The owner stream the rebuild met first. */
+  readonly first: string
+  /** The other owner stream. */
+  readonly second: string
+
+  constructor(pk: string, sk: string, first: string, second: string) {
+    super(
+      'sharedViewKey',
+      `view row ${JSON.stringify(pk)}/${JSON.stringify(sk)} is written for streams ` +
+        `${JSON.stringify(first)} and ${JSON.stringify(second)}, whose commits have no durable order`,
+    )
+    this.pk = pk
+    this.sk = sk
+    this.first = first
+    this.second = second
+  }
+}
+
+/**
+ * A projection rebuild under a caller's lease failed: its error (also the `cause`), and how far it
+ * got. The caller holds the lock and decides what to do with it: release it only when no write was
+ * attempted under the lease (`attempted` is 0 here, and the caller wrote nothing of its own) and
+ * its own begin acquired the lock from a settled generation (`acquiredFromSettled` over the
+ * generation read just before the begin). Otherwise keep it, because the rows may be half-written,
+ * until a rebuild completes. `isConflict` and `isRetryable` answer for its error.
+ */
+export class RebuildFailure extends EvtError {
+  override readonly name = 'RebuildFailure'
+  override readonly code = 'rebuildFailed'
+  /** Why the rebuild failed. */
+  readonly error: unknown
+  /**
+   * The guarded batches attempted, the failed one included: a write whose result is unknown may
+   * have applied. 0 means nothing was written.
+   */
+  readonly attempted: number
+  /** The batches the run planned to write; 0 when it failed before its plan was complete. */
+  readonly batches: number
+  /** The lease as the rebuild last renewed it, which the caller ends or keeps. */
+  readonly lease: RebuildLease
+
+  constructor(error: unknown, attempted: number, batches: number, lease: RebuildLease) {
+    super('rebuildFailed', messageOf(error), {cause: error})
+    this.error = error
+    this.attempted = attempted
+    this.batches = batches
+    this.lease = lease
+  }
+}
+
 function viewRef(view: ProjectedView): string {
   return (
     `projector ${JSON.stringify(view.projector)} (#${view.projectorIndex}) ` +
@@ -771,9 +1010,13 @@ function viewRef(view: ProjectedView): string {
 
 /**
  * Whether an error is an optimistic-concurrency conflict: a `conflict`, a `sequenceGap` or a
- * `fenceConflict`.
+ * `fenceConflict`. A {@link RebuildFailure} answers for its error.
  */
 export function isConflict(error: unknown): boolean {
+  if (error instanceof RebuildFailure) {
+    return isConflict(error.error)
+  }
+
   return (
     error instanceof EvtError &&
     (error.code === 'conflict' || error.code === 'sequenceGap' || error.code === 'fenceConflict')
@@ -784,9 +1027,12 @@ export function isConflict(error: unknown): boolean {
  * Whether reloading and running the command again may succeed: after a conflict (a fence the
  * caller stamped excepted), while a rebuild holds the store, after the feature manifest changed
  * under the writer, after throttling, or after an ambiguous write, whose outcome check answers a
- * command that landed.
+ * command that landed. A {@link RebuildFailure} answers for its error.
  */
 export function isRetryable(error: unknown): boolean {
+  if (error instanceof RebuildFailure) {
+    return isRetryable(error.error)
+  }
   // A caller-stamped fence stays stale however often the command runs again.
   if (error instanceof FenceConflictError) {
     return error.provenance === 'engine'
@@ -798,9 +1044,13 @@ export function isRetryable(error: unknown): boolean {
   return (
     error instanceof EvtError &&
     (error.code === 'rebuildInProgress' ||
+      error.code === 'rebuildConflict' ||
+      error.code === 'rebuildUnavailable' ||
+      error.code === 'rebuildEpochChanged' ||
       error.code === 'featureManifestChanged' ||
       error.code === 'transient' ||
-      error.code === 'ambiguousWrite')
+      error.code === 'ambiguousWrite' ||
+      error.code === 'journalSnapshotMoved')
   )
 }
 

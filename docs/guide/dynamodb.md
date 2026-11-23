@@ -155,6 +155,11 @@ transaction that writes it can lose a race against the commits' checks (or anoth
 `Begin` retries from a fresh read up to eight times before returning the transient
 `*evt.RebuildConflictError`. Retry it.
 
+The TypeScript `DynamoRepository` sends the same requests (`beginRebuild`, `renewRebuild`,
+`endRebuild`, `forceReleaseRebuild`, `writeRebuildViews`), and its retryable
+`RebuildConflictError` means the same. Renewing is one `UpdateItem`, so a structural client must
+have `updateItem`, which the SDK's `DynamoDB` client does.
+
 ### Snapshots
 
 `snapshots.NewStore(repo, snapshotSize)` wraps the repository and writes a snapshot roughly every
@@ -296,8 +301,8 @@ A repository that writes commit-wide views hands out a view repository over the 
 handler commits and reads its own rows through one repository: Rust's
 `DynamoRepository::view_repository()` and TypeScript's `DynamoRepository.viewRepository()` return a
 `DynamoViewRepository` over the configured views table and the repository's client, and refuse with
-a views-not-configured error when there is none. Rust's and TypeScript's `MemRepository` are
-their own view repositories, over the rows their commits write.
+a views-not-configured error when there is none. Rust's and TypeScript's `MemRepository` are their
+own view repositories, over the rows their commits write.
 
 ```ts
 const repo = new DynamoRepository(new DynamoDB({}), 'events', {viewsTable: 'views'})

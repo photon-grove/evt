@@ -2,6 +2,7 @@
 // `pg`'s Pool, or anything shaped like it, as a PgClient.
 
 export {type PgClient, type PgConnection, type PgQueryable, type PgResult} from './client.js'
+export {type ManifestRow, manifestRow, manifestWrite} from './marker.js'
 export {
   type OutcomeRow,
   insertOutcomeSql,
@@ -9,22 +10,38 @@ export {
   outcomeRow,
   selectOutcomeSql,
 } from './outcome.js'
+export {
+  DEFAULT_CONNECT_TIMEOUT_MS,
+  DEFAULT_POLL_INTERVAL_MS,
+  JournalListener,
+  type JournalListenerOptions,
+  type PgListenConnection,
+  type PgNotification,
+  type Wakeup,
+} from './listener.js'
 export {POSTGRES_BACKEND, PgRepository, type PgRepositoryOptions} from './repository.js'
+export {type ViewStatement, type ViewWriter} from './views.js'
+export {PgViewRepository} from './view-repository.js'
 
 export {
   DEFAULT_EVENTS_TABLE,
   DEFAULT_SNAPSHOTS_TABLE,
   MAX_EVENTS_TABLE_NAME_BYTES,
   MAX_SNAPSHOTS_TABLE_NAME_BYTES,
+  MAX_VIEW_INDEX_KEY_BYTES,
+  MAX_VIEW_PAGE_ROWS,
   type PgTables,
   RESERVED_INFIX,
   SCHEMA_LOCK,
   entityTypeIndex,
   featuresTable,
+  journalChannel,
   outcomesTable,
   pgTables,
   rebuildGenerationTable,
   rebuildLockTable,
   schemaDdl,
   streamHeadsTable,
+  viewsDdl,
+  viewsTable,
 } from './schema.js'

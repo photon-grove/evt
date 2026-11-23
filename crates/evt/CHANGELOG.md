@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.5.2](https://github.com/photon-grove/evt/compare/photon-evt-v0.5.1...photon-evt-v0.5.2) (2026-11-23)
+
+
+### Bug Fixes
+
+* **conformance:** keep outcome_cases' stack flat as cases grow ([#315](https://github.com/photon-grove/evt/issues/315)) ([cc57902](https://github.com/photon-grove/evt/commit/cc579020543b883f4bf799812c935fcf07c2d88c))
+* **dynamo:** pin the SDK's commit token; poll after a conflict on the outcome put ([#311](https://github.com/photon-grove/evt/issues/311)) ([b1f9bd8](https://github.com/photon-grove/evt/commit/b1f9bd8e58a0b9b03a52bd30edd7c12d2d33f3f7))
+
+## [0.5.1](https://github.com/photon-grove/evt/compare/photon-evt-v0.5.0...photon-evt-v0.5.1) (2026-11-21)
+
+
+### Bug Fixes
+
+* replay a command another attempt committed after the outcome check ([#301](https://github.com/photon-grove/evt/issues/301)) ([e0a2341](https://github.com/photon-grove/evt/commit/e0a23416b86a8bd0a721eac9f87eda69e9c22dda))
+
 ## [0.5.0](https://github.com/photon-grove/evt/compare/photon-evt-v0.4.1...photon-evt-v0.5.0) (2026-11-05)
 
 

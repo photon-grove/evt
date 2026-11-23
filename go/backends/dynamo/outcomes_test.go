@@ -453,3 +453,123 @@ func TestATransactionConflictIsNeverRecordedAsAStaleFence(t *testing.T) {
 	require.ErrorIs(t, err, dynamo.ErrTransactionConflict)
 	require.Nil(t, recorded("exhausted"))
 }
+
+// racingClient is a FakeDynamo standing in for the loser of a race for the same command ID. It
+// applies the next commit carrying a command outcome, as the winner's, and answers it with a
+// TransactionConflict cancellation on item `on`, or on the outcome put (the last action) when `on`
+// is negative. With hold > 0 the commit applies only after that many outcome reads have missed it,
+// as a winner's does while its transaction is still committing.
+type racingClient struct {
+	*compat.FakeDynamo
+
+	armed bool
+	on    int
+	hold  int
+
+	held  *dynamodb.TransactWriteItemsInput
+	reads int
+}
+
+func (c *racingClient) TransactWriteItems(
+	ctx context.Context,
+	params *dynamodb.TransactWriteItemsInput,
+	options ...func(*dynamodb.Options),
+) (*dynamodb.TransactWriteItemsOutput, error) {
+	if !c.armed || !carriesOutcome(params) {
+		return c.FakeDynamo.TransactWriteItems(ctx, params, options...)
+	}
+
+	c.armed = false
+
+	if c.hold > 0 {
+		c.held = params
+	} else if _, err := c.FakeDynamo.TransactWriteItems(ctx, params, options...); err != nil {
+		return nil, err
+	}
+
+	on := c.on
+	if on < 0 {
+		on = len(params.TransactItems) - 1
+	}
+
+	reasons := make([]types.CancellationReason, len(params.TransactItems))
+	for i := range reasons {
+		reasons[i] = types.CancellationReason{Code: strPtr("None")}
+	}
+	reasons[on] = types.CancellationReason{Code: strPtr("TransactionConflict")}
+
+	return nil, &types.TransactionCanceledException{
+		Message:             strPtr("Transaction cancelled, please refer cancellation reasons for specific reasons"),
+		CancellationReasons: reasons,
+	}
+}
+
+func (c *racingClient) GetItem(
+	ctx context.Context,
+	params *dynamodb.GetItemInput,
+	options ...func(*dynamodb.Options),
+) (*dynamodb.GetItemOutput, error) {
+	pk, ok := params.Key["pk"].(*types.AttributeValueMemberS)
+	if c.held != nil && ok && strings.HasPrefix(pk.Value, "command-outcome#") {
+		c.reads++
+
+		if c.reads > c.hold {
+			held := c.held
+			c.held = nil
+
+			if _, err := c.FakeDynamo.TransactWriteItems(ctx, held, options...); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	return c.FakeDynamo.GetItem(ctx, params, options...)
+}
+
+// The loser of a race for the same command ID gets a TransactionConflict, and replays the winner's
+// outcome in the same attempt: after one read once the winner landed, and after a short poll when
+// the conflict is on the outcome put, which only another attempt of the command writes, and the
+// winner is still committing.
+func TestTheLoserOfARaceReplaysTheWinnerInOneAttempt(t *testing.T) {
+	client := &racingClient{FakeDynamo: compat.NewFakeDynamo()}
+	repo := dynamo.NewRepository(client, "events").WithLazyInitialization(true)
+	ctx := context.Background()
+
+	execute := func(entity evt.EntityID, id evt.CommandID) (*evt.CommandOutcome, error) {
+		store := snapshots.NewStore(repo, 0).WithOutcomes().WithRetry(snapshots.ImmediateRetryPolicy(1))
+
+		return store.ExecuteWithOutcome(ctx, newScriptedAggregate(entity), entity, deposit(5), evt.Metadata{CommandID: &id})
+	}
+
+	for _, tc := range []struct {
+		name string
+		on   int
+		hold int
+		// replayed is whether the attempt replays the winner; otherwise it returns the transient
+		// conflict, and the resend replays it.
+		replayed bool
+	}{
+		{name: "landed, on the outcome put", on: -1, replayed: true},
+		{name: "landed, on the rebuild-lock check", on: 1, replayed: true},
+		{name: "committing, on the outcome put", on: -1, hold: 2, replayed: true},
+		{name: "committing, on the rebuild-lock check", on: 1, hold: 1, replayed: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			entity, id := evt.EntityID("e-"+tc.name), evt.CommandID(tc.name)
+			client.armed, client.on, client.hold, client.reads = true, tc.on, tc.hold, 0
+
+			outcome, err := execute(entity, id)
+			if !tc.replayed {
+				require.ErrorIs(t, err, dynamo.ErrTransactionConflict)
+				require.Equal(t, 1, client.reads, "a conflict elsewhere reads the row once")
+
+				// The winner lands; the resend's pre-check replays it.
+				outcome, err = execute(entity, id)
+			}
+
+			require.NoError(t, err)
+			require.Equal(t, evt.OutcomeAccepted, outcome.Status)
+			require.True(t, outcome.Replayed, "the winner's outcome is replayed")
+		})
+	}
+}

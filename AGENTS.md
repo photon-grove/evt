@@ -61,7 +61,8 @@
   The exception is a Rust-first extension's fixtures (ADR 0005): Rust generates them,
   `compat/fixtures/journal.json` with `EVT_UPDATE_FIXTURES=1 cargo test -p evt-compat --test
   journal_fixtures` and `compat/fixtures/lambda.json` with `EVT_UPDATE_FIXTURES=1 cargo test -p
-  photon-evt-lambda --all-features --test fixtures`.
+  photon-evt-lambda --all-features --test fixtures` (then `pnpm exec moon run evt-lambda:test
+  evt-lambda:runtimes`).
 - Update documentation when behavior changes: the README of the unit you changed (`README.md`,
   `go/README.md`, `crates/*/README.md`), `docs/guide/`, `docs/reference/storage-format.md` (normative),
   and `docs/internal/behavioral-invariants.md`.
@@ -81,6 +82,8 @@
   - `packages/evt` (`@photon-grove/evt`, moon project `evt-ts`): the TypeScript implementation,
     built phase by phase from ADR 0009. `packages/evt-compat` (private) is its fixture runner and
     live-run driver. TS checks itself against `compat/fixtures` and generates none.
+  - `packages/evt-lambda` (`@photon-grove/evt-lambda`, moon project `evt-lambda`): the TS port of
+    `photon-evt-lambda`, held to `lambda.json` by `packages/evt-compat/src/lambda.ts`.
   - `infra/local/`: Terraform stack for local DynamoDB-compatible integration testing.
   - `infra/local-postgres/`: Terraform stack for local PostgreSQL integration testing.
   - `go/examples/`: public examples; keep names and scenarios neutral.
@@ -130,11 +133,13 @@
   - Moon tests: `pnpm exec moon run evt:test`
   - Go vet/check: `pnpm exec moon run evt:check`
   - Go lint (golangci-lint, must report zero findings): `pnpm exec moon run evt:lint`
-  - Website typecheck/build: `pnpm exec moon run website:typecheck website:build`
+  - Website typecheck/build/tests: `pnpm exec moon run website:typecheck website:build website:test`
   - React diagram tests: `pnpm exec moon run react-flow-diagrams:test`
   - TypeScript (`@photon-grove/evt`): `pnpm exec moon run evt-ts:check evt-ts:test evt-ts:runtimes`
     (tsc, oxlint with `--deny-warnings`, the import check, Vitest, and the fixture runner on Node,
     Bun and Deno)
+  - TypeScript Lambda helpers: `pnpm exec moon run evt-lambda:check evt-lambda:test
+    evt-lambda:runtimes`
   - Rust (toolchain pinned in `rust-toolchain.toml`): `pnpm exec moon run evt-rust:check
     evt-rust:test` (fmt check, clippy `-D warnings`, tests)
   - Rust and cross-language integration: `pnpm exec moon run evt-rust:integration
@@ -163,10 +168,10 @@
 - Use upstream `actions/cache` (currently `@v6`); do not introduce archived cache forks.
 - CI quality checks include:
   - From `go/`: `go mod tidy` with no `go.mod`/`go.sum` diff, `go vet ./...` and `go test ./...`.
-  - `pnpm exec moon run evt:check evt:lint evt:test website:typecheck website:build react-flow-diagrams:test`
+  - `pnpm exec moon run evt:check evt:lint evt:test website:typecheck website:build website:test react-flow-diagrams:test`
   - `pnpm exec moon run evt-rust:check evt-rust:test` (Rust job)
-  - `pnpm exec moon run evt-ts:check evt-ts:test evt-ts:runtimes`, then the fixture runner on Node
-    22.12 (TypeScript job)
+  - `pnpm exec moon run evt-ts:check evt-ts:test evt-ts:runtimes evt-lambda:check evt-lambda:test
+    evt-lambda:runtimes`, then the fixture runners on Node 22.12 (TypeScript job)
 - CI integration checks start Moto or PostgreSQL, apply the local Terraform, and run
   `evt:integration` / `evt:integration-postgres`, plus `evt-rust:integration` /
   `evt-rust:integration-postgres` when the storage format may have changed or the TypeScript

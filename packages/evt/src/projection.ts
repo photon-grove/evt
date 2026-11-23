@@ -10,6 +10,7 @@ import {
   EvtError,
   ProjectorError,
   ReservedViewKeyError,
+  SharedViewKeyError,
   ViewKeyTooLongError,
 } from './errors.js'
 import type {SerializedEvent} from './event.js'
@@ -24,6 +25,31 @@ export const RESERVED_VIEW_PREFIXES: readonly string[] = Object.freeze([
   'journal-counter#',
   'journal-compaction#',
 ])
+
+/**
+ * The metadata extension key the engine keeps for the journal's allocations. Only the engine's own
+ * projectors see it: the journal adds it as it commits, after the store ran its projectors, so a
+ * live event never carries it and a stored one does, and hiding it keeps a live commit and a replay
+ * of the stored events in agreement.
+ */
+export const ENGINE_ALLOCATION_KEY = 'evt.journal'
+
+// The engine's own projectors (the journal's). Membership is the seal: nothing outside this
+// package can add a projector, so an application projector can't opt into the engine's metadata
+// or partitions.
+const engineProjectors = new WeakSet<CommitProjector>()
+
+/** Marks one of the engine's own projectors. Internal: the package entry points don't export it. */
+export function engineProjector<P extends CommitProjector>(projector: P): P {
+  engineProjectors.add(projector)
+
+  return projector
+}
+
+/** Whether a projector is one of the engine's own, which an application can't register. */
+export function isEngineProjector(projector: CommitProjector): boolean {
+  return engineProjectors.has(projector)
+}
 
 /** The longest view partition key, in UTF-8 bytes (DynamoDB's own limit). */
 export const MAX_VIEW_PK_BYTES = 2048
@@ -71,6 +97,15 @@ export interface ViewOperation {
    * `ProjectorOperationError` reports as its `mapped` error. Never stored.
    */
   readonly conflict?: unknown
+  /**
+   * An engine-only condition on a put (the journal's counter, ADR 0005): the row must exist, be
+   * the owner's, and hold exactly these payload bytes, valid UTF-8. Only a put with no other
+   * condition may carry it, and a commit-wide projector's operation that sets it is refused, so
+   * only the engine writes it. A repository that writes the journal applies it in the commit
+   * (DynamoDB: `entityID = :owner AND payload = :expected`) and says so with
+   * `Repository.appliesExpectedPayload`. Like every put's condition, it isn't budgeted.
+   */
+  readonly expectedPayload?: Uint8Array | null | undefined
 }
 
 const encoder = new TextEncoder()
@@ -95,6 +130,14 @@ export function putView(
     condition: options.condition ?? 'none',
     ...('conflict' in options && {conflict: options.conflict}),
   }
+}
+
+/**
+ * The engine's compare-and-set put: `op` with the condition that the stored row is the owner's
+ * and holds exactly `payload`. Internal: a projector cannot set it.
+ */
+export function expectPayload(op: ViewOperation, payload: Uint8Array): ViewOperation {
+  return {...op, expectedPayload: payload}
 }
 
 /** An operation that deletes the row at `pk` and `sk`, which only its `owner` may delete. */
@@ -213,27 +256,83 @@ export function projectViews(
     return []
   }
 
+  return projectWith(
+    projectors.map((projector, index) => ({index, projector})),
+    view,
+  )
+}
+
+/**
+ * Runs the given projectors, each with its index among the store's (or the rebuild's), over a
+ * commit view whether or not it carries events, with the checks of {@link projectViews}. Internal:
+ * a rebuild runs its current-state projectors over a view with a stream's state and no events.
+ */
+export function projectWith(
+  entries: readonly {readonly index: number; readonly projector: CommitProjector}[],
+  view: CommitView,
+): ProjectedView[] {
   const projected: ProjectedView[] = []
-  projectors.forEach((projector, projectorIndex) => {
+  for (const {index: projectorIndex, projector} of entries) {
     const history = projector.history ?? []
+    const engine = isEngineProjector(projector)
     let operations: readonly ViewOperation[]
     try {
-      operations = projector.project(visibleTo(view, history))
+      operations = projector.project(visibleTo(view, history, engine))
     } catch (error) {
       throw new ProjectorError(projector.name, error)
     }
 
     operations.forEach((op, operation) => {
       const item: ProjectedView = {projector: projector.name, projectorIndex, operation, op}
+      if (op.expectedPayload !== null && op.expectedPayload !== undefined) {
+        throw invalidView(item, "an expected payload is the engine's alone")
+      }
       checkOwner(item, view, history)
-      checkUnreserved(item)
+      if (!engine) {
+        checkUnreserved(item)
+      }
       projected.push(item)
     })
-  })
+  }
 
   checkViews(projected)
 
   return projected
+}
+
+/**
+ * The rows a replay's operations leave: the last operation on each key, a put or a delete, keyed
+ * by `pk` then `sk` bytes. Conditions are never evaluated: a replay applies what the live commits
+ * wrote. Internal to the rebuild.
+ */
+export class ViewReplay {
+  readonly #last = new Map<string, ProjectedView>()
+
+  /**
+   * Applies one operation, or throws a {@link SharedViewKeyError} when another owner already
+   * wrote its row: the final row would then depend on an order the log doesn't keep.
+   */
+  apply(item: ProjectedView): void {
+    const {pk, sk, owner} = item.op
+    // A key no projector can make, since checkViews refuses the separator in both parts.
+    const key = `${pk}\0${sk}`
+    const first = this.#last.get(key)
+    if (first !== undefined && first.op.owner !== owner) {
+      throw new SharedViewKeyError(pk, sk, first.op.owner, owner)
+    }
+    this.#last.set(key, item)
+  }
+
+  /**
+   * The last operation on every key the replay touched, ascending by `pk` then `sk` bytes: a key
+   * whose last operation deleted it keeps the delete.
+   */
+  intoLast(): ProjectedView[] {
+    const items = [...this.#last.values()]
+    items.sort((a, b) => compareUtf8(a.op.pk, b.op.pk) || compareUtf8(a.op.sk, b.op.sk))
+
+    return items
+  }
 }
 
 /**
@@ -278,6 +377,15 @@ function invalidReason(op: ViewOperation): string | null {
   if (op.kind === 'delete' && op.condition === 'absent') {
     return 'a delete cannot carry the "absent" condition'
   }
+  const expected = op.expectedPayload
+  if (expected !== null && expected !== undefined) {
+    if (op.kind !== 'put' || op.condition !== 'none') {
+      return 'an expected payload is valid only on a put with no other condition'
+    }
+    if (!isUtf8(expected)) {
+      return 'an expected view payload must be UTF-8'
+    }
+  }
   if (op.pk === '') {
     return 'pk is empty'
   }
@@ -316,6 +424,15 @@ function invalidReason(op: ViewOperation): string | null {
   return null
 }
 
+function isUtf8(bytes: Uint8Array): boolean {
+  try {
+    decoder.decode(bytes)
+    return true
+  } catch {
+    return false
+  }
+}
+
 function invalidView(view: ProjectedView, reason: string): EvtError {
   return new EvtError(
     'invalidViewOperation',
@@ -350,10 +467,11 @@ function checkUnreserved(view: ProjectedView): void {
 
 // The view a projector is given: a current-state projector gets an empty commit ID and no events,
 // and the state of every stream; a history-dependent one gets the commit ID, and the events and
-// state of the streams of the types it names only.
+// state of the streams of the types it names only, without the engine's metadata unless it's one
+// of the engine's own projectors.
 // Each projector gets its own copies, so none can change what another one sees. A copy is a new
 // array, never a slice, which a Node Buffer shares with its source.
-function visibleTo(view: CommitView, history: readonly string[]): CommitView {
+function visibleTo(view: CommitView, history: readonly string[], engine: boolean): CommitView {
   if (history.length === 0) {
     return {
       commitId: '',
@@ -369,13 +487,22 @@ function visibleTo(view: CommitView, history: readonly string[]): CommitView {
     commitId: view.commitId,
     streams: view.streams.map((stream) =>
       history.includes(stream.entityType)
-        ? {...stream, events: stream.events.map(copyEvent), state: new Uint8Array(stream.state)}
+        ? {
+            ...stream,
+            events: stream.events.map((event) => copyEvent(event, engine)),
+            state: new Uint8Array(stream.state),
+          }
         : {...stream, events: [], state: new Uint8Array()},
     ),
   }
 }
 
-function copyEvent(event: SerializedEvent): SerializedEvent {
+function copyEvent(event: SerializedEvent, engine: boolean): SerializedEvent {
+  const extensions = new Map(event.metadata.extensions)
+  if (!engine) {
+    extensions.delete(ENGINE_ALLOCATION_KEY)
+  }
+
   return {
     ...event,
     payload: event.payload && new Uint8Array(event.payload),
@@ -383,7 +510,7 @@ function copyEvent(event: SerializedEvent): SerializedEvent {
       ...event.metadata,
       trace: event.metadata.trace && new Map(event.metadata.trace),
       origin: event.metadata.origin && {...event.metadata.origin},
-      extensions: new Map(event.metadata.extensions),
+      extensions,
     },
   }
 }

@@ -29,8 +29,8 @@ share one database.
 
 The TypeScript package's `PgRepository` (`@photon-grove/evt/postgres`) writes the same tables. It
 takes a pool shaped like `pg`'s `Pool`, has `ensureSchema()` and the `eventsTable` and
-`snapshotsTable` options, and initializes a fresh store on its first write. It writes no view rows
-yet, so don't point it at entity types that have projectors.
+`snapshotsTable` options, and initializes a fresh store on its first write. Its `viewWriter` option
+writes commit-wide views as Go's [view writer](#views) does.
 
 ## Schema
 
@@ -86,7 +86,9 @@ transactions, so no acquire or release can slip between a commit's assertion and
 guarded view write selects the lock row `FOR UPDATE` and asserts the owner and an unexpired lease
 in the transaction that carries the view statements. So a takeover waits for it, and a worker that
 lost the lock aborts without writing. A database created before the fence has neither table, and
-commits pass until `EnsureSchema` creates them.
+commits pass until `EnsureSchema` creates them. The TypeScript `PgRepository` runs the same
+statements under the same locks (`beginRebuild`, `renewRebuild`, `endRebuild`,
+`forceReleaseRebuild`, `writeRebuildViews`).
 
 Outcome rows record the identity of their command in three columns of the outcomes table
 (`command_type`, `targets`, `principal`), which `EnsureSchema` adds to a table created before them.
@@ -124,8 +126,8 @@ for streams whose early events were compacted away.
 
 ### Views
 
-In Go, evt defines no PostgreSQL view schema (Rust has one, [below](#the-rust-views-table)). Your
-application owns its view tables and their DDL. But
+In Go, evt defines no PostgreSQL view schema (Rust and TypeScript have one,
+[below](#the-views-table)). Your application owns its view tables and their DDL. But
 [commit-wide projectors](projections.md#commit-wide-projectors) still commit their rows atomically
 with the events, through a view writer that turns each view operation into the SQL statement for
 your table:
@@ -186,9 +188,48 @@ cause, is a `*evt.ProjectorError`. A commit that carries view operations but has
 with `*evt.ViewsNotConfiguredError` before any write. Each statement counts as one action in the
 commit budget, sized by its SQL text.
 
-#### The Rust views table
+In TypeScript the writer is `PgRepository`'s `viewWriter` option, a function from a view operation
+to `{sql, args, keyConstraint}`, with the same statement rules, errors and budget:
 
-`photon-evt`'s `PostgresRepository::ensure_schema` also creates an evt-owned views table,
+```ts
+const repository = new PgRepository(pool, {
+  viewWriter: (op) => {
+    const args = [op.pk, op.sk, op.owner]
+    if (op.kind === 'delete') {
+      return op.condition === 'present'
+        ? {sql: 'DELETE FROM views WHERE pk = $1 AND sk = $2 AND entity_id = $3', args}
+        : {
+            sql:
+              'WITH gone AS (DELETE FROM views WHERE pk = $1 AND sk = $2 AND entity_id = $3) ' +
+              'SELECT 1 FROM views WHERE pk = $1 AND sk = $2 AND entity_id <> $3',
+            args,
+          }
+    }
+    const insert =
+      'INSERT INTO views (pk, sk, entity_id, entity_type, payload) VALUES ($1, $2, $3, $4, $5)'
+    const payload = new TextDecoder('utf-8', {ignoreBOM: true}).decode(op.payload)
+    const row = [...args, op.entityType, payload]
+    return op.condition === 'absent'
+      ? {sql: insert, args: row, keyConstraint: 'views_pkey'}
+      : {
+          sql:
+            `${insert} ON CONFLICT (pk, sk) DO UPDATE SET entity_type = EXCLUDED.entity_type, ` +
+            'payload = EXCLUDED.payload WHERE views.entity_id = EXCLUDED.entity_id',
+          args: row,
+        }
+  },
+})
+```
+
+It reads a statement's count from the rows it returns, or, when it returns none, from the driver's
+`rowCount` (`pg`, Neon) or `affectedRows` (PGlite). With a driver that reports neither, add
+`RETURNING 1` to the puts and the `present` deletes and mark their statements `returning: true`,
+so that a statement returning no row is a failed condition.
+
+#### The views table
+
+`photon-evt`'s `PostgresRepository::ensure_schema`, and TypeScript's `PgRepository.ensureSchema`,
+also create an evt-owned views table,
 `{events}__evt_views` ([ADR 0008](../adr/0008-postgresql-views-table-and-journal.md)), and
 `view_repository()` reads and writes it with the same semantics as the DynamoDB view repository:
 
@@ -204,20 +245,67 @@ views.purge_expired(now_unix_seconds).await?; // PostgreSQL does not expire rows
 Its keys order by UTF-8 bytes, as on DynamoDB, and its payloads keep their exact bytes. It needs a
 `UTF8` database, and it refuses a row whose entity type, `pk` and `sk` together exceed 2,600 bytes,
 the most a btree index entry holds. Like every backend's view repository, it refuses U+0000, which
-`text` can't hold, with `InvalidArgument`. The TypeScript package doesn't have this table yet, so,
-as in Go, it has no PostgreSQL view repository: its `DynamoViewRepository` and `MemViewRepository`
-are the two it offers.
+`text` can't hold, with `InvalidArgument`.
 
-`with_views_table()` makes the table the commit's view target, in place of a view writer: evt
-builds every statement with the DynamoDB repository's owner rules, so you write no SQL. The
-repository declares the `postgres-views` marker feature before its first commit, after which a Go
-writer, or a Rust repository with a view writer, refuses the store instead of putting views
-somewhere else. The [sync journal](../reference/storage-format.md#journal) works on PostgreSQL through the same table:
-wrap the repository in a `JournalRepository` and it journals, pages and compacts as it does on
-DynamoDB. Each journaled commit runs `pg_notify` per scope it wrote, and a `JournalListener`
-(one dedicated connection) turns those into wake-ups: page the scope it names, and every scope on
-`Connected` and `Poll`, since a notification sent while the listener was disconnected is lost.
-`with_wakeups(false)` turns the notifications off for a deployment that only polls.
+In TypeScript it's `PgViewRepository`, which `repository.viewRepository()` returns, with the same
+rows, order and cursors, so a Rust process can continue a TypeScript listing:
+
+```ts
+const views = repository.viewRepository()
+const payload = new TextEncoder().encode('{"name":"core"}')
+await views.putView({pk: 'USER#1#teams', sk: 't1', entityId: 'user-1', entityType: 'team', payload})
+const page = await views.listViewsByPkPaged('USER#1#teams', {limit: 50})
+await views.purgeExpired(Math.floor(Date.now() / 1000))
+```
+
+`with_views_table()` (TypeScript: `new PgRepository(pool, {viewsTable: true})`) makes the table
+the commit's view target, in place of a view writer: evt builds every statement with the DynamoDB
+repository's owner rules, so you write no SQL, and counts each one in the commit budget as its
+DynamoDB item, so the budget refuses the same commits on both backends. The repository declares the
+`postgres-views` marker feature before its first commit, after which a Go writer, or a Rust or
+TypeScript repository without the views table, refuses the store instead of putting views somewhere
+else. The [sync journal](../reference/storage-format.md#journal) works on PostgreSQL through the same
+table: wrap the repository in a `JournalRepository` and it journals, pages and compacts as it does
+on DynamoDB, with the same rows, so a Rust and a TypeScript writer share one journal:
+
+```ts
+import {Journal, JournalRepository, page} from '@photon-grove/evt/journal'
+
+const repository = new PgRepository(pool, {viewsTable: true})
+const journal = new Journal(['account'], (event) => [`account:${event.entityId}`])
+const store = new Store(new JournalRepository(repository, journal))
+const next = await page(repository, 'account:acct-1', 0n, 100)
+```
+
+A repository without the views table holds no journal: its journal reads fail with
+`ViewsNotConfigured`, and a journaled commit through it is refused before anything is declared.
+
+Each journaled commit runs `pg_notify` per scope it wrote, and a `JournalListener` (one dedicated
+connection) turns those into wake-ups: page the scope it names, and every scope on `Connected` and
+`Poll`, since a notification sent while the listener was disconnected is lost. `with_wakeups(false)`
+(TypeScript: `wakeups: false`) turns the notifications off for a deployment that only polls. In
+TypeScript the listener takes a function that opens its dedicated connection, such as a `pg`
+`Client`, never a pooled one:
+
+```ts
+import {Client} from 'pg'
+import {JournalListener} from '@photon-grove/evt/postgres'
+
+const listener = new JournalListener({
+  connect: async () => {
+    const client = new Client(url)
+    await client.connect()
+    return client
+  },
+})
+for (;;) {
+  const wakeup = await listener.next() // {kind: 'scope', scope} | {kind: 'connected'} | {kind: 'poll'}
+  // page wakeup.scope from its cursor, or every scope you follow on 'connected' and 'poll'
+}
+```
+
+`next()` rejects when it can't connect, and the next call tries again, so back off between
+failures. The listener keeps each notified scope once until a call reports it.
 
 ## Local development
 

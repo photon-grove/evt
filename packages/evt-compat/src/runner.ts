@@ -13,6 +13,8 @@ import {
   type DigestInput,
   DuplicateViewKeyError,
   type EventOf,
+  type FeatureManifest,
+  HistoryDependentProjectionError,
   IdempotencyKeyReuseError,
   type JsonValue,
   type Metadata,
@@ -22,8 +24,15 @@ import {
   ProjectorOnlyCommitError,
   ProjectorOperationError,
   type ProjectedView,
+  type RebuildFence,
+  type RebuildLease,
+  RebuildInProgressError,
+  RebuildLeaseLostError,
+  RebuildLockHeldError,
+  RebuildUnavailableError,
   type Repository,
   ReservedEntityIdError,
+  RetentionConflictError,
   type SerializedEvent,
   Store,
   type StoreOptions,
@@ -32,10 +41,16 @@ import {
   type Transaction,
   type TransactionCommit,
   type TransactionalRepository,
+  UnsupportedFeatureError,
+  commitTransactionWithReceipt,
+  commitWithReceipt,
   defaultDigest,
   deleteView,
   emptyMetadata,
   encodeEvent,
+  isEventLog,
+  isReserved,
+  observeRebuildEpoch,
   encodeSnapshot,
   eventId,
   groupCommits,
@@ -77,15 +92,10 @@ export const SUPPORTED_SCENARIOS: readonly string[] = [
   'commit-wide-projector',
   'commit-too-large',
   'commit-grouping',
+  'feature-marker',
+  'reserved-namespaces',
+  'rebuild-fence',
 ]
-
-/**
- * The scenarios a backend can't run yet: PostgreSQL writes commit-wide views through a view writer
- * TypeScript doesn't have so far.
- */
-export const UNSUPPORTED_ON: Readonly<Record<string, readonly string[]>> = Object.freeze({
-  postgres: ['commit-wide-views', 'commit-wide-projector', 'commit-too-large'],
-})
 
 /** The fixture run's name, which every run's identity digests use. */
 export const FIXTURE_RUN = 'fixture'
@@ -107,6 +117,9 @@ const OUTCOME_KEYS = new Set([
   'operation',
   'mapped',
   'groups',
+  'delta',
+  'forceReleased',
+  'rows',
 ])
 
 // The step keys this runner reads. A supported scenario that gains another fails loudly rather
@@ -142,6 +155,15 @@ const STEP_KEYS = new Set([
   'retryWrites',
   'interfere',
   'projectors',
+  'features',
+  'retention',
+  'historyDependent',
+  'retract',
+  'entityPrefix',
+  'action',
+  'owner',
+  'leaseSeconds',
+  'seconds',
 ])
 
 // The keys this runner reads of an executeTransaction step's writes and its interference.
@@ -149,23 +171,36 @@ const WRITE_KEYS = new Set(['suffix', 'event'])
 const INTERFERE_KEYS = new Set(['suffix', 'event', 'times'])
 
 // The keys this runner reads of a transaction step's streams, their events and its fences.
-const STREAM_KEYS = new Set(['suffix', 'sequence', 'events', 'snapshot'])
+const STREAM_KEYS = new Set(['suffix', 'sequence', 'events', 'snapshot', 'entityPrefix'])
 const EVENT_KEYS = new Set(['type', 'version', 'payload', 'pad'])
-const FENCE_KEYS = new Set(['suffix', 'head', 'callerStamped'])
+const FENCE_KEYS = new Set(['suffix', 'head', 'callerStamped', 'entityType'])
 
-// The scenario flags that need what TypeScript lacks so far.
-const LATER_FLAGS = ['exclusive']
+// The scenario keys this runner reads. An exclusive scenario holds store-wide state across its
+// steps, so a driver runs it alone, which the fixture run does with a store of its own.
+const SCENARIO_KEYS = new Set([
+  'name',
+  'description',
+  'snapshotInterval',
+  'steps',
+  'outcomes',
+  'projector',
+  'exclusive',
+])
 
 const encoder = new TextEncoder()
 const decoder = new TextDecoder()
 
-/** Throws when a scenario sets a flag this runner doesn't support. */
+/** Throws when a scenario sets a key this runner doesn't read. */
 export function checkScenario(scenario: JsonValue): void {
-  for (const flag of LATER_FLAGS) {
-    if (optionalBoolean(scenario, flag)) {
-      throw new Error(`the scenario sets ${flag}, which TypeScript doesn't support yet`)
-    }
+  if (!(scenario instanceof Map)) {
+    throw new Error('a scenario is not an object')
   }
+  checkKeys(scenario, SCENARIO_KEYS, `scenario ${str(field(scenario, 'name'))}`)
+}
+
+/** Whether the scenario holds store-wide state, so a driver runs it alone. */
+export function isExclusive(scenario: JsonValue): boolean {
+  return optionalBoolean(scenario, 'exclusive')
 }
 
 /** Throws when a step sets a key this runner doesn't read. */
@@ -225,6 +260,12 @@ export interface Outcome {
   mapped?: string
   /** A groupCommits step's commits, each its ID and its events. */
   groups?: string[]
+  /** How far a declare or rebuild step moved the feature manifest's version or the generation. */
+  delta?: number
+  /** A rebuild step left the generation flagged force-released. */
+  forceReleased?: true
+  /** The rows a rebuild's writeViews step left in the scenario's rebuild partition. */
+  rows?: number
 }
 
 export function expectedOutcome(expect: JsonValue): Outcome {
@@ -259,6 +300,14 @@ export function expectedOutcome(expect: JsonValue): Outcome {
     ...(optionalList(expect, 'groups').length > 0 && {
       groups: optionalList(expect, 'groups').map(str),
     }),
+    ...(expect.has('delta') && num(field(expect, 'delta')) !== 0
+      ? {delta: num(field(expect, 'delta'))}
+      : {}),
+    ...(expect.has('forceReleased') &&
+      field(expect, 'forceReleased') === true && {forceReleased: true as const}),
+    ...(expect.has('rows') && num(field(expect, 'rows')) !== 0
+      ? {rows: num(field(expect, 'rows'))}
+      : {}),
   }
 }
 
@@ -359,6 +408,33 @@ export interface RunnerOptions {
    * appendRawBypassingHead step.
    */
   bypassHead?: ((event: SerializedEvent) => Promise<void>) | undefined
+  /** Reads and declares the store's feature manifest, as another writer would. Backs declare. */
+  marker?: MarkerDriver | undefined
+  /** The store's rebuild fence, and how time passes and rows are counted. Backs rebuild. */
+  rebuild?: RebuildDriver | undefined
+}
+
+/** What a rebuild step needs: the fence, a clock to wait on, and the view rows of a partition. */
+export interface RebuildDriver {
+  readonly fence: RebuildFence
+  /** Lets `seconds` pass: an injected clock moves, a live run sleeps. */
+  wait(seconds: number): Promise<void>
+  /** How many view rows the partition `pk` holds. */
+  rows(pk: string): Promise<number>
+}
+
+/** A store's feature manifest as a declaring writer sees it. */
+export interface MarkerDriver {
+  manifest(): FeatureManifest | null | Promise<FeatureManifest | null>
+  /** Changes the manifest's declarable parts in one declaration that bumps its version by one. */
+  declare(change: (draft: ManifestDraft) => void): FeatureManifest | Promise<FeatureManifest>
+}
+
+/** A manifest's declarable parts, which a declaration changes in place. */
+export interface ManifestDraft {
+  features: Map<string, number>
+  historyDependent: string[]
+  retention: string[]
 }
 
 export class Runner {
@@ -367,6 +443,8 @@ export class Runner {
   readonly #outcomes: boolean
   readonly #options: StoreOptions
   readonly #bypassHead: RunnerOptions['bypassHead']
+  readonly #marker: RunnerOptions['marker']
+  readonly #rebuild: RunnerOptions['rebuild']
   readonly #run: string
   readonly entityId: string
 
@@ -388,19 +466,29 @@ export class Runner {
     }
     this.#store = new Store(repository, this.#options)
     this.#bypassHead = options.bypassHead
+    this.#marker = options.marker
+    this.#rebuild = options.rebuild
   }
 
   async step(step: JsonValue): Promise<Outcome> {
     const op = str(field(step, 'op'))
-    const id = streamId(this.entityId, optionalString(step, 'suffix') ?? '')
+    // A prefix puts the stream of an appendRaw or putSnapshot step in a reserved namespace, which
+    // every write path refuses. A transaction's streams carry their own.
+    const prefix = optionalString(step, 'entityPrefix') ?? ''
+    if (prefix !== '' && op !== 'appendRaw' && op !== 'putSnapshot') {
+      throw new Error(`a ${op} step sets entityPrefix, which only appendRaw and putSnapshot read`)
+    }
+    const id = prefix + streamId(this.entityId, optionalString(step, 'suffix') ?? '')
 
     switch (op) {
       case 'execute':
         return this.#execute(id, step)
       case 'appendRaw': {
         const raw = field(step, 'event')
-        const loaded = await this.#store.load(account, id)
-        const event = rawEvent(id, loaded.sequence + 1n, step, rawFields(raw))
+        // A stream in a reserved namespace is never loaded: the write is refused before anything
+        // is read, so it's tried at sequence 1.
+        const sequence = prefix === '' ? (await this.#store.load(account, id)).sequence : 0n
+        const event = rawEvent(id, sequence + 1n, step, rawFields(raw))
         return this.#commitRaw(event)
       }
       case 'conflictProbe': {
@@ -421,10 +509,7 @@ export class Runner {
           })
           return outcome('ok')
         } catch (error) {
-          if (error instanceof StreamHeadDriftError) {
-            return outcome('drift')
-          }
-          throw error
+          return classify(error)
         }
       }
       case 'readLatest': {
@@ -464,8 +549,14 @@ export class Runner {
           if (error instanceof Error && 'code' in error && error.code === 'compactionUncovered') {
             return outcome('uncovered')
           }
-          throw error
+          return classify(error)
         }
+      case 'declare':
+        return this.#declare(step)
+      case 'rebuild':
+        return this.#rebuildStep(step)
+      case 'enumerate':
+        return this.#enumerate()
       default:
         throw new Error(`a supported scenario has no ${op} step`)
     }
@@ -565,6 +656,15 @@ export class Runner {
       repository.commitTransaction = async (transaction, options) => {
         await interfere(transaction.outcome)
         return inner.commitTransaction(transaction, options)
+      }
+      // The store commits through the receipt methods, which must interfere as well.
+      repository.commitWithReceipt = async (commit, options) => {
+        await interfere(commit.outcome)
+        return commitWithReceipt(inner, commit, options)
+      }
+      repository.commitTransactionWithReceipt = async (transaction, options) => {
+        await interfere(transaction.outcome)
+        return commitTransactionWithReceipt(inner, transaction, options)
       }
     }
 
@@ -709,6 +809,161 @@ export class Runner {
     } catch (error) {
       return classify(error)
     }
+  }
+
+  // One step of the rebuild fence's lifecycle. The owner is scoped to the scenario's stream, and a
+  // step that presents a lease rebuilds it from the store, as a separate process would: the lock's
+  // fencing generation when it names the owner, else 0. The outcome reports how far the generation
+  // moved, whether it's force-released, and a write's rows.
+  async #rebuildStep(step: JsonValue): Promise<Outcome> {
+    const driver = this.#rebuild
+    if (driver === undefined) {
+      throw new Error('the backend has no rebuild fence driver')
+    }
+
+    const {fence} = driver
+    const owner = `${this.entityId}-${optionalString(step, 'owner') ?? ''}`
+    const action = str(field(step, 'action'))
+    const leaseMs = () => num(field(step, 'leaseSeconds')) * 1000
+    const held = async (): Promise<RebuildLease> => {
+      const {lock} = await fence.rebuildState()
+      return {owner, generation: lock?.owner === owner ? lock.generation : 0n, leaseExpiresAt: 0}
+    }
+    const partition = `rebuild-${this.entityId}`
+
+    const before = await fence.rebuildGeneration()
+    let result = 'ok'
+    try {
+      switch (action) {
+        case 'begin':
+          await fence.beginRebuild(owner, leaseMs())
+          break
+        case 'renew':
+          await fence.renewRebuild(await held(), leaseMs())
+          break
+        case 'end':
+          await fence.endRebuild(await held())
+          break
+        case 'forceRelease':
+          await fence.forceReleaseRebuild(owner)
+          break
+        case 'generation':
+          await observeRebuildEpoch(fence)
+          result = 'settled'
+          break
+        case 'wait':
+          await driver.wait(num(field(step, 'seconds')))
+          break
+        case 'writeViews':
+          await fence.writeRebuildViews(await held(), [
+            {
+              projector: 'rebuild',
+              projectorIndex: 0,
+              operation: 0,
+              op: putView(partition, owner, owner, 'rebuild', `{"owner":${JSON.stringify(owner)}}`),
+            },
+          ])
+          break
+        default:
+          throw new Error(`unknown rebuild action ${action}`)
+      }
+    } catch (error) {
+      if (error instanceof RebuildLockHeldError) {
+        result = 'held'
+      } else if (error instanceof RebuildLeaseLostError) {
+        result = 'leaseLost'
+      } else if (error instanceof RebuildUnavailableError) {
+        result = 'unavailable'
+      } else {
+        throw error
+      }
+    }
+    const after = await fence.rebuildGeneration()
+    const rows = action === 'writeViews' ? await driver.rows(partition) : 0
+
+    return {
+      ...outcome(result),
+      ...(after.value !== before.value && {delta: Number(after.value - before.value)}),
+      ...(after.forceReleased && {forceReleased: true as const}),
+      ...(rows !== 0 && {rows}),
+    }
+  }
+
+  // Walks the event log and the entity heads, as a rebuild does, and counts the events of the
+  // scenario's streams. An engine row of the scenario's (an outcome row, say) in either walk fails
+  // the step.
+  async #enumerate(): Promise<Outcome> {
+    const repository = this.#repository
+    if (!isEventLog(repository)) {
+      throw new Error('the repository does not enumerate its log')
+    }
+
+    let count = 0
+    for await (const batch of repository.streamAllEvents()) {
+      for (const event of batch) {
+        if (!event.entityId.includes(this.entityId)) {
+          continue
+        }
+        if (isReserved(event.entityId)) {
+          throw new Error(`enumeration yielded the engine row ${event.entityId}`)
+        }
+        count++
+      }
+    }
+    for (const entityId of (await repository.entityHeads()).keys()) {
+      if (entityId.includes(this.entityId) && isReserved(entityId)) {
+        throw new Error(`entity heads yielded the engine row ${entityId}`)
+      }
+    }
+
+    return outcome('ok', count)
+  }
+
+  // Applies one declaration to the store's feature manifest, as another writer would, and reports
+  // how far it moved the version. The entity types name the scenario's stream with {id}.
+  async #declare(step: JsonValue): Promise<Outcome> {
+    const marker = this.#marker
+    if (marker === undefined) {
+      throw new Error('the backend has no feature marker driver')
+    }
+
+    const scoped = (name: string) =>
+      optionalList(step, name).map((entityType) =>
+        str(entityType).replaceAll('{id}', this.entityId),
+      )
+    const retention = scoped('retention')
+    const history = scoped('historyDependent')
+    const raw = step instanceof Map ? step.get('features') : undefined
+    const features =
+      raw instanceof Map ? Array.from(raw, ([name, format]) => [name, num(format)] as const) : []
+    const retract = optionalBoolean(step, 'retract')
+
+    const before = await marker.manifest()
+    const declared = await marker.declare((draft) => {
+      if (retract) {
+        for (const [name] of features) {
+          draft.features.delete(name)
+        }
+        draft.retention = draft.retention.filter((entityType) => !retention.includes(entityType))
+        draft.historyDependent = draft.historyDependent.filter(
+          (entityType) => !history.includes(entityType),
+        )
+
+        return
+      }
+
+      for (const [name, format] of features) {
+        draft.features.set(name, format)
+      }
+      draft.retention.push(
+        ...retention.filter((entityType) => !draft.retention.includes(entityType)),
+      )
+      draft.historyDependent.push(
+        ...history.filter((entityType) => !draft.historyDependent.includes(entityType)),
+      )
+    })
+
+    return {...outcome('ok'), delta: Number(declared.version - (before?.version ?? 0n))}
   }
 
   // Commits the step's streams and fences through the repository, as the Go and Rust drivers do,
@@ -891,6 +1146,15 @@ function classify(error: unknown): Outcome {
   if (error instanceof ReservedEntityIdError) {
     return outcome('reserved')
   }
+  if (error instanceof UnsupportedFeatureError) {
+    return outcome('unsupported')
+  }
+  if (error instanceof RetentionConflictError) {
+    return outcome('retentionConflict')
+  }
+  if (error instanceof HistoryDependentProjectionError) {
+    return outcome('historyDependent')
+  }
   if (error instanceof ProjectorOperationError) {
     return {
       ...outcome('projector'),
@@ -908,6 +1172,9 @@ function classify(error: unknown): Outcome {
   }
   if (error instanceof StreamHeadDriftError) {
     return outcome('drift')
+  }
+  if (error instanceof RebuildInProgressError) {
+    return outcome('rebuildInProgress')
   }
   if (isConflict(error)) {
     return outcome('conflict')
@@ -949,7 +1216,8 @@ function metadata(step: JsonValue): Partial<Metadata> {
  */
 export function transactionCommit(base: string, step: JsonValue): TransactionCommit {
   const streams = optionalList(step, 'streams').map((stream): Commit => {
-    const id = streamId(base, optionalString(stream, 'suffix') ?? '')
+    const prefix = optionalString(stream, 'entityPrefix') ?? ''
+    const id = prefix + streamId(base, optionalString(stream, 'suffix') ?? '')
     const first = int(field(stream, 'sequence'))
     const events = list(field(stream, 'events')).map((raw, index) =>
       rawEvent(id, first + BigInt(index), step, rawFields(raw)),
@@ -971,7 +1239,8 @@ export function transactionCommit(base: string, step: JsonValue): TransactionCom
   })
   const fences = optionalList(step, 'fences').map((fence): ReadFence => ({
     entityId: streamId(base, optionalString(fence, 'suffix') ?? ''),
-    entityType: 'account',
+    // A fence names its stream's type when it isn't the account's, with {id} for the scenario's.
+    entityType: (optionalString(fence, 'entityType') ?? 'account').replaceAll('{id}', base),
     head: int(field(fence, 'head')),
     provenance: optionalBoolean(fence, 'callerStamped') ? 'caller' : 'engine',
   }))

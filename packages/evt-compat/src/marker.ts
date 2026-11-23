@@ -1,17 +1,33 @@
-// feature-marker.json: the declarations (the manifest's stored JSON texts and its DynamoDB item,
-// for each declaration of a chain) and the streamHeads requests of the DynamoDB writer. The view
-// commits and the PostgreSQL rows and writes wait for the backends that write them. The
-// postgresSchemas DDL is checked byte for byte, so every language creates the same schema.
+// feature-marker.json: the declarations (the manifest's stored JSON texts, its DynamoDB item and
+// its PostgreSQL row and write, for each declaration of a chain), the commits a writer sends
+// against a declared and a fresh marker, and the streamHeads and commitViews requests of the
+// DynamoDB writer. The postgresSchemas DDL is checked byte for byte, so every language creates the
+// same schema.
 import {
   type Commit,
   type FeatureManifest,
   type JsonValue,
   type SerializedEvent,
   type SerializedSnapshot,
+  decodeMetadata,
   emptyMetadata,
   encodeManifest,
   eventId,
   normalizeTransaction,
+  type ProjectedView,
+  RebuildConflictError,
+  RebuildLeaseLostError,
+  RebuildLockHeldError,
+  RebuildStateInvalidError,
+  type RebuildBeginPlan,
+  type RebuildGeneration,
+  type RebuildLease,
+  type RebuildState,
+  STREAM_HEADS_FEATURE,
+  STREAM_HEADS_VERSION,
+  deleteView,
+  planRebuildBegin,
+  putView,
   viewOperationSize,
 } from '@photon-grove/evt'
 import {
@@ -23,10 +39,24 @@ import {
   manifestFromItem,
   markerItem,
   snapshotTransaction,
+  beginRebuildItems,
+  endRebuildItems,
+  forceReleaseRebuildItems,
+  generationFromItem,
+  generationItem,
+  lockFromItem,
+  lockItem,
+  rebuildGenerationKey,
+  rebuildGuardCheck,
+  rebuildLockKey,
+  renewRebuildUpdate,
   transactionItems,
   transactItemSize,
+  viewActions,
+  viewProjector,
 } from '@photon-grove/evt/dynamodb'
-import {pgTables, schemaDdl} from '@photon-grove/evt/postgres'
+import {MemRepository, controlFixtures} from '@photon-grove/evt/memory'
+import {manifestRow, manifestWrite, pgTables, schemaDdl} from '@photon-grove/evt/postgres'
 
 import {milliseconds} from './codec.js'
 import {stepViews} from './runner.js'
@@ -36,6 +66,8 @@ export async function markerVectors(checks: Checks): Promise<void> {
   const declarations = list(field(await loadFixture('feature-marker.json'), 'declarations'))
   checks.equal('feature-marker declarations present', declarations.length > 0, true)
 
+  // The vectors are one chain of declarations: each declares over the one before.
+  let stored: FeatureManifest | null = null
   for (const vector of declarations) {
     const name = `feature-marker declaration ${str(field(vector, 'name'))}`
     checks.run(name, () => {
@@ -65,8 +97,46 @@ export async function markerVectors(checks: Checks): Promise<void> {
 
       // Decoding the item gives back the manifest as stored: each set sorted and deduplicated.
       checks.equal(`${name} decoded`, canonical(markerItem(manifestFromItem(item))), want)
+
+      // The PostgreSQL row, and the statement that writes it over the chain's previous one, as
+      // Go's repository runs it: the SQL with its whitespace, casts and RETURNING aside.
+      const row = field(output, 'postgresRow')
+      checks.equal(
+        `${name} postgresRow`,
+        canonical(manifestRow(manifest)),
+        canonical({
+          id: num(field(row, 'id')),
+          version: int(field(row, 'version')).toString(),
+          features: str(field(row, 'features')),
+          history_dependent: str(field(row, 'history_dependent')),
+          retention: str(field(row, 'retention')),
+        }),
+      )
+      const write = manifestWrite(pgTables(), stored, manifest)
+      const wantWrite = field(output, 'postgresWrite')
+      checks.equal(
+        `${name} postgresWrite`,
+        canonical({sql: statementShape(write.text), args: write.values}),
+        canonical({
+          sql: statementShape(str(field(wantWrite, 'sql'))),
+          args: list(field(wantWrite, 'args')).map((arg) =>
+            typeof arg === 'string' ? arg : int(arg).toString(),
+          ),
+        }),
+      )
+      stored = manifest
     })
   }
+}
+
+// A statement as Go's and this package's writers both shape it: whitespace collapsed, and without
+// the casts and the RETURNING clause this package adds so that no driver parses a value.
+function statementShape(sql: string): string {
+  return sql
+    .replaceAll('::bigint', '')
+    .replace(/ RETURNING 1$/, '')
+    .replace(/\s+/g, ' ')
+    .trim()
 }
 
 // The streamHeads vectors this package's writers produce: single-stream commits, a transaction
@@ -294,6 +364,87 @@ function normalize(action: TransactItem): unknown {
   return normalized
 }
 
+// The commits vectors: a writer's commit with the per-entity view projector's row, against a store
+// whose manifest a declaration of the chain left, or a fresh one the writer declares stream-heads
+// on before its first commit, whose marker check then conditions on that version.
+export async function commitVectors(checks: Checks): Promise<void> {
+  const fixture = await loadFixture('feature-marker.json')
+  const versions = new Map(
+    list(field(fixture, 'declarations')).map((vector) => [
+      str(field(vector, 'name')),
+      int(field(field(field(vector, 'output'), 'postgresRow'), 'version')),
+    ]),
+  )
+  const vectors = list(field(fixture, 'commits'))
+  checks.equal('feature-marker commits present', vectors.length > 0, true)
+
+  for (const vector of vectors) {
+    const name = `feature-marker commit ${str(field(vector, 'name'))}`
+    checks.run(name, () => {
+      const input = field(vector, 'input')
+      const declaration = str(field(input, 'markerDeclaration'))
+      let version = versions.get(declaration)
+      if (declaration === '') {
+        const declared: FeatureManifest = {
+          version: 1n,
+          features: new Map([[STREAM_HEADS_FEATURE, STREAM_HEADS_VERSION]]),
+          historyDependent: [],
+          retention: [],
+        }
+        checks.equal(
+          `${name} declared`,
+          canonical(markerItem(declared)),
+          canonical(plain(field(vector, 'declared'))),
+        )
+        version = declared.version
+      }
+      if (version === undefined) {
+        throw new Error(`no declaration ${declaration}`)
+      }
+
+      const raw = field(input, 'event')
+      const entityId = str(field(raw, 'entityId'))
+      const entityType = str(field(raw, 'entityType'))
+      const event: SerializedEvent = {
+        id: str(field(raw, 'id')),
+        sequence: int(field(raw, 'sequence')),
+        type: str(field(raw, 'type')),
+        version: num(field(raw, 'version')),
+        entityId,
+        entityType,
+        payload: encoder.encode(str(field(raw, 'payload'))),
+        metadata: decodeMetadata(str(field(raw, 'metadataJson'))),
+      }
+      const group = viewProjector(str(field(input, 'viewsTable'))).project({
+        entityType,
+        entityId,
+        state: null,
+        encodedState: encoder.encode(str(field(input, 'viewState'))),
+        events: [event],
+      })
+      const snapshot = field(input, 'snapshot')
+      const commit: Commit = {
+        entityId,
+        events: [event],
+        projections: group === null ? [] : [group],
+        ...(snapshot !== null && {
+          snapshot: {
+            entityType: str(field(snapshot, 'entityType')),
+            sequence: int(field(snapshot, 'sequence')),
+            payload: encoder.encode(str(field(snapshot, 'payload'))),
+          },
+        }),
+      }
+      const got = commitTransaction(str(field(input, 'eventsTable')), commit, version)
+      checks.equal(
+        name,
+        canonical(got.map(normalize)),
+        canonical(list(field(vector, 'output')).map(plain)),
+      )
+    })
+  }
+}
+
 export async function postgresSchemaVectors(checks: Checks): Promise<void> {
   const schemas = list(field(await loadFixture('feature-marker.json'), 'postgresSchemas'))
   checks.equal('postgres schemas present', schemas.length > 0, true)
@@ -306,4 +457,216 @@ export async function postgresSchemaVectors(checks: Checks): Promise<void> {
       checks.equal(name, schemaDdl(pgTables(events, snapshots)), str(field(vector, 'ddl')))
     })
   }
+}
+
+// The rebuildFence vectors' fixed parts: the clock, the tables, and the batch writeViews writes.
+const FENCE_NOW = 1_790_000_000
+const FENCE_TABLE = 'evt-compat'
+const FENCE_VIEWS_TABLE = 'views'
+const FENCE_BATCH: ProjectedView[] = [
+  {
+    projector: 'rebuild',
+    projectorIndex: 0,
+    operation: 0,
+    op: putView('rebuilt', 'row-1', 'acct-1', 'account', '{"n":1}'),
+  },
+  {
+    projector: 'rebuild',
+    projectorIndex: 0,
+    operation: 1,
+    op: deleteView('rebuilt', 'row-2', 'acct-2'),
+  },
+]
+
+// The rebuildFence vectors, checked as Rust checks them: the requests a DynamoDB repository sends
+// for each operation, from the state the vector seeds, and the operation's result and the fence
+// rows it leaves, on a MemRepository at the same clock.
+export async function rebuildFenceVectors(checks: Checks): Promise<void> {
+  const vectors = list(field(await loadFixture('feature-marker.json'), 'rebuildFence'))
+  checks.equal('feature-marker rebuildFence present', vectors.length, 24)
+
+  // Each vector on a store of its own, one after another.
+  /* oxlint-disable no-await-in-loop */
+  for (const vector of vectors) {
+    const name = `feature-marker rebuildFence ${str(field(vector, 'name'))}`
+    await checks.case(name, async () => {
+      const before = field(vector, 'before')
+      const rows = (part: string) => {
+        const item = field(before, part)
+        return item === null ? null : (plain(item) as Item)
+      }
+      const state: RebuildState = {
+        generation: generationFromItem(rows('generation')),
+        lock: lockFromItem(rows('lock')),
+      }
+      // The seeded rows read back as they were written.
+      checks.equal(`${name} before`, canonical(fenceRows(state)), canonical(plain(before)))
+
+      checks.equal(
+        `${name} calls`,
+        canonical(fenceCalls(vector, state)),
+        canonical(plain(field(vector, 'calls'))),
+      )
+
+      const repository = new MemRepository({clock: () => FENCE_NOW * 1000})
+      controlFixtures(repository).setRebuildState(state)
+      let result: Record<string, unknown>
+      try {
+        result = await fenceOperation(repository, vector)
+      } catch (error) {
+        result = {error: fenceErrorName(error)}
+      }
+      checks.equal(`${name} result`, canonical(result), canonical(plain(field(vector, 'result'))))
+      const after = await repository.rebuildState()
+      checks.equal(
+        `${name} after`,
+        canonical(fenceRows(after)),
+        canonical(plain(field(vector, 'after'))),
+      )
+    })
+  }
+  /* oxlint-enable no-await-in-loop */
+}
+
+// A strongly consistent GetItem of a fence row, as a call the vectors record.
+function fenceGet(key: Item): unknown {
+  return {
+    call: 'GetItem',
+    consistentRead: true,
+    actions: [{operation: 'Get', tableName: FENCE_TABLE, key}],
+  }
+}
+
+// A TransactWriteItems call as the vectors record it.
+function fenceTransact(items: TransactItem[]): unknown {
+  return {call: 'TransactWriteItems', actions: items.map(normalize)}
+}
+
+// A generation as a vector's result records it.
+function generationResult(value: RebuildGeneration): Record<string, unknown> {
+  return {generation: Number(value.value), ...(value.forceReleased && {forceReleased: true})}
+}
+
+// The fence rows as the vectors record them: the generation item and the lock item, or null.
+function fenceRows(state: RebuildState): unknown {
+  return {generation: generationItem(state.generation), lock: lockItem(state)}
+}
+
+// The lease a vector presents: its owner and fencing generation, its expiry irrelevant.
+function fenceLease(vector: JsonValue): RebuildLease {
+  return {
+    owner: str(field(vector, 'owner')),
+    generation: int(field(vector, 'leaseGeneration')),
+    leaseExpiresAt: 0,
+  }
+}
+
+// The calls a DynamoDB repository makes for a vector's operation, from the state it reads.
+function fenceCalls(vector: JsonValue, state: RebuildState): unknown[] {
+  const get = fenceGet
+  const transact = fenceTransact
+  const seconds = () => num(field(vector, 'leaseSeconds'))
+  switch (str(field(vector, 'operation'))) {
+    case 'state':
+      return [get(rebuildGenerationKey()), get(rebuildLockKey())]
+    case 'generation':
+      return [get(rebuildGenerationKey())]
+    case 'begin': {
+      const reads = [get(rebuildGenerationKey()), get(rebuildLockKey())]
+      let plan: RebuildBeginPlan
+      try {
+        plan = planRebuildBegin(state, FENCE_NOW)
+      } catch {
+        return reads
+      }
+      const lease = {
+        owner: str(field(vector, 'owner')),
+        generation: state.generation.value + plan.increment,
+        leaseExpiresAt: FENCE_NOW + seconds(),
+      }
+      return [...reads, transact(beginRebuildItems(FENCE_TABLE, plan, lease, FENCE_NOW))]
+    }
+    case 'renew':
+      return [
+        {
+          call: 'UpdateItem',
+          actions: [
+            normalize({
+              Update: renewRebuildUpdate(FENCE_TABLE, fenceLease(vector), FENCE_NOW + seconds()),
+            }),
+          ],
+        },
+      ]
+    case 'end':
+      return [transact(endRebuildItems(FENCE_TABLE, fenceLease(vector)))]
+    case 'forceRelease': {
+      const read = get(rebuildGenerationKey())
+      if (state.generation.value % 2n === 0n) {
+        return [read]
+      }
+      const owner = str(field(vector, 'owner'))
+      return [read, transact(forceReleaseRebuildItems(FENCE_TABLE, owner, state.generation.value))]
+    }
+    case 'writeViews': {
+      const actions = viewActions(FENCE_BATCH, FENCE_VIEWS_TABLE).map(({action}) => action)
+      return [transact([...actions, rebuildGuardCheck(FENCE_TABLE, fenceLease(vector), FENCE_NOW)])]
+    }
+    default:
+      throw new Error(`unknown rebuild fence operation ${str(field(vector, 'operation'))}`)
+  }
+}
+
+// Runs a vector's operation and returns its result as the vector records it.
+async function fenceOperation(
+  repository: MemRepository,
+  vector: JsonValue,
+): Promise<Record<string, unknown>> {
+  const generation = generationResult
+  const ms = () => num(field(vector, 'leaseSeconds')) * 1000
+  switch (str(field(vector, 'operation'))) {
+    case 'state': {
+      const state = await repository.rebuildState()
+      return {
+        ...generation(state.generation),
+        ...(state.lock && {lockOwner: state.lock.owner, leaseExpiresAt: state.lock.leaseExpiresAt}),
+      }
+    }
+    case 'generation':
+      return generation(await repository.rebuildGeneration())
+    case 'begin': {
+      const lease = await repository.beginRebuild(str(field(vector, 'owner')), ms())
+      return {generation: Number(lease.generation), leaseExpiresAt: lease.leaseExpiresAt}
+    }
+    case 'renew': {
+      const lease = await repository.renewRebuild(fenceLease(vector), ms())
+      return {leaseExpiresAt: lease.leaseExpiresAt}
+    }
+    case 'end':
+      return generation(await repository.endRebuild(fenceLease(vector)))
+    case 'forceRelease':
+      return generation(await repository.forceReleaseRebuild(str(field(vector, 'owner'))))
+    case 'writeViews':
+      await repository.writeRebuildViews(fenceLease(vector), FENCE_BATCH)
+      return {}
+    default:
+      throw new Error(`unknown rebuild fence operation ${str(field(vector, 'operation'))}`)
+  }
+}
+
+// An operation's error as the vectors name it.
+function fenceErrorName(error: unknown): string {
+  if (error instanceof RebuildLockHeldError) {
+    return 'lockHeld'
+  }
+  if (error instanceof RebuildLeaseLostError) {
+    return 'leaseLost'
+  }
+  if (error instanceof RebuildStateInvalidError) {
+    return 'stateInvalid'
+  }
+  if (error instanceof RebuildConflictError) {
+    return 'conflict'
+  }
+
+  return `other: ${error instanceof Error ? error.message : String(error)}`
 }

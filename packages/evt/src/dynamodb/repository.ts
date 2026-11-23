@@ -18,7 +18,11 @@ import {
   HistoryDependentProjectionError,
   IndeterminateError,
   OutcomeConflictError,
+  RebuildBeginIndeterminateError,
+  RebuildConflictError,
   RebuildInProgressError,
+  RebuildLeaseLostError,
+  RebuildStateInvalidError,
   SequenceGapError,
   StoreNotInitializedError,
   StreamHeadDriftError,
@@ -27,6 +31,7 @@ import {
   ProjectorOperationError,
   ViewsNotConfiguredError,
 } from '../errors.js'
+import type {EventLog, StreamFilter} from '../enumerate.js'
 import type {SerializedEvent, SerializedSnapshot} from '../event.js'
 import {
   type FeatureManifest,
@@ -34,9 +39,52 @@ import {
   STREAM_HEADS_VERSION,
   checkSupported,
   declaresStreamHeads,
+  JOURNAL_COMPACTION_FEATURE,
+  JOURNAL_COMPACTION_VERSION,
+  JOURNAL_MARKER,
+  checkJournalWriter,
+  type JournalDeclared,
+  type JournalMarker,
+  declaredAnything,
+  isJournalWriter,
+  journalDeclaration,
+  withJournal,
+  withoutJournal,
+  missingHistoryDependent,
 } from '../features.js'
 import {int64Argument} from '../fields.js'
+import {
+  type CompactionWrite,
+  type CompactionWritten,
+  type Expect,
+  checkCompactionWrites,
+  compactionPartitionKey,
+} from '../journal/compaction.js'
+import {type JournalRow, journalRowFromView, readCounter} from '../journal/row.js'
+import {
+  COUNTER_OWNER,
+  COUNTER_SORT_KEY,
+  counterPartitionKey,
+  parseRowSortKey,
+  rowPartitionKey,
+  rowSortKey,
+} from '../journal/scope.js'
 import {type Outcome, checkCommandId} from '../outcome.js'
+import {type ProjectedView, REASON_CONDITION_FAILED} from '../projection.js'
+import {
+  MAX_REBUILD_BEGIN_ATTEMPTS,
+  type RebuildBeginPlan,
+  type RebuildFence,
+  type RebuildGeneration,
+  type RebuildLease,
+  type RebuildState,
+  checkRebuildOwner,
+  checkRebuildViewBatch,
+  fenceNow,
+  observeRebuildEpoch,
+  planRebuildBegin,
+  rebuildLeaseSeconds,
+} from '../rebuild-fence.js'
 import {
   type CallOptions,
   type Commit,
@@ -67,12 +115,27 @@ import {
 } from './item.js'
 import {FEATURES_PK, manifestFromItem, markerItem} from './marker.js'
 import {OUTCOME_SORT_KEY, outcomeFromItem, outcomeKey} from './outcome.js'
-import {DYNAMODB_BACKEND, transactItemSize} from './views.js'
+import {
+  beginRebuildItems,
+  endRebuildItems,
+  forceReleaseRebuildItems,
+  generationFromItem,
+  lockFromItem,
+  rebuildGenerationKey,
+  rebuildGuardCheck,
+  rebuildLockKey,
+  renewRebuildUpdate,
+} from './rebuild.js'
+import type {ViewRow} from '../views.js'
 import {
   type DynamoViewClient,
   DynamoViewRepository,
   type DynamoViewRepositoryOptions,
+  viewKey,
+  viewRowFromItem,
+  viewRowItem,
 } from './view-repository.js'
+import {DYNAMODB_BACKEND, transactItemSize} from './views.js'
 import {
   type CommitTtl,
   type StreamLayout,
@@ -109,8 +172,8 @@ export interface DynamoRepositoryOptions {
    */
   retention?: Readonly<Record<string, number>> | ReadonlyMap<string, number>
   /**
-   * The clock that stamps `ttl`s and decides which have passed, in Unix milliseconds as
-   * `Date.now` gives them, never seconds. `Date.now` by default.
+   * The clock that stamps `ttl`s and decides which have passed, and that rebuild leases expire by,
+   * in Unix milliseconds as `Date.now` gives them, never seconds. `Date.now` by default.
    */
   clock?: () => number
   /**
@@ -152,7 +215,9 @@ const MAX_SNAPSHOT_GUARD_RETRIES = 4
  * declares a feature, the next write fails, validates the manifest again, and either refuses an
  * unsupported feature or fails once with a retryable {@link FeatureManifestChangedError}.
  */
-export class DynamoRepository implements OutcomeRepository, StoreInitializer {
+export class DynamoRepository
+  implements OutcomeRepository, StoreInitializer, EventLog, RebuildFence
+{
   readonly #client: DynamoClient
   readonly #table: string
   readonly #lazy: boolean
@@ -184,6 +249,11 @@ export class DynamoRepository implements OutcomeRepository, StoreInitializer {
     return true
   }
 
+  /** It applies a view put's expected-payload condition, in its views table. */
+  appliesExpectedPayload(): boolean {
+    return true
+  }
+
   /** The events table this repository writes. */
   get eventsTable(): string {
     return this.#table
@@ -192,20 +262,19 @@ export class DynamoRepository implements OutcomeRepository, StoreInitializer {
   /**
    * A {@link DynamoViewRepository} over this repository's views table and client, so a handler
    * can commit and then read its own rows: point reads and partition listings are strongly
-   * consistent (unless `consistentRead: false`), so they see every row a returned commit wrote.
-   * Refused with a {@link ViewsNotConfiguredError} when no views table is configured, and with a
-   * `TypeError` when the client has no `batchWriteItem` or `batchGetItem` (the AWS SDK's
-   * aggregated `DynamoDB` client has both).
+   * consistent (unless `consistentRead: false`), so they see every row a returned commit wrote,
+   * as with Rust's `DynamoRepository::view_repository`. Refused with a
+   * {@link ViewsNotConfiguredError} when no views table is configured, and with a `TypeError` when
+   * the client has no `batchWriteItem` or `batchGetItem` (the AWS SDK's aggregated `DynamoDB`
+   * client has both).
    */
   viewRepository(options?: DynamoViewRepositoryOptions): DynamoViewRepository {
-    if (this.#viewsTable === undefined || this.#viewsTable === '') {
-      throw new ViewsNotConfiguredError(DYNAMODB_BACKEND)
-    }
+    const table = this.#journalTable()
     if (!isViewClient(this.#client)) {
       throw new TypeError('a view repository needs a client with batchWriteItem and batchGetItem')
     }
 
-    return new DynamoViewRepository(this.#client, this.#viewsTable, options)
+    return new DynamoViewRepository(this.#client, table, options)
   }
 
   /**
@@ -220,7 +289,7 @@ export class DynamoRepository implements OutcomeRepository, StoreInitializer {
     return this.#exclusive(async () => {
       try {
         const manifest = await this.#readManifest(request)
-        checkSupported(manifest)
+        checkSupported(manifest, isJournalWriter(this))
         if (declaresStreamHeads(manifest)) {
           return false
         }
@@ -230,7 +299,7 @@ export class DynamoRepository implements OutcomeRepository, StoreInitializer {
 
         // Another initializer may have declared a feature this package doesn't model.
         const {manifest: declared, wrote} = await this.#declareOnEmptyStore(request)
-        checkSupported(declared)
+        checkSupported(declared, isJournalWriter(this))
 
         return wrote
       } finally {
@@ -238,6 +307,273 @@ export class DynamoRepository implements OutcomeRepository, StoreInitializer {
         this.#validated = null
       }
     })
+  }
+
+  /**
+   * Adds the entity types to the feature manifest's historyDependent set in one conditional
+   * declaration, so compaction refuses them in every process. The store is validated first, as a
+   * write validates it: an uninitialized store is refused (or, initializing lazily, declared) before
+   * anything is declared. Types already declared are left alone, and nothing is written when there
+   * are none to add.
+   */
+  async declareHistoryDependent(types: readonly string[], options?: CallOptions): Promise<void> {
+    options?.signal?.throwIfAborted()
+    const request = requestOptions(options)
+
+    await this.#exclusive(async () => {
+      await this.#validate(true, request)
+      const declared = await this.#declare((draft) => {
+        // Another writer may have declared a feature this package doesn't model since.
+        const stored = {...draft, version: 0n}
+        checkSupported(stored, isJournalWriter(this))
+        const missing = missingHistoryDependent(stored, types)
+        draft.historyDependent.push(...missing)
+
+        return missing.length > 0
+      }, request)
+      if (declared.wrote) {
+        // The declaration moved the version: the next write reads it again.
+        this.#validated = null
+      }
+    })
+  }
+
+  async rebuildGeneration(options?: CallOptions): Promise<RebuildGeneration> {
+    options?.signal?.throwIfAborted()
+
+    return generationFromItem(await this.#controlItem(rebuildGenerationKey(), options))
+  }
+
+  /** The generation, then the lock: two strongly consistent reads, as Go's and Rust's are. */
+  async rebuildState(options?: CallOptions): Promise<RebuildState> {
+    const generation = await this.rebuildGeneration(options)
+    const lock = lockFromItem(await this.#controlItem(rebuildLockKey(), options))
+
+    return {generation, lock}
+  }
+
+  async beginRebuild(owner: string, leaseMs: number, options?: CallOptions): Promise<RebuildLease> {
+    options?.signal?.throwIfAborted()
+    checkRebuildOwner(owner)
+    const seconds = rebuildLeaseSeconds(leaseMs)
+
+    // Each attempt reads what the one before it lost to.
+    let invalid: RebuildStateInvalidError | null = null
+    for (let attempt = 1; attempt <= MAX_REBUILD_BEGIN_ATTEMPTS; attempt++) {
+      const state = await this.rebuildState(options)
+      const now = fenceNow(this.#clock)
+      let plan: RebuildBeginPlan
+      try {
+        plan = planRebuildBegin(state, now)
+      } catch (error) {
+        // The two reads may straddle another rebuild's transition: read again.
+        if (error instanceof RebuildStateInvalidError) {
+          invalid = error
+          continue
+        }
+        throw error
+      }
+      invalid = null
+
+      const lease = {
+        owner,
+        generation: state.generation.value + plan.increment,
+        leaseExpiresAt: now + seconds,
+      }
+      try {
+        await this.#client.transactWriteItems(
+          {TransactItems: beginRebuildItems(this.#table, plan, lease, now)},
+          requestOptions(options),
+        )
+
+        return lease
+      } catch (error) {
+        const codes = cancellationCodes(error)
+        if (
+          codes?.some((code) => code === 'ConditionalCheckFailed' || code === 'TransactionConflict')
+        ) {
+          continue
+        }
+        if (codes === null && !throttled(error) && resultUnknown(error)) {
+          throw new RebuildBeginIndeterminateError(lease, state.generation.value, error)
+        }
+        throw fenceError(error, codes)
+      }
+    }
+
+    throw invalid ?? new RebuildConflictError(MAX_REBUILD_BEGIN_ATTEMPTS)
+  }
+
+  async renewRebuild(
+    lease: RebuildLease,
+    leaseMs: number,
+    options?: CallOptions,
+  ): Promise<RebuildLease> {
+    options?.signal?.throwIfAborted()
+    checkRebuildOwner(lease.owner)
+    const seconds = rebuildLeaseSeconds(leaseMs)
+    const update = this.#client.updateItem
+    if (update === undefined) {
+      throw new EvtError('invalidArgument', 'the DynamoDB client has no updateItem to renew with')
+    }
+
+    const expiresAt = fenceNow(this.#clock) + seconds
+    try {
+      await update.call(
+        this.#client,
+        renewRebuildUpdate(this.#table, lease, expiresAt),
+        requestOptions(options),
+      )
+    } catch (error) {
+      if (isConditionalCheckFailed(error)) {
+        throw new RebuildLeaseLostError(lease.owner)
+      }
+      throw fenceError(error, null)
+    }
+
+    return {...lease, leaseExpiresAt: expiresAt}
+  }
+
+  async endRebuild(lease: RebuildLease, options?: CallOptions): Promise<RebuildGeneration> {
+    options?.signal?.throwIfAborted()
+    checkRebuildOwner(lease.owner)
+    await this.#fenceTransaction(endRebuildItems(this.#table, lease), lease.owner, options)
+
+    return {value: lease.generation + 1n, forceReleased: false}
+  }
+
+  async forceReleaseRebuild(owner: string, options?: CallOptions): Promise<RebuildGeneration> {
+    options?.signal?.throwIfAborted()
+    checkRebuildOwner(owner)
+    const seen = await this.rebuildGeneration(options)
+    if (seen.value % 2n === 0n) {
+      throw new RebuildLeaseLostError(owner)
+    }
+    await this.#fenceTransaction(
+      forceReleaseRebuildItems(this.#table, owner, seen.value),
+      owner,
+      options,
+    )
+
+    return {value: seen.value + 2n, forceReleased: true}
+  }
+
+  /**
+   * Writes the batch to the views table in one transaction whose last action guards the lease. A
+   * lost or expired lease outranks every view's failure.
+   */
+  async writeRebuildViews(
+    lease: RebuildLease,
+    views: readonly ProjectedView[],
+    options?: CallOptions,
+  ): Promise<void> {
+    options?.signal?.throwIfAborted()
+    checkRebuildOwner(lease.owner)
+    checkRebuildViewBatch(views)
+    const actions = viewActions(views, this.#viewsTable)
+    const guard = rebuildGuardCheck(this.#table, lease, fenceNow(this.#clock))
+    try {
+      await this.#client.transactWriteItems(
+        {TransactItems: [...actions.map(({action}) => action), guard]},
+        requestOptions(options),
+      )
+    } catch (error) {
+      const codes = cancellationCodes(error)
+      if (codes !== null) {
+        if (codes[actions.length] === 'ConditionalCheckFailed') {
+          throw new RebuildLeaseLostError(lease.owner)
+        }
+        for (const [index, {view}] of actions.entries()) {
+          const code = codes[index]
+          if (code === REASON_CONDITION_FAILED) {
+            throw new ProjectorOperationError(view, code)
+          }
+          if (code !== undefined && VIEW_REFUSALS.has(code)) {
+            throw new ProjectorOperationError(view, code, error)
+          }
+        }
+      }
+      throw fenceError(error, codes)
+    }
+  }
+
+  // A control row of the fence, read strongly consistent whatever the repository's reads are.
+  async #controlItem(key: Item, options?: CallOptions): Promise<Item | null> {
+    const output = await this.#client.getItem(
+      {TableName: this.#table, Key: key, ConsistentRead: true},
+      requestOptions(options),
+    )
+    const item = output.Item as Item | undefined
+
+    return item && Object.keys(item).length > 0 ? item : null
+  }
+
+  // Ends or force-releases a lease: any failed condition means the caller no longer holds it.
+  async #fenceTransaction(
+    items: TransactItem[],
+    owner: string,
+    options?: CallOptions,
+  ): Promise<void> {
+    try {
+      await this.#client.transactWriteItems({TransactItems: items}, requestOptions(options))
+    } catch (error) {
+      const codes = cancellationCodes(error)
+      if (codes?.includes('ConditionalCheckFailed')) {
+        throw new RebuildLeaseLostError(owner)
+      }
+      throw fenceError(error, codes)
+    }
+  }
+
+  /** A Scan page holds any mix of entities, in no order. */
+  readonly batchesByEntity = false
+
+  /**
+   * The event log, one batch per Scan page of events, in the table's order and not grouped by
+   * entity: an entity's events can span pages. Rows below `sk = 1` (snapshots and head items)
+   * and the reserved namespaces are skipped, and pages the filter empties out aren't yielded.
+   * Reads are strongly consistent unless the repository says otherwise.
+   */
+  async *streamAllEvents(
+    filter?: StreamFilter,
+    options?: CallOptions,
+  ): AsyncGenerator<SerializedEvent[]> {
+    options?.signal?.throwIfAborted()
+    const request = requestOptions(options)
+    for await (const items of this.#enumerate(undefined, filter?.entityType, request)) {
+      const events = items.filter((item) => (sortKey(item) ?? 0n) >= 1n).map(eventFromItem)
+      if (events.length > 0) {
+        yield events
+      }
+    }
+  }
+
+  /**
+   * Each entity's head, folded from a key-only Scan of the whole log: the larger of its highest
+   * event sort key and its snapshot's `eventSeq`. Head items are derived from the log, not part of
+   * it, so they don't count.
+   */
+  async entityHeads(entityType?: string, options?: CallOptions): Promise<Map<string, bigint>> {
+    options?.signal?.throwIfAborted()
+    const request = requestOptions(options)
+    const heads = new Map<string, bigint>()
+    for await (const items of this.#enumerate('pk, sk, eventSeq', entityType, request)) {
+      for (const item of items) {
+        const pk = item['pk']
+        const sk = sortKey(item)
+        if (pk === undefined || !('S' in pk) || sk === undefined || sk < 0n) {
+          continue
+        }
+
+        const seq = item['eventSeq']
+        const head = sk > 0n ? sk : seq !== undefined && 'N' in seq ? BigInt(seq.N) : 0n
+        if (head > (heads.get(pk.S) ?? 0n)) {
+          heads.set(pk.S, head)
+        }
+      }
+    }
+
+    return heads
   }
 
   async commit(commit: Commit, options?: CallOptions): Promise<void> {
@@ -454,6 +790,297 @@ export class DynamoRepository implements OutcomeRepository, StoreInitializer {
     }
   }
 
+  /** A scope's journal counter, read strongly consistently from the views table: 0 when none. */
+  async readCounter(scope: string, options?: CallOptions): Promise<bigint> {
+    options?.signal?.throwIfAborted()
+    const output = await this.#client.getItem(
+      {
+        TableName: this.#journalTable(),
+        Key: viewKey(counterPartitionKey(scope), COUNTER_SORT_KEY),
+        ConsistentRead: true,
+      },
+      requestOptions(options),
+    )
+    const item = output.Item as Item | undefined
+
+    return item === undefined || Object.keys(item).length === 0
+      ? 0n
+      : readCounter(scope, viewRowFromItem(item))
+  }
+
+  /** Several scopes' journal counters, in the order given. */
+  async readCounters(scopes: readonly string[], options?: CallOptions): Promise<bigint[]> {
+    return Promise.all(scopes.map((scope) => this.readCounter(scope, options)))
+  }
+
+  /** The highest position with a journal row in the scope: 0 when it has none. */
+  async readLastPosition(scope: string, options?: CallOptions): Promise<bigint> {
+    options?.signal?.throwIfAborted()
+    const pk = rowPartitionKey(scope)
+    const page = await this.#client.query(
+      {
+        TableName: this.#journalTable(),
+        KeyConditionExpression: 'pk = :pk',
+        ExpressionAttributeValues: {':pk': {S: pk}},
+        ConsistentRead: true,
+        ScanIndexForward: false,
+        Limit: 1,
+      },
+      requestOptions(options),
+    )
+    const item = page.Items?.[0] as Item | undefined
+    if (item === undefined) {
+      return 0n
+    }
+    const row = viewRowFromItem(item)
+    const position = parseRowSortKey(row.sk)
+    if (position === null) {
+      throw new EvtError('invalidRecord', `journal row ${pk}/${row.sk} has no position`)
+    }
+
+    return position
+  }
+
+  /**
+   * Up to `limit` journal rows of the scope above `after`, ascending, with strongly consistent
+   * queries that follow the last evaluated key until they have the rows or reach the end.
+   */
+  async readRows(
+    scope: string,
+    after: bigint,
+    limit: number,
+    options?: CallOptions,
+  ): Promise<JournalRow[]> {
+    options?.signal?.throwIfAborted()
+    const table = this.#journalTable()
+    const request = requestOptions(options)
+    const rows: JournalRow[] = []
+    let start: Item | undefined
+    // Each page continues from the last.
+    while (rows.length < limit) {
+      const page: Page = await this.#client.query(
+        {
+          TableName: table,
+          KeyConditionExpression: 'pk = :pk AND sk > :after',
+          ExpressionAttributeValues: {
+            ':pk': {S: rowPartitionKey(scope)},
+            ':after': {S: rowSortKey(after)},
+          },
+          ConsistentRead: true,
+          Limit: limit - rows.length,
+          ...(start && {ExclusiveStartKey: start}),
+        },
+        request,
+      )
+      for (const item of page.Items ?? []) {
+        rows.push(journalRowFromView(scope, viewRowFromItem(item as Item)))
+      }
+      start = page.LastEvaluatedKey as Item | undefined
+      if (start === undefined) {
+        break
+      }
+    }
+
+    return rows.slice(0, limit)
+  }
+
+  /** The journal's declarations on this store's manifest. Internal. */
+  readonly [JOURNAL_MARKER]: JournalMarker = {
+    declareJournal: (types, options) => {
+      options?.signal?.throwIfAborted()
+      checkJournalWriter(this)
+      const request = requestOptions(options)
+
+      return this.#exclusive(async () => {
+        // Validated as a commit validates it: an uninitialized store is refused before anything is
+        // declared, or, initializing lazily, declared.
+        await this.#validate(true, request)
+        // The feature, then the history, a declaration each.
+        const feature = await this.#declareJournal(types, true, request)
+        const history = await this.#declareJournal(types, false, request)
+
+        return {journal: feature.journal, history: history.history}
+      })
+    },
+    retractJournal: async (declared, options) => {
+      checkJournalWriter(this)
+      if (!declaredAnything(declared)) {
+        return
+      }
+      const request = requestOptions(options)
+      await this.#exclusive(async () => {
+        try {
+          await this.#declare((draft) => {
+            checkSupported({...draft, version: 0n}, isJournalWriter(this))
+            const next = withoutJournal({...draft, version: 0n}, declared)
+            draft.features = new Map(next.features)
+            draft.historyDependent = [...next.historyDependent]
+
+            return true
+          }, request)
+        } finally {
+          this.#validated = null
+        }
+      })
+    },
+    checkCompactionMarker: async (options) => {
+      checkSupported(await this.#readManifest(requestOptions(options)), true)
+    },
+    declareCompaction: async (options) => {
+      const request = requestOptions(options)
+      await this.#exclusive(async () => {
+        const result = await this.#declare((draft) => {
+          const stored = {...draft, version: 0n}
+          checkSupported(stored, true)
+          if (draft.features.get(JOURNAL_COMPACTION_FEATURE) === JOURNAL_COMPACTION_VERSION) {
+            return false
+          }
+          draft.features.set(JOURNAL_COMPACTION_FEATURE, JOURNAL_COMPACTION_VERSION)
+
+          return true
+        }, request)
+        if (result.wrote) {
+          this.#validated = null
+        }
+      })
+    },
+  }
+
+  // Declares the journal feature (`feature`) or the entity types history-dependent, and resolves
+  // to what it wrote. Only a journal writer declares. The caller holds #lock.
+  async #declareJournal(
+    types: readonly string[],
+    feature: boolean,
+    request: RequestOptions,
+  ): Promise<JournalDeclared> {
+    let declared: JournalDeclared = {journal: false, history: []}
+    const result = await this.#declare((draft) => {
+      // Another writer may have declared a feature this package doesn't model since.
+      const stored = {...draft, version: 0n}
+      checkSupported(stored, isJournalWriter(this))
+      const wanted = journalDeclaration(stored, types)
+      declared = feature
+        ? {journal: wanted.journal, history: []}
+        : {journal: false, history: wanted.history}
+      if (!declaredAnything(declared)) {
+        return false
+      }
+      const next = withJournal(stored, declared)
+      draft.features = new Map(next.features)
+      draft.historyDependent = [...next.historyDependent]
+
+      return true
+    }, request)
+    if (!result.wrote) {
+      return {journal: false, history: []}
+    }
+    // The declaration moved the version: the next write reads it again.
+    this.#validated = null
+
+    return declared
+  }
+
+  /** A row of a scope's journal compaction partition, strongly consistent, or null. */
+  async readCompactionRow(
+    scope: string,
+    sk: string,
+    options?: CallOptions,
+  ): Promise<ViewRow | null> {
+    options?.signal?.throwIfAborted()
+    const output = await this.#client.getItem(
+      {
+        TableName: this.#journalTable(),
+        Key: viewKey(compactionPartitionKey(scope), sk),
+        ConsistentRead: true,
+      },
+      requestOptions(options),
+    )
+    const item = output.Item as Item | undefined
+
+    return item === undefined || Object.keys(item).length === 0 ? null : viewRowFromItem(item)
+  }
+
+  /**
+   * One journal compaction transaction: the writes in order, then, with an epoch, a check on the
+   * events table that the rebuild generation still holds it. A failed condition names the write,
+   * or the epoch check; a concurrent transaction or throttling is transient.
+   */
+  async writeCompaction(
+    epoch: bigint | null,
+    writes: readonly CompactionWrite[],
+    options?: CallOptions,
+  ): Promise<CompactionWritten> {
+    options?.signal?.throwIfAborted()
+    checkCompactionWrites(writes)
+    const table = this.#journalTable()
+    const items = writes.map((write) => compactionItem(table, write))
+    if (epoch !== null) {
+      items.push(this.#epochCheck(epoch))
+    }
+
+    try {
+      await this.#client.transactWriteItems({TransactItems: items}, requestOptions(options))
+    } catch (error) {
+      const codes = cancellationCodes(error)
+      if (codes === null) {
+        throw error
+      }
+      if (epoch !== null && codes[writes.length] === CONDITION_FAILED) {
+        return {kind: 'epochChanged'}
+      }
+      const at = codes.slice(0, writes.length).indexOf(CONDITION_FAILED)
+      if (at !== -1) {
+        return {kind: 'refused', at}
+      }
+      if (codes.some((code) => code === 'TransactionConflict' || THROTTLED.has(code))) {
+        throw new TransientError('a journal compaction write met another writer', {cause: error})
+      }
+      throw error
+    }
+
+    return {kind: 'written'}
+  }
+
+  /** The clock journal compaction reads, in whole Unix seconds. */
+  compactionNow(): number {
+    return Math.floor(this.#clock() / 1000)
+  }
+
+  /**
+   * The settled rebuild generation, read strongly consistently from the events table: even, 0
+   * with no generation item. An odd one is a `RebuildUnavailableError`.
+   */
+  observeRebuildEpoch(options?: CallOptions): Promise<bigint> {
+    return observeRebuildEpoch(this, options)
+  }
+
+
+  // The check of a compaction write that the rebuild generation is still `epoch`'s.
+  #epochCheck(epoch: bigint): TransactItem {
+    return {
+      ConditionCheck: {
+        TableName: this.#table,
+        Key: controlKey(REBUILD_GENERATION_PK),
+        ExpressionAttributeNames: {'#value': 'value'},
+        ...(epoch === 0n
+          ? {ConditionExpression: 'attribute_not_exists(#value)'}
+          : {
+              ConditionExpression: '#value = :epoch',
+              ExpressionAttributeValues: {':epoch': {N: epoch.toString()}},
+            }),
+      },
+    }
+  }
+
+  // The views table, which the journal and the view repository need.
+  #journalTable(): string {
+    if (this.#viewsTable === undefined || this.#viewsTable === '') {
+      throw new ViewsNotConfiguredError(DYNAMODB_BACKEND)
+    }
+
+    return this.#viewsTable
+  }
+
   async compactBelow(entityId: string, through: bigint, options?: CallOptions): Promise<number> {
     options?.signal?.throwIfAborted()
     checkNotReserved(entityId)
@@ -510,7 +1137,7 @@ export class DynamoRepository implements OutcomeRepository, StoreInitializer {
     entityId: string,
     snapshot: SerializedSnapshot | null,
   ): TransactItem {
-    checkSupported(manifest)
+    checkSupported(manifest, isJournalWriter(this))
     if (manifest === null || !declaresStreamHeads(manifest)) {
       throw this.#lazy ? new StreamHeadsNotMigratedError() : new StoreNotInitializedError()
     }
@@ -601,7 +1228,7 @@ export class DynamoRepository implements OutcomeRepository, StoreInitializer {
     }
 
     let manifest = await this.#readManifest(request)
-    checkSupported(manifest)
+    checkSupported(manifest, isJournalWriter(this))
     if (!declaresStreamHeads(manifest)) {
       if (!this.#lazy) {
         throw new StoreNotInitializedError()
@@ -615,7 +1242,7 @@ export class DynamoRepository implements OutcomeRepository, StoreInitializer {
 
       // Another writer may have declared a feature this package doesn't model.
       const declared = await this.#declareOnEmptyStore(request)
-      checkSupported(declared.manifest)
+      checkSupported(declared.manifest, isJournalWriter(this))
       manifest = declared.manifest
     }
 
@@ -676,9 +1303,13 @@ export class DynamoRepository implements OutcomeRepository, StoreInitializer {
       // transient, like throttling, and never a conflict, as in Go and Rust.
       const colliding = codes.indexOf('TransactionConflict')
       if (colliding !== -1) {
+        // A conflict on the outcome put names another attempt of the same command, still
+        // committing: the store polls its row briefly instead of reading it once.
+        const outcomeRow =
+          layout.outcome !== null && codes[layout.outcome] === 'TransactionConflict'
         return new TransientError(
           `transaction conflict on ${entityAt(layout, colliding)}: another writer was committing at the same time`,
-          {cause: error, transactionConflict: true},
+          {cause: error, transactionConflict: true, outcomeRow},
         )
       }
       if (codes.some((code) => THROTTLED.has(code))) {
@@ -1079,6 +1710,39 @@ export class DynamoRepository implements OutcomeRepository, StoreInitializer {
     return false
   }
 
+  // The pages of a Scan of the log outside the reserved namespaces, narrowed to an entity type.
+  async *#enumerate(
+    projection: string | undefined,
+    entityType: string | undefined,
+    request: RequestOptions,
+  ): AsyncGenerator<Item[]> {
+    const values: Item = {':system': {S: 'SYSTEM#'}, ':outcome': {S: 'command-outcome#'}}
+    let filter = 'NOT begins_with(pk, :system) AND NOT begins_with(pk, :outcome)'
+    if (entityType !== undefined) {
+      filter += ' AND entityType = :et'
+      values[':et'] = {S: entityType}
+    }
+
+    let start: Item | undefined
+    do {
+      // Checked between pages too, so a client that ignores the signal still stops.
+      request.abortSignal?.throwIfAborted()
+      const page: Page = await this.#client.scan(
+        {
+          TableName: this.#table,
+          ConsistentRead: this.#consistentRead,
+          FilterExpression: filter,
+          ExpressionAttributeValues: values,
+          ...(projection !== undefined && {ProjectionExpression: projection}),
+          ...(start && {ExclusiveStartKey: start}),
+        },
+        request,
+      )
+      yield ((page.Items ?? []) as Item[]).filter((item) => !reservedItem(item))
+      start = page.LastEvaluatedKey as Item | undefined
+    } while (start !== undefined)
+  }
+
   async *#scan(projection: string, request: RequestOptions): AsyncGenerator<Item[]> {
     let start: Item | undefined
     do {
@@ -1296,12 +1960,107 @@ function resultUnknown(error: unknown): boolean {
   return typeof status !== 'number' || status < 400 || status >= 500
 }
 
+// The SDK errors of a throttled request: a refusal that didn't apply, which a retry may pass.
+const THROTTLED_NAMES = new Set([
+  'ThrottlingException',
+  'ProvisionedThroughputExceededException',
+  'RequestLimitExceeded',
+])
+
+function throttled(error: unknown): boolean {
+  const name = typeof error === 'object' && error !== null ? (error as {name?: unknown}).name : null
+
+  return typeof name === 'string' && THROTTLED_NAMES.has(name)
+}
+
+// A fence request's failure that isn't the lease's: transient when DynamoDB throttled it or a
+// transaction conflicted, as Go and Rust classify it, and otherwise the error itself.
+function fenceError(error: unknown, codes: string[] | null): unknown {
+  const transient =
+    throttled(error) ||
+    (codes?.some((code) => code === 'TransactionConflict' || THROTTLED.has(code)) ?? false)
+
+  return transient
+    ? new TransientError('the rebuild fence request was throttled or conflicted', {cause: error})
+    : error
+}
+
 function isConditionalCheckFailed(error: unknown): boolean {
   return isNamed(error, 'ConditionalCheckFailedException')
 }
 
 function isNamed(error: unknown, name: string): boolean {
   return typeof error === 'object' && error !== null && (error as {name?: unknown}).name === name
+}
+
+// The rebuild fence's generation item, on the events table.
+const REBUILD_GENERATION_PK = 'SYSTEM#REBUILD#GENERATION'
+
+// The conditions of a compaction write that expects a row: absent, or the engine's exact payload.
+const COMPACTION_ABSENT = 'attribute_not_exists(pk)'
+const COMPACTION_PAYLOAD = 'entityID = :engine AND payload = :expected'
+const COMPACTION_DELETE = 'attribute_not_exists(pk) OR entityID = :owner'
+const compactionDecoder = new TextDecoder('utf-8', {fatal: true, ignoreBOM: true})
+
+// A compaction write's condition on what it expects at its key.
+function expected(
+  expect: Expect,
+): {ConditionExpression?: string; ExpressionAttributeValues?: Item} {
+  switch (expect.kind) {
+    case 'any':
+      return {}
+    case 'absent':
+      return {ConditionExpression: COMPACTION_ABSENT}
+    case 'payload':
+      return {
+        ConditionExpression: COMPACTION_PAYLOAD,
+        ExpressionAttributeValues: {
+          ':expected': {S: payloadText(expect.payload)},
+          ':engine': {S: COUNTER_OWNER},
+        },
+      }
+  }
+}
+
+// The transaction action of one compaction write.
+function compactionItem(table: string, write: CompactionWrite): TransactItem {
+  switch (write.kind) {
+    case 'put':
+      return {Put: {TableName: table, Item: viewRowItem(write.row), ...expected(write.expect)}}
+    case 'delete':
+      return {
+        Delete: {
+          TableName: table,
+          Key: viewKey(write.pk, write.sk),
+          ConditionExpression: COMPACTION_DELETE,
+          ExpressionAttributeValues: {':owner': {S: write.owner}},
+        },
+      }
+    case 'check': {
+      const condition = expected(write.expect)
+
+      return {
+        ConditionCheck: {
+          TableName: table,
+          Key: viewKey(write.pk, write.sk),
+          // A check needs a condition; `any` checks that the key is a key.
+          ConditionExpression:
+            condition.ConditionExpression ?? 'attribute_not_exists(pk) OR attribute_exists(pk)',
+          ...(condition.ExpressionAttributeValues && {
+            ExpressionAttributeValues: condition.ExpressionAttributeValues,
+          }),
+        },
+      }
+    }
+  }
+}
+
+function payloadText(payload: Uint8Array): string {
+  try {
+    return compactionDecoder.decode(payload)
+  } catch {
+    throw new EvtError('invalidArgument', 'a compaction payload must be UTF-8')
+  }
 }
 
 // Whether a repository's client also makes the batch calls a view repository needs.

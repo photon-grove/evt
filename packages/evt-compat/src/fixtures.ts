@@ -2,7 +2,15 @@
 // adds the vectors for what it builds.
 import {codecVectors} from './codec.js'
 import {Checks} from './harness.js'
-import {commitViewVectors, headVectors, markerVectors, postgresSchemaVectors} from './marker.js'
+import {journalVectors} from './journal.js'
+import {
+  commitVectors,
+  commitViewVectors,
+  headVectors,
+  markerVectors,
+  postgresSchemaVectors,
+  rebuildFenceVectors,
+} from './marker.js'
 import {outcomeVectors} from './outcomes.js'
 import {scenarioChecks} from './scenarios.js'
 import {viewVectors} from './views.js'
@@ -20,10 +28,13 @@ checks.equal('@photon-grove/evt/postgres loads', typeof postgres, 'object')
 await codecVectors(checks)
 await markerVectors(checks)
 await headVectors(checks)
+await commitVectors(checks)
+await rebuildFenceVectors(checks)
 await commitViewVectors(checks)
 await postgresSchemaVectors(checks)
 await outcomeVectors(checks)
 await scenarioChecks(checks)
 await viewVectors(checks)
+await journalVectors(checks)
 
 checks.report()

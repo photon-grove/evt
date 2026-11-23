@@ -14,6 +14,7 @@ import {
   StoreNotInitializedError,
   StreamHeadDriftError,
   StreamHeadsNotMigratedError,
+  UnsupportedFeatureError,
   ViewsNotConfiguredError,
   emptyMetadata,
   eventId,
@@ -25,21 +26,22 @@ import {
   type Item,
   eventItem,
   headFromItem,
-  manifestFromItem,
-  markerItem,
   ttlFromItem,
   viewProjector,
 } from '@photon-grove/evt/dynamodb'
 
-import {
-  type ControlFixtures,
-  type HeadFixtures,
-  type ManifestDraft,
-  type RebuildState,
-  conformance,
-  markerConformance,
-} from './conformance.js'
+import {type HeadFixtures, conformance, markerConformance} from './conformance.js'
+import {Journal, JournalRepository} from '@photon-grove/evt/journal'
+
+import {TestClock, compactionConformance} from './compaction-conformance.js'
+import {dynamoControls} from './controls.js'
 import {Checks, canonical} from './harness.js'
+import {
+  type JournalRebuildTarget,
+  journalConformance,
+  journalRebuildConformance,
+  journalStoreCases,
+} from './journal-conformance.js'
 import {committedViewConformance, viewRepositoryConformance} from './view-conformance.js'
 
 // Only a local emulator: a loopback address or a .localhost name.
@@ -83,12 +85,14 @@ try {
   // The marker cases declare store-wide, so they get a table of their own, and they take
   // stream-heads away, which only a lazily initializing writer reports as unmigrated.
   const lazy = new DynamoRepository(client, marked, {lazyInitialization: true})
-  await markerConformance(checks, lazy, controlFixtures(marked))
+  await markerConformance(checks, lazy, dynamoControls(client, marked))
 
   await initialization(created)
   await retention(created)
   await views(created)
   await viewRepository(created)
+  await journal(created)
+  await compaction(created)
 } finally {
   await Promise.all(created.map(deleteTable))
 }
@@ -160,7 +164,7 @@ async function initialization(tables: string[]): Promise<void> {
     await repo.initialize()
     await repo.commit({entityId: 'a', events: [ledgerEvent('a', 1)]})
 
-    await controlFixtures(table).declare((draft) => draft.retention.push('session'))
+    await dynamoControls(client, table).declare((draft) => draft.retention.push('session'))
     await refuses(
       repo.commit({entityId: 'a', events: [ledgerEvent('a', 2)]}),
       FeatureManifestChangedError,
@@ -407,7 +411,7 @@ function snapshot(entityId: string, eventSequence: bigint) {
 }
 
 async function manifestOf(table: string): Promise<FeatureManifest | null> {
-  return controlFixtures(table).manifest()
+  return dynamoControls(client, table).manifest()
 }
 
 function ensure(condition: boolean, what: string): asserts condition {
@@ -434,6 +438,95 @@ async function refuses(
 }
 
 // An events table, whose sort key is the event sequence, or a views table, whose sort key is text.
+// The journal's cases, on an initialized store whose journal rows go to its own views table, and
+// the fresh-store cases on tables of their own.
+async function journal(tables: string[]): Promise<void> {
+  const table = await freshTable(tables)
+  const viewsTable = `evt-ts-journal-views-${run}`
+  await createTable(viewsTable, 'S')
+  tables.push(viewsTable)
+  await new DynamoRepository(client, table).initialize()
+
+  const reader = new DynamoViewRepository(client, viewsTable)
+  const journalTarget: JournalRebuildTarget = {
+    repo: new DynamoRepository(client, table, {viewsTable}),
+    manifest: async () => dynamoControls(client, table).manifest(),
+    views: {
+      getViewAt: (pk, sk) => reader.getViewAt(pk, sk),
+      putView: (row) => reader.putView(row),
+      deleteView: (pk, sk) => reader.deleteView(pk, sk),
+      listViewsByPk: (pk) => reader.listViewsByPk(pk),
+    },
+    handle: () => new DynamoRepository(client, table, {viewsTable}),
+  }
+  await journalConformance(checks, journalTarget)
+  // The rebuild cases take the store-wide rebuild lock: after the others, on the same store.
+  await journalRebuildConformance(checks, journalTarget)
+  await checks.case(
+    'dynamodb journal: a strict writer refuses an uninitialized store before declaring',
+    async () => {
+      const fresh = await freshTable(tables)
+      const strict = new DynamoRepository(client, fresh, {viewsTable})
+      const journaled = new JournalRepository(
+        strict,
+        new Journal(['ledger'], (event) => [`ledger:${event.entityId}`]),
+      )
+      await refuses(
+        journaled.commit({entityId: 'a', events: [ledgerEvent('a', 1)]}),
+        StoreNotInitializedError,
+        'a journaled commit',
+      )
+      ensure((await manifestOf(fresh)) === null, 'the refusal declared nothing')
+    },
+  )
+  await journalStoreCases(checks, async () => {
+    const fresh = await freshTable(tables)
+
+    // Lazy, so an empty store validates and the cases decide its refusals.
+    return {
+      repo: new DynamoRepository(client, fresh, {viewsTable, lazyInitialization: true}),
+      manifest: async () => dynamoControls(client, fresh).manifest(),
+    }
+  })
+}
+
+// The journal compaction cases, on an initialized table and views table of their own: they declare
+// store-wide and set the rebuild fence. The repository's clock is the cases', which they move.
+async function compaction(tables: string[]): Promise<void> {
+  const table = await freshTable(tables)
+  const viewsTable = `evt-ts-compaction-views-${run}`
+  await createTable(viewsTable, 'S')
+  tables.push(viewsTable)
+  await new DynamoRepository(client, table).initialize()
+
+  const clock = new TestClock(Date.now())
+  const repo = new DynamoRepository(client, table, {viewsTable, clock: clock.now})
+  const reader = new DynamoViewRepository(client, viewsTable)
+  const controls = dynamoControls(client, table)
+  await compactionConformance(checks, {
+    repo,
+    clock,
+    views: {
+      getViewAt: (pk, sk) => reader.getViewAt(pk, sk),
+      putView: (row) => reader.putView(row),
+      deleteView: (pk, sk) => reader.deleteView(pk, sk),
+    },
+    manifest: async () => controls.manifest(),
+    declare: async (change) => {
+      await controls.declare(change)
+      // The repository caches the manifest it validated: have it read the new one now, as its
+      // next write would, so that write doesn't fail once. A manifest it refuses stays refused.
+      try {
+        await repo.initialize()
+      } catch (error) {
+        if (!(error instanceof UnsupportedFeatureError)) {
+          throw error
+        }
+      }
+    },
+  })
+}
+
 async function createTable(name: string, sortKey: 'N' | 'S' = 'N'): Promise<void> {
   await client.createTable({
     TableName: name,
@@ -474,69 +567,6 @@ function headFixtures(table: string): HeadFixtures {
       })
 
       return item ? headFromItem(item as Item).head : null
-    },
-  }
-}
-
-function controlFixtures(table: string): ControlFixtures {
-  const manifest = async (): Promise<FeatureManifest | null> => {
-    const {Item: item} = await client.getItem({
-      TableName: table,
-      Key: key('SYSTEM#FEATURES', 0n),
-      ConsistentRead: true,
-    })
-
-    return item ? manifestFromItem(item as Item) : null
-  }
-
-  return {
-    manifest,
-    async declare(change: (draft: ManifestDraft) => void) {
-      const stored = await manifest()
-      const draft: ManifestDraft = {
-        features: new Map(stored?.features),
-        historyDependent: [...(stored?.historyDependent ?? [])],
-        retention: [...(stored?.retention ?? [])],
-      }
-      change(draft)
-
-      const next = {...draft, version: (stored?.version ?? 0n) + 1n}
-      await client.putItem({
-        TableName: table,
-        Item: markerItem(next),
-        ...(stored
-          ? {
-              ConditionExpression: 'version = :observed',
-              ExpressionAttributeValues: {':observed': {N: stored.version.toString()}},
-            }
-          : {ConditionExpression: 'attribute_not_exists(pk)'}),
-      })
-
-      // Read back as stored: each set sorted and deduplicated.
-      return (await manifest())!
-    },
-    async setRebuild(state: RebuildState) {
-      await client.putItem({
-        TableName: table,
-        Item: {...key('SYSTEM#REBUILD#GENERATION', 0n), value: {N: state.generation.toString()}},
-      })
-
-      const lock = key('SYSTEM#REBUILD', 0n)
-      if (state.lock === null) {
-        await client.deleteItem({TableName: table, Key: lock})
-      } else if (state.lock === 'held') {
-        await client.putItem({
-          TableName: table,
-          Item: {
-            ...lock,
-            owner: {S: 'conformance'},
-            generation: {N: state.generation.toString()},
-            leaseExpiresAt: {N: String(Math.floor(Date.now() / 1000) + 300)},
-          },
-        })
-      } else {
-        await client.putItem({TableName: table, Item: {...lock, forceReleased: {BOOL: true}}})
-      }
     },
   }
 }

@@ -26,6 +26,13 @@ import {
 } from './command.js'
 import {commitIds} from './commit-id.js'
 import {
+  type EnumeratedEntity,
+  type EventLog,
+  type StreamFilter,
+  foldEntities,
+  isEventLog,
+} from './enumerate.js'
+import {
   DuplicateCommandError,
   EvtError,
   OutcomePrincipalMismatchError,
@@ -54,6 +61,7 @@ import {
   type Repository,
   type TransactionalRepository,
   checkNotReserved,
+  commitWithReceipt,
 } from './repository.js'
 import {
   DEFAULT_RETRY_POLICY,
@@ -62,8 +70,17 @@ import {
   retryDelay,
   sleep,
 } from './retry.js'
-import {commitSnapshot, projectCommit, projectStreams, serializeEvents} from './staging.js'
+import {
+  type HistoryLedger,
+  commitSnapshot,
+  declareHistory,
+  projectCommit,
+  projectStreams,
+  serializeEvents,
+} from './staging.js'
+import {JournalRowTooLargeError} from './journal/config.js'
 import type {CommitProjector, ProjectedView} from './projection.js'
+import {compareUtf8} from './utf8.js'
 import {
   type ReadFailures,
   Transaction,
@@ -100,8 +117,10 @@ export interface StoreOptions {
   /**
    * The commit-wide projectors, whose view operations every commit that writes events carries,
    * in this order. The repository must write views, as every one this package ships does (the
-   * DynamoDB one with a views table). Only current-state projectors run for now: one that names
-   * a `history` is refused.
+   * DynamoDB one with a views table, the PostgreSQL one with a view writer). A history-dependent
+   * projector's entity types are declared in the store's feature manifest once, before the first
+   * commit that runs it, so the repository must declare them too, as every one this package ships
+   * does.
    */
   commitProjectors?: readonly CommitProjector[] | undefined
 }
@@ -156,6 +175,8 @@ export class Store {
   readonly #commitId: () => string
   readonly #outcomes: OutcomeConfig | null
   readonly #commitProjectors: readonly CommitProjector[]
+  // The entity types this store's history-dependent projectors read, once declared.
+  readonly #history: HistoryLedger = {declared: new Set(), inflight: null}
 
   constructor(repository: Repository, options: StoreOptions = {}) {
     const interval = options.snapshotInterval ?? DEFAULT_SNAPSHOT_INTERVAL
@@ -223,6 +244,69 @@ export class Store {
   }
 
   /**
+   * Every entity of the aggregate's type folded from the event log alone, as Rust's
+   * `stream_entities` does, for rebuilds and diagnostics: a stream whose early events were
+   * compacted fails with a `SequenceGapError` instead of loading (Go's folds what's left), which
+   * {@link streamEntitiesFromSnapshots} avoids. `filter.entityType` names another type whose
+   * events fold into this aggregate, after a rename say. An entity that fails to fold is yielded
+   * as an error, and a backend failure rejects the iteration. The repository must enumerate its
+   * log ({@link EventLog}), or the call fails with `invalidArgument`.
+   */
+  async *streamEntities<S, C, D extends EventDefinitions>(
+    aggregate: Aggregate<S, C, D>,
+    filter: StreamFilter = {},
+    options: CallOptions = {},
+  ): AsyncGenerator<EnumeratedEntity<S>> {
+    const log = this.#eventLog()
+    const entityType = filter.entityType ?? aggregate.type
+    yield* foldEntities(aggregate, log, {entityType}, options)
+  }
+
+  /**
+   * Every entity of the aggregate's type, each loaded as {@link load} loads it: from its latest
+   * snapshot and the events after it, so a compacted stream loads (Go's
+   * `StreamEntitiesFromSnapshots`, Rust's `stream_entities_from_snapshots`). The entities are the
+   * entity heads', by ID bytes. An entity that fails to load is yielded as an error.
+   */
+  async *streamEntitiesFromSnapshots<S, C, D extends EventDefinitions>(
+    aggregate: Aggregate<S, C, D>,
+    filter: StreamFilter = {},
+    options: CallOptions = {},
+  ): AsyncGenerator<EnumeratedEntity<S>> {
+    const log = this.#eventLog()
+    const heads = await log.entityHeads(filter.entityType ?? aggregate.type, options)
+    const ids = [...heads.keys()]
+    ids.sort(compareUtf8)
+    // One entity at a time, so memory holds one.
+    /* oxlint-disable no-await-in-loop */
+    for (const entityId of ids) {
+      let loaded: Loaded<S>
+      try {
+        loaded = await this.load(aggregate, entityId, options)
+      } catch (error) {
+        options.signal?.throwIfAborted()
+        yield {ok: false, entityId, error}
+        continue
+      }
+      yield {ok: true, entityId, loaded}
+    }
+    /* oxlint-enable no-await-in-loop */
+  }
+
+  // The repository as an event log, or a refusal.
+  #eventLog(): Repository & EventLog {
+    const repository = this.repository
+    if (!isEventLog(repository)) {
+      throw new EvtError(
+        'invalidArgument',
+        `repository ${repository.constructor.name || 'repository'} does not enumerate its log`,
+      )
+    }
+
+    return repository
+  }
+
+  /**
    * Loads the aggregate, runs the command, and commits its events, with a snapshot when the
    * commit reaches the snapshot interval, and the aggregate's projector operations. A snapshot
    * whose item is over the per-item commit budget is left out, so the commit still succeeds and
@@ -269,9 +353,14 @@ export class Store {
       decision.events,
       metadata,
     )
-    await this.repository.commit({entityId, events, snapshot, projections, views}, options)
+    await this.#declareHistory(options)
+    const receipt = await commitWithReceipt(
+      this.repository,
+      {entityId, events, snapshot, projections, views},
+      options,
+    )
 
-    return {kind: 'committed', state, events}
+    return {kind: 'committed', state, events: [...receipt.events]}
   }
 
   /**
@@ -370,6 +459,11 @@ export class Store {
       if (attempt.kind === 'done') {
         return attempt.outcome
       }
+      // A journal row over its cap refuses this command, not the store: it's recorded as the
+      // command's rejection, so a replay of the command ID gets the same answer.
+      if (attempt.error instanceof JournalRowTooLargeError) {
+        return persistRejection(repository, pending, config, attempt.error.toRejection(), options)
+      }
 
       const kind = retryKind(attempt.error, attempt.phase)
       if (kind === 'never') {
@@ -449,8 +543,14 @@ export class Store {
       metadata: (partial) => this.#metadata(partial),
       outcomes: this.#outcomes,
       commitProjectors: this.#commitProjectors,
+      declareHistory: (options) => this.#declareHistory(options),
       ...extra,
     })
+  }
+
+  // Declares the history-dependent projectors' entity types before a commit that runs them.
+  #declareHistory(options?: CallOptions): Promise<void> {
+    return declareHistory(this.#commitProjectors, this.repository, this.#history, options)
   }
 
   /**
@@ -507,6 +607,11 @@ export class Store {
       const attempt = await this.#attemptWithOutcome(aggregate, entityId, command, pending, options)
       if (attempt.kind === 'done') {
         return attempt.outcome
+      }
+      // A journal row over its cap refuses this command, not the store: it's recorded as the
+      // command's rejection, so a replay of the command ID gets the same answer.
+      if (attempt.error instanceof JournalRowTooLargeError) {
+        return persistRejection(repository, pending, config, attempt.error.toRejection(), options)
       }
 
       const kind = retryKind(attempt.error, attempt.phase)
@@ -649,14 +754,19 @@ export class Store {
       return failed(error, 'internal')
     }
 
+    // Declared before the commit is sent, so a failed declaration is the command's own error and
+    // never settled as the commit's.
+    if (commit.events.length > 0) {
+      try {
+        await this.#declareHistory(options)
+      } catch (error) {
+        return failed(error, 'internal')
+      }
+    }
+
     try {
-      const outcome = await recordCommit(
-        repository,
-        pending,
-        config,
-        commit.outcome!,
-        commit.events,
-        () => repository.commit(commit, options),
+      const outcome = await recordCommit(repository, pending, config, commit.outcome!, () =>
+        commitWithReceipt(repository, commit, options),
       )
       return {kind: 'done', outcome}
     } catch (error) {

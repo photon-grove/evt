@@ -125,9 +125,10 @@ describe('followSystemTheme', () => {
 })
 
 describe('initialLang', () => {
-  it('defaults to Rust and keeps a saved Go pick', () => {
+  it('defaults to Rust and keeps a saved Go or TypeScript pick', () => {
     expect(initialLang(memoryStore())).toBe('rust')
     expect(initialLang(memoryStore({[LANG_KEY]: 'go'}))).toBe('go')
+    expect(initialLang(memoryStore({[LANG_KEY]: 'ts'}))).toBe('ts')
     expect(initialLang(memoryStore({[LANG_KEY]: 'python'}))).toBe('rust')
     expect(initialLang(blockedStore)).toBe('rust')
   })

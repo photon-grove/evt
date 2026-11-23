@@ -16,6 +16,7 @@ import {
   CompactionUncoveredError,
   ConflictError,
   EvtError,
+  type CommitProjector,
   type FeatureManifest,
   FeatureManifestChangedError,
   FenceConflictError,
@@ -26,9 +27,15 @@ import {
   OutcomeConflictError,
   type OutcomeRepository,
   ProjectorOnlyCommitError,
+  ProjectionRebuild,
   ProjectorOperationError,
   type ProjectedView,
   RebuildInProgressError,
+  type RebuildFence,
+  RebuildLeaseLostError,
+  RebuildLockHeldError,
+  RebuildUnavailableError,
+  ViewsNotConfiguredError,
   type ReadFence,
   type Repository,
   ReservedEntityIdError,
@@ -46,6 +53,11 @@ import {
   StreamHeadsNotMigratedError,
   UnsupportedFeatureError,
   type ViewOperation,
+  type EventLog,
+  type StreamFilter,
+  compareUtf8,
+  commitTransactionWithReceipt,
+  commitWithReceipt,
   defineAggregate,
   defineEvents,
   deleteView,
@@ -54,6 +66,10 @@ import {
   eventId,
   json,
   isConflict,
+  isEventLog,
+  isRebuildFence,
+  isReserved,
+  observeRebuildEpoch,
   putView,
   isRetryable,
 } from '@photon-grove/evt'
@@ -114,6 +130,10 @@ export async function conformance(
       ['a transaction built wrong is refused before any write', () => invalidTransactions(repo)],
       ['a transaction budgets its fences', () => transactionBudget(repo)],
       ['a store transaction fences what it reads and writes once', () => storeTransaction(repo)],
+      [
+        "a commit's receipt is its events as stored, on every path that hands them back",
+        () => commitReceipts(repo),
+      ],
     )
     if (fixtures) {
       cases.push([
@@ -124,6 +144,24 @@ export async function conformance(
   }
   if (repo.writesViews?.() === true) {
     cases.push(['views commit with their events, each conditioned on its owner', () => views(repo)])
+  }
+  if (isEventLog(repo)) {
+    cases.push(
+      [
+        'enumeration yields every stream, by type, and never an engine row',
+        () => enumeration(repo),
+      ],
+      [
+        'entity heads cover compaction, and seeded enumeration loads a compacted stream',
+        () => entityHeads(repo),
+      ],
+    )
+  }
+  if (repo.appliesExpectedPayload?.() === true) {
+    cases.push([
+      'an expected payload replaces exactly the row the commit read',
+      () => expectedPayload(repo),
+    ])
   }
   if (recordsOutcomes(repo)) {
     cases.push(
@@ -156,6 +194,13 @@ export async function conformance(
     )
   }
 
+  // Last: it takes the store-wide rebuild lock, which a failure after a write would keep.
+  if (isRebuildFence(repo) && isEventLog(repo) && repo.writesViews?.() === true) {
+    cases.push([
+      'a projection rebuild writes the rows its projectors derive from the log, and settles',
+      () => projectionRebuild(repo),
+    ])
+  }
   for (const [name, run] of cases) {
     await checks.case(`conformance: ${name}`, run)
   }
@@ -876,6 +921,307 @@ async function views(repo: Repository): Promise<void> {
   )
 }
 
+// A small rebuild end to end: a current-state projector over every registered stream, one of them
+// compacted and seeded from its snapshot, and a history projector replaying another type. It takes
+// the store-wide rebuild lock, so it runs only where no other suite writes at the same time, and
+// leaves the fence settled.
+async function projectionRebuild(repo: Repository & EventLog & RebuildFence): Promise<void> {
+  const ns = namespace()
+  const [a, b, c] = [new Stream(ns, 'a'), new Stream(ns, 'b'), new Stream(ns, 'c', 'order')]
+  await a.commit(repo, a.events(1, 2), a.newSnapshot(1, '{"total":3}'))
+  await a.commit(repo, a.events(3, 3))
+  ensureEqual(await repo.compactBelow(a.id, 2n), 2, 'the compaction below the snapshot')
+  await b.commit(repo, b.events(1, 1))
+  await c.commit(repo, c.events(1, 2))
+
+  const totals = `${ns}-totals`
+  const history = `${ns}-history`
+  const current: CommitProjector = {
+    name: 'totals',
+    project: (commit) =>
+      commit.streams.map((stream) =>
+        putView(totals, stream.entityId, stream.entityId, stream.entityType, stream.state),
+      ),
+  }
+  const replayed: CommitProjector = {
+    name: 'history',
+    history: [c.entityType],
+    project: (commit) =>
+      commit.streams.map((stream) =>
+        putView(
+          history,
+          stream.entityId,
+          stream.entityId,
+          stream.entityType,
+          `{"events":${stream.events.length},"state":${new TextDecoder().decode(stream.state)}}`,
+        ),
+      ),
+  }
+
+  const before = await repo.rebuildGeneration()
+  ensure(before.value % 2n === 0n, 'the fence is settled before the rebuild')
+  const report = await new ProjectionRebuild(repo, {
+    projectors: [current, replayed],
+    aggregates: [ledger(ns), {aggregate: ledger(ns), entityType: c.entityType}],
+  }).run(`${ns}-rebuild`, 60_000)
+  ensureEqual(
+    report,
+    {
+      entities: 3,
+      commits: 2,
+      puts: 4,
+      deletes: 0,
+      batches: 1,
+      events: 2,
+      journalRows: 0,
+      journalCounters: 0,
+    },
+    'the rebuild report',
+  )
+  ensureEqual(
+    await repo.rebuildGeneration(),
+    {value: before.value + 2n, forceReleased: false},
+    'the rebuild settled the generation',
+  )
+
+  // The in-memory repository reads its rows back.
+  const reader = repo as Partial<{view(pk: string, sk: string): {payload: Uint8Array} | null}>
+  if (typeof reader.view === 'function') {
+    const rows: [string, string, string][] = [
+      [totals, a.id, '{"total":6}'],
+      [totals, b.id, '{"total":1}'],
+      [totals, c.id, '{"total":3}'],
+      [history, c.id, '{"events":1,"state":{"total":3}}'],
+    ]
+    for (const [pk, sk, payload] of rows) {
+      const row = reader.view(pk, sk)
+      ensureEqual(row && new TextDecoder().decode(row.payload), payload, `the row ${pk}/${sk}`)
+    }
+  }
+
+  // On every backend the rows exist as their streams': another stream's write to one is refused,
+  // and the owner's own commit passes, since the fence is settled.
+  await expectError(
+    repo.commit({
+      entityId: b.id,
+      events: [b.event(2, 1)],
+      views: [handle(putView(totals, a.id, b.id, b.entityType, '{}'))],
+    }),
+    'an overwrite of a rebuilt row by another stream',
+    (error) => error instanceof ProjectorOperationError,
+  )
+  await repo.commit({
+    entityId: a.id,
+    events: [a.event(4, 4)],
+    views: [handle(putView(totals, a.id, a.id, a.entityType, '{"total":10}'))],
+  })
+}
+
+// Every batch the log yields, narrowed to the namespace's streams, checking that no batch is empty
+// and none holds an engine row, and that a log that batches by entity yields one entity a batch.
+async function enumerated(
+  repo: Repository & EventLog,
+  ns: string,
+  filter?: StreamFilter,
+): Promise<SerializedEvent[]> {
+  const events: SerializedEvent[] = []
+  for await (const batch of repo.streamAllEvents(filter)) {
+    ensure(batch.length > 0, 'an empty batch')
+    for (const event of batch) {
+      ensure(!isReserved(event.entityId), `an engine row ${event.entityId} was enumerated`)
+    }
+    if (repo.batchesByEntity) {
+      ensure(new Set(batch.map((event) => event.entityId)).size === 1, 'a batch of two entities')
+      const sequences = batch.map((event) => event.sequence)
+      const ascending = [...sequences]
+      ascending.sort((a, b) => (a < b ? -1 : 1))
+      ensureEqual(sequences, ascending, 'a batch out of order')
+    }
+    events.push(...batch.filter((event) => event.entityId.startsWith(`${ns}-`)))
+  }
+  events.sort((a, b) =>
+    a.entityId === b.entityId
+      ? a.sequence < b.sequence
+        ? -1
+        : 1
+      : compareUtf8(a.entityId, b.entityId),
+  )
+
+  return events
+}
+
+async function enumeration(repo: Repository & EventLog): Promise<void> {
+  const ns = namespace()
+  const a = new Stream(ns, 'a')
+  const b = new Stream(ns, 'b', 'other')
+  await a.commit(repo, a.events(1, 3))
+  await b.commit(repo, b.events(1, 2), b.newSnapshot(1, '{}'))
+  if (recordsOutcomes(repo)) {
+    // An outcome-only commit writes a row in the reserved namespace and no event.
+    await repo.commitTransaction({streams: [], fences: [], outcome: outcome(`${ns}-cmd`)})
+  }
+
+  const all = await enumerated(repo, ns)
+  ensureEqual(
+    all.map((event) => `${event.entityId}:${event.sequence}`),
+    [`${a.id}:1`, `${a.id}:2`, `${a.id}:3`, `${b.id}:1`, `${b.id}:2`],
+    'every event, and never a snapshot',
+  )
+  ensureEqual(all, [...a.events(1, 3), ...b.events(1, 2)], 'the events as stored')
+
+  const typed = await enumerated(repo, ns, {entityType: b.entityType})
+  ensureEqual(typed, b.events(1, 2), 'the events of one type')
+  ensureEqual(await enumerated(repo, ns, {entityType: `${ns}-none`}), [], 'a type with no events')
+}
+
+async function entityHeads(repo: Repository & EventLog): Promise<void> {
+  const ns = namespace()
+  const plain = new Stream(ns, 'plain')
+  const compacted = new Stream(ns, 'compacted')
+  const other = new Stream(ns, 'other', 'other')
+  await plain.commit(repo, plain.events(1, 2))
+  await compacted.commit(repo, compacted.events(1, 3), compacted.newSnapshot(1, '{"total":6}'))
+  await compacted.commit(repo, compacted.events(4, 4))
+  ensureEqual(await repo.compactBelow(compacted.id, 2n), 2, 'the stream compacts below 3')
+  const emptied = new Stream(ns, 'emptied')
+  await emptied.commit(repo, emptied.events(1, 2), emptied.newSnapshot(1, '{"total":3}'))
+  ensureEqual(await repo.compactBelow(emptied.id, 2n), 2, 'the stream compacts whole')
+  await other.commit(repo, other.events(1, 1))
+
+  const mine = (heads: Map<string, bigint>) => {
+    const entries = [...heads].filter(([id]) => id.startsWith(`${ns}-`))
+    entries.sort(([x], [y]) => compareUtf8(x, y))
+
+    return entries
+  }
+  for (const [id] of await repo.entityHeads()) {
+    ensure(!isReserved(id), `entity heads yielded the engine row ${id}`)
+  }
+  ensureEqual(
+    mine(await repo.entityHeads()),
+    [
+      [compacted.id, 4n],
+      [emptied.id, 2n],
+      [other.id, 1n],
+      [plain.id, 2n],
+    ],
+    "each entity's head, a compacted one's from what its snapshot covers",
+  )
+  ensureEqual(
+    mine(await repo.entityHeads(plain.entityType)),
+    [
+      [compacted.id, 4n],
+      [emptied.id, 2n],
+      [plain.id, 2n],
+    ],
+    'the heads of one type',
+  )
+
+  // Seeded enumeration loads the compacted stream from its snapshot; folding the log can't.
+  const store = new Store(repo)
+  const aggregate = ledger(ns)
+  const seeded = []
+  for await (const entity of store.streamEntitiesFromSnapshots(aggregate)) {
+    seeded.push(entity)
+  }
+  ensureEqual(
+    seeded.map((entity) => (entity.ok ? [entity.entityId, entity.loaded.state.total] : null)),
+    [
+      [compacted.id, 10],
+      [emptied.id, 3],
+      [plain.id, 3],
+    ],
+    'each entity loaded from its snapshot and the events after it',
+  )
+  const folded = new Map<string, unknown>()
+  for await (const entity of store.streamEntities(aggregate)) {
+    if (entity.entityId.startsWith(`${ns}-`)) {
+      folded.set(entity.entityId, entity.ok ? entity.loaded.state.total : entity.error)
+    }
+  }
+  ensureEqual(folded.get(plain.id), 3, 'a stream folded from its events')
+  ensure(folded.get(compacted.id) instanceof SequenceGapError, 'a compacted stream fails to fold')
+  ensure(!folded.has(emptied.id), 'a stream with no events left has nothing to fold')
+}
+
+// The engine's compare-and-set put, the journal's counter: it replaces the owner's row only while
+// that row holds exactly the expected bytes, and a failed expectation writes nothing. Each step's
+// success shows what the step before it stored.
+async function expectedPayload(repo: Repository): Promise<void> {
+  const ns = namespace()
+  const [owner, other] = [new Stream(ns, 'owner'), new Stream(ns, 'other')]
+  const pk = `${ns}-counter`
+  const put = (stream: Stream, payload: string, expected?: string): ProjectedView => {
+    const op = putView(pk, 'COUNTER', stream.id, 'journal-counter', payload, {
+      condition: expected === undefined ? 'absent' : 'none',
+    })
+    return expected === undefined
+      ? {projector: 'counter', projectorIndex: 0, operation: 0, op}
+      : expecting(op, encoder.encode(expected))
+  }
+  const commit = (stream: Stream, sequence: number, view: ProjectedView) =>
+    repo.commit({entityId: stream.id, events: [stream.event(sequence, 1)], views: [view]})
+
+  // The first counter is claimed with an absent put, as when the commit read none.
+  await commit(owner, 1, put(owner, '{"n":1}'))
+  // Expecting what is stored replaces it.
+  await commit(owner, 2, put(owner, '{"n":2}', '{"n":1}'))
+  // A stale expectation fails, and writes nothing.
+  await expectError(
+    commit(owner, 3, put(owner, '{"n":3}', '{"n":1}')),
+    'a stale payload',
+    conditionFailed,
+  )
+  ensureEqual((await repo.events(owner.id)).length, 2, 'the failed commit wrote no event')
+  await commit(owner, 3, put(owner, '{"n":3}', '{"n":2}'))
+
+  // Another stream cannot replace the row, even with the right payload.
+  await expectError(
+    commit(other, 1, put(other, '{"n":4}', '{"n":3}')),
+    'another owner',
+    conditionFailed,
+  )
+  // An expectation on a row that is not there fails.
+  const missing = put(owner, '{}', '{}')
+  await expectError(
+    commit(owner, 4, {...missing, op: {...missing.op, pk: `${ns}-missing`}}),
+    'an absent row',
+    conditionFailed,
+  )
+
+  // Built wrong, it's refused before any write.
+  const body = encoder.encode('{}')
+  for (const [what, view] of [
+    [
+      'with the absent condition',
+      expecting(putView(pk, 'x', owner.id, 't', '{}', {condition: 'absent'}), body),
+    ],
+    ['on a delete', expecting(deleteView(pk, 'x', owner.id), body)],
+    ['not UTF-8', expecting(putView(pk, 'x', owner.id, 't', '{}'), new Uint8Array([0xff]))],
+  ] as const) {
+    await expectError(
+      commit(owner, 4, view),
+      `an expected payload ${what}`,
+      coded('invalidViewOperation'),
+    )
+  }
+  ensureEqual((await repo.events(owner.id)).length, 3, 'the refused commits wrote no event')
+}
+
+function conditionFailed(error: unknown): boolean {
+  return error instanceof ProjectorOperationError && error.reason === 'ConditionalCheckFailed'
+}
+
+// A view operation of the `counter` projector that expects the stored payload.
+function expecting(op: ViewOperation, expected: Uint8Array): ProjectedView {
+  return {
+    projector: 'counter',
+    projectorIndex: 0,
+    operation: 0,
+    op: {...op, expectedPayload: expected},
+  }
+}
+
 // A view operation of the `handles` projector.
 function handle(op: ViewOperation, operation = 0): ProjectedView {
   return {projector: 'handles', projectorIndex: 0, operation, op}
@@ -954,6 +1300,89 @@ async function storeTransaction(repo: TransactionalRepository): Promise<void> {
   )
   ensure(!isRetryable(caller), "a caller's fence conflict isn't retryable")
   ensureEqual((await repo.events(b)).length, 2, 'the stale commit wrote nothing to b')
+}
+
+// A commit's receipt is the events as stored: through the receipt helpers, which use the
+// repository's own receipt methods when it has them, and through every store and transaction path
+// that hands events back. Events compare as Rust's metadata does, by effective causation ID, which
+// a backend that stores the encoded JSON reads back filled in.
+async function commitReceipts(repo: TransactionalRepository): Promise<void> {
+  const ns = namespace()
+  const [a, b] = [new Stream(ns, 'a'), new Stream(ns, 'b')]
+
+  let receipt = await commitWithReceipt(repo, {entityId: a.id, events: a.events(1, 2)})
+  ensureEqual(receipt.events, await repo.events(a.id), 'a single-stream receipt')
+
+  // Given in the opposite order, returned in persisted order: entity ID bytes, then sequence.
+  receipt = await commitTransactionWithReceipt(repo, {
+    streams: [
+      {entityId: b.id, events: b.events(1, 1)},
+      {entityId: a.id, events: a.events(3, 3)},
+    ],
+  })
+  ensureEqual(
+    receipt.events,
+    [...(await repo.eventsAfter(a.id, 2n)), ...(await repo.events(b.id))],
+    'a multi-stream receipt',
+  )
+
+  // An empty commit stores nothing and returns nothing.
+  receipt = await commitTransactionWithReceipt(repo, {streams: []})
+  ensureEqual(receipt.events, [], "an empty transaction's receipt")
+
+  const type = outcomeLedger(ns)
+  const store = new Store(repo, {snapshotInterval: 0})
+  const [first, second] = [`${ns}-first`, `${ns}-second`]
+  const executed = await store.execute(type, first, {type: 'add', amount: 5})
+  ensure(executed.kind === 'committed', 'execute commits')
+  ensureEqual(
+    executed.kind === 'committed' ? executed.events : null,
+    await repo.events(first),
+    'Store.execute',
+  )
+
+  const tx = store.transaction()
+  const one = await tx.read(type, second)
+  const two = await tx.read(type, first)
+  tx.append(one, [added(1)]).append(two, [added(2)])
+  const committed = await tx.commit()
+  ensure(committed.kind === 'committed', 'the transaction commits')
+  ensureEqual(
+    committed.kind === 'committed' ? committed.events : null,
+    [...(await repo.eventsAfter(first, 1n)), ...(await repo.events(second))],
+    'Transaction.commit',
+  )
+
+  if (recordsOutcomes(repo)) {
+    const outcomes = outcomeStore(repo)
+    const recorded = await outcomes.executeWithOutcome(
+      type,
+      second,
+      {type: 'add', amount: 3},
+      {metadata: {commandId: `${ns}-receipt`}},
+    )
+    ensureEqual(
+      effective(recorded.events),
+      effective(await repo.eventsAfter(second, 1n)),
+      'Store.executeWithOutcome',
+    )
+    ensureEqual(
+      recorded.outcome.eventIds,
+      recorded.events.map((event) => event.id),
+      "the outcome lists the receipt's event IDs",
+    )
+  }
+}
+
+// Events with the causation ID the encoder writes: the one set, otherwise the command ID.
+function effective(events: readonly SerializedEvent[]): SerializedEvent[] {
+  return events.map((event) => ({
+    ...event,
+    metadata: {
+      ...event.metadata,
+      causationId: event.metadata.causationId ?? event.metadata.commandId,
+    },
+  }))
 }
 
 function fenceConflict(error: unknown, entityId: string, provenance: string): boolean {
@@ -1865,6 +2294,10 @@ export async function markerConformance(
       'the durable historyDependent set refuses compaction',
       () => historyDependentRefusal(repo, controls),
     ],
+    [
+      'declaring history-dependent types adds the missing ones in one declaration',
+      () => historyDeclaration(repo, controls),
+    ],
     ['the retention set is stored sorted and deduplicated', () => retentionSet(repo, controls)],
     ['a fence on a retained entity type is refused', () => fenceRetention(repo, controls)],
     [
@@ -1876,6 +2309,12 @@ export async function markerConformance(
       () => controlRanking(repo, controls),
     ],
   ]
+  if (isRebuildFence(repo)) {
+    cases.push([
+      "a rebuild's lease fences commits and its own writes until it ends or is force-released",
+      () => rebuildLifecycle(repo, controls),
+    ])
+  }
 
   try {
     for (const [name, check] of cases) {
@@ -2052,6 +2491,148 @@ async function historyDependentRefusal(
 
   await controls.declare(streamHeadsOnly)
   ensureEqual(await repo.compactBelow(audited.id, 3n), 3, 'the type compacts once removed')
+}
+
+async function historyDeclaration(
+  repo: Repository & StoreInitializer,
+  controls: ControlFixtures,
+): Promise<void> {
+  const declare = repo.declareHistoryDependent?.bind(repo)
+  if (declare === undefined) {
+    throw new Failure('the repository declares no history-dependent types')
+  }
+
+  const ns = namespace()
+  const audited = new Stream(ns, 'audited', `${ns}-audit`)
+  await settled(() => audited.commit(repo, audited.events(1, 2), audited.newSnapshot(1, '{}')))
+
+  const before = (await controls.manifest())!
+  await declare([`${ns}-z`, audited.entityType, `${ns}-z`])
+  const declared = (await controls.manifest())!
+  ensureEqual(declared.version, before.version + 1n, 'one declaration')
+  ensureEqual(
+    declared.historyDependent,
+    [audited.entityType, `${ns}-z`],
+    'the set, sorted and deduplicated',
+  )
+
+  // Declaring them again writes nothing, and the writer goes on writing.
+  await declare([audited.entityType])
+  ensureEqual((await controls.manifest())!.version, declared.version, 'no second declaration')
+  await settled(() => audited.commit(repo, audited.events(3, 3)))
+  await expectError(
+    repo.compactBelow(audited.id, 2n),
+    'compacting a declared type',
+    (error) => error instanceof HistoryDependentProjectionError,
+  )
+
+  // A store that declares a feature this package doesn't model refuses the declaration.
+  await controls.declare((draft) => draft.features.set('compat-unsupported', 1))
+  await expectError(
+    declare([`${ns}-y`]),
+    'a declaration on a store with an unsupported feature',
+    (error) => error instanceof UnsupportedFeatureError,
+  )
+  ensure(!(await controls.manifest())!.historyDependent.includes(`${ns}-y`), 'nothing declared')
+
+  await controls.declare(streamHeadsOnly)
+}
+
+async function rebuildLifecycle(
+  repo: Repository & StoreInitializer & RebuildFence,
+  controls: ControlFixtures,
+): Promise<void> {
+  await controls.setRebuild({generation: 0n, lock: null})
+  const ns = namespace()
+  const stream = new Stream(ns, 'a')
+  await settled(() => stream.commit(repo, stream.events(1, 1)))
+  const owner = `${ns}-rebuild`
+  ensureEqual(await observeRebuildEpoch(repo), 0n, 'the epoch before any rebuild')
+
+  // Taking the lock moves the generation to odd and refuses commits and a second taker.
+  const lease = await repo.beginRebuild(owner, 60_000)
+  ensureEqual(lease.generation, 1n, "the lease's fencing generation")
+  ensureEqual((await repo.rebuildState()).lock?.owner, owner, 'the lock names its owner')
+  await expectError(
+    stream.commit(repo, stream.events(2, 2)),
+    'a commit during the rebuild',
+    (error) => error instanceof RebuildInProgressError,
+  )
+  await expectError(
+    repo.beginRebuild(`${ns}-other`, 60_000),
+    'a second rebuild',
+    (error) => error instanceof RebuildLockHeldError && error.owner === owner,
+  )
+  await expectError(
+    observeRebuildEpoch(repo),
+    'reading derived state during the rebuild',
+    (error) => error instanceof RebuildUnavailableError && error.generation === 1n,
+  )
+
+  // The holder renews and writes; a stale lease can do neither.
+  const renewed = await repo.renewRebuild(lease, 120_000)
+  ensure(renewed.leaseExpiresAt >= lease.leaseExpiresAt, 'a renewal extends the lease')
+  const staleLease = {...lease, generation: lease.generation + 2n}
+  await expectError(
+    repo.renewRebuild(staleLease, 60_000),
+    'renewing a stale lease',
+    (error) => error instanceof RebuildLeaseLostError,
+  )
+  // A repository with nowhere to write views refuses a guarded write before it checks the lease.
+  {
+    const row = (sk: string) => [
+      {
+        projector: 'rebuild',
+        projectorIndex: 0,
+        operation: 0,
+        op: putView(`${ns}-rebuilt`, sk, stream.id, stream.entityType, '{"n":1}'),
+      },
+    ]
+    const configured = await repo.writeRebuildViews(renewed, row('one')).then(
+      () => true,
+      (error: unknown) => {
+        if (error instanceof ViewsNotConfiguredError) {
+          return false
+        }
+        throw error
+      },
+    )
+    if (configured) {
+      await expectError(
+        repo.writeRebuildViews(staleLease, row('two')),
+        'a guarded write under a stale lease',
+        (error) => error instanceof RebuildLeaseLostError,
+      )
+    }
+  }
+
+  // Ending it settles the generation, and commits pass again.
+  ensureEqual(await repo.endRebuild(renewed), {value: 2n, forceReleased: false}, 'the end')
+  await expectError(
+    repo.endRebuild(renewed),
+    'ending it twice',
+    (error) => error instanceof RebuildLeaseLostError,
+  )
+  ensureEqual(await observeRebuildEpoch(repo), 2n, 'the settled epoch')
+  await settled(() => stream.commit(repo, stream.events(2, 2)))
+
+  // A force-release ends the lease and leaves the generation odd, so commits stay refused until
+  // a rebuild begins from it and ends.
+  await repo.beginRebuild(owner, 60_000)
+  ensureEqual(
+    await repo.forceReleaseRebuild(owner),
+    {value: 5n, forceReleased: true},
+    'the force-release',
+  )
+  await expectError(
+    stream.commit(repo, stream.events(3, 3)),
+    'a commit after a force-release',
+    (error) => error instanceof RebuildInProgressError,
+  )
+  const settler = await repo.beginRebuild(`${ns}-settle`, 60_000)
+  ensureEqual(settler.generation, 7n, 'a rebuild begins from the force-released generation')
+  ensureEqual(await repo.endRebuild(settler), {value: 8n, forceReleased: false}, 'and settles it')
+  await settled(() => stream.commit(repo, stream.events(3, 3)))
 }
 
 async function retentionSet(

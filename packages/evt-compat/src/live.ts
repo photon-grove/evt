@@ -1,21 +1,29 @@
 // The TypeScript driver of the cross-language run (scripts/compat-integration.sh, ADR 0009):
 //
-//   live.js scenarios
-//   live.js step   --backend dynamo|postgres --run RUN --index N --as go|rust
+//   live.js scenarios --backend dynamo|postgres
+//   live.js exclusive --backend dynamo|postgres
+//   live.js step   --backend dynamo|postgres --run RUN --index N --as go|rust [--only NAME]
 //   live.js verify --backend dynamo|postgres --run RUN
+//   live.js enumerate --backend dynamo|postgres --run RUN
 //
 // TypeScript joins the run as a stand-in. step executes step N of every scenario TypeScript
 // supports whose writer is the language --as names, and stamps that language's name into the
-// event's origin and commit ID, so the streams match the fixtures byte for byte. In such a pass
+// event's origin and commit ID, so the streams match the fixtures byte for byte. An exclusive
+// scenario holds store-wide state across its steps (a declared feature refuses every other
+// scenario's commits), so step skips it unless --only names it, which runs that scenario alone;
+// exclusive lists the exclusive scenarios TypeScript supports. In such a pass
 // the other language's driver writes its own steps of the same scenarios, limited to the list
 // scenarios prints (-scenarios or --scenarios). verify checks the streams of the supported
 // scenarios against the golden fixtures: the events and snapshot read through the repository, the
 // loaded state and the head, and what the backend stores: the raw DynamoDB items and the SNS
-// messages they publish, or the PostgreSQL event and snapshot rows.
+// messages they publish, or the PostgreSQL event and snapshot rows, and the view rows commit-wide
+// projectors wrote.
+//
+// enumerate prints every event of the run the event log yields, unfiltered and narrowed to the
+// account type, as the Go and Rust drivers print them, so the script diffs the three.
 //
 // It runs against a local DynamoDB emulator, such as Moto, at AWS_ENDPOINT_URL, never real AWS,
 // or a local PostgreSQL server at DATABASE_URL, in the default tables the Go and Rust drivers use.
-// TypeScript has no event-log enumeration yet, so it doesn't join the enumeration check.
 
 // Each step needs the one before it, so the driver awaits in loops on purpose.
 /* oxlint-disable no-await-in-loop */
@@ -34,6 +42,8 @@ import {
   encodeMetadata,
   encodeSnapshot,
   compareUtf8,
+  isEventLog,
+  isRebuildFence,
   parseJson,
 } from '@photon-grove/evt'
 import {
@@ -62,14 +72,18 @@ import {
   type Observed,
   Runner,
   SUPPORTED_SCENARIOS,
-  UNSUPPORTED_ON,
+  type MarkerDriver,
+  type RebuildDriver,
   checkScenario,
   checkStep,
   compareObserved,
   compareStream,
   expectedOutcome,
+  isExclusive,
   optionalList,
 } from './runner.js'
+import {dynamoControls, postgresControls} from './controls.js'
+import {POSTGRES_VIEW_TABLE, postgresViewDdl, postgresViewWriter} from './pgviews.js'
 import {viewPartitions} from './scenarios.js'
 
 const WRITERS = ['go', 'rust']
@@ -80,6 +94,7 @@ interface Args {
   run: string
   index: number
   as: string
+  only: string
 }
 
 /** A backend the run writes, and how to read a stream back as it stores it. */
@@ -87,14 +102,24 @@ interface Backend {
   readonly repository: Repository
   /** Appends an event to the log without maintaining the stream's head. */
   bypassHead(event: SerializedEvent): Promise<void>
+  /** Declares on the store's feature manifest, as another writer would. */
+  readonly marker: MarkerDriver
+  /** Counts the view rows of a partition, for a rebuild's guarded writes. */
+  viewRows(pk: string): Promise<number>
   observe(runner: Runner, id: string): Promise<Observed>
   /** Compares what the backend stores for a stream beyond what `observe` reads. */
   checkRows(checks: Checks, name: string, id: string, expected: JsonValue): Promise<void>
   /**
-   * The view rows of `partitions` whose key names `base`, as the fixtures record them, by
-   * partition and then sort key bytes.
+   * Compares the view rows of `partitions` whose key names `base` with the fixture's, which
+   * records them as DynamoDB items.
    */
-  views(partitions: readonly string[], base: string): Promise<unknown[]>
+  checkViews(
+    checks: Checks,
+    name: string,
+    partitions: readonly string[],
+    base: string,
+    expected: readonly JsonValue[],
+  ): Promise<void>
   /** Compares a command's stored outcome row with its fixture's DynamoDB item. */
   checkOutcome(checks: Checks, name: string, commandId: string, expected: JsonValue): Promise<void>
   close(): Promise<void>
@@ -104,6 +129,12 @@ const cli = parseArgs(process.argv.slice(2))
 
 if (cli.command === 'scenarios') {
   console.log(scenarioNames(cli.backend).join(','))
+} else if (cli.command === 'exclusive') {
+  for (const scenario of await supportedScenarios(cli.backend)) {
+    if (isExclusive(scenario)) {
+      console.log(str(field(scenario, 'name')))
+    }
+  }
 } else {
   if (cli.run === '') {
     throw new Error('--run is required')
@@ -124,6 +155,10 @@ if (cli.command === 'scenarios') {
       case 'verify':
         await verify(checks, backend, cli.backend, cli.run)
         break
+      case 'enumerate':
+        await enumerate(backend, cli.run)
+        quiet = true
+        break
       default:
         throw new Error(`unknown command ${cli.command}`)
     }
@@ -139,10 +174,10 @@ if (cli.command === 'scenarios') {
 function parseArgs(argv: string[]): Args {
   const [command, ...flags] = argv
   if (command === undefined) {
-    throw new Error('missing command: scenarios | step | verify')
+    throw new Error('missing command: scenarios | exclusive | step | verify | enumerate')
   }
 
-  const parsed: Args = {command, backend: '', run: '', index: 0, as: ''}
+  const parsed: Args = {command, backend: '', run: '', index: 0, as: '', only: ''}
   for (let i = 0; i < flags.length; i += 2) {
     const flag = flags[i]
     const value = flags[i + 1]
@@ -159,6 +194,9 @@ function parseArgs(argv: string[]): Args {
         break
       case '--as':
         parsed.as = value
+        break
+      case '--only':
+        parsed.only = value
         break
       case '--index':
         if (!/^\d+$/.test(value)) {
@@ -219,6 +257,10 @@ function dynamoBackend(): Backend {
 
   return {
     repository,
+    marker: dynamoControls(client, table),
+    async viewRows(pk) {
+      return (await partition(client, viewsTable, pk)).length
+    },
     // The event item alone, with none of the head update a commit carries, as Go's driver puts it.
     async bypassHead(event) {
       await client.putItem({
@@ -245,19 +287,15 @@ function dynamoBackend(): Backend {
     },
     // The items are compared with the stream itself.
     async checkRows() {},
-    async views(partitions, base) {
+    async checkViews(checks, name, partitions, base, expected) {
       const rows: unknown[] = []
       for (const pk of partitions) {
         const items = await partition(client, viewsTable, pk)
-        const owned = items.filter((item) => {
-          const sk = item['sk'] !== undefined && 'S' in item['sk'] ? item['sk'].S : ''
-          return pk.includes(base) || sk.includes(base)
-        })
+        const owned = items.filter((item) => ownsViewRow(base, pk, textOf(item['sk'])))
         owned.sort((a, b) => compareUtf8(textOf(a['sk']), textOf(b['sk'])))
         rows.push(...owned.map((item) => ({pk, sk: textOf(item['sk']), dynamoItem: item})))
       }
-
-      return rows
+      checks.equal(`${name}: views`, canonical(rows), canonical(expected.map(plain)))
     },
     async checkOutcome(checks, name, commandId, expected) {
       const items = await partition(client, table, outcomeKey(commandId))
@@ -277,10 +315,12 @@ async function postgresBackend(): Promise<Backend> {
     'PostgreSQL server',
   )
   const pool = new Pool({connectionString: url, max: 2})
-  const repository = new PgRepository(pool)
+  // The view writer the Go and Rust drivers use, on the view table they create.
+  const repository = new PgRepository(pool, {viewWriter: postgresViewWriter()})
   try {
     // As the Go and Rust drivers do: whichever language writes first creates the schema.
     await repository.ensureSchema()
+    await pool.query(postgresViewDdl())
   } catch (error) {
     await pool.end()
     throw error
@@ -288,6 +328,14 @@ async function postgresBackend(): Promise<Backend> {
 
   return {
     repository,
+    marker: postgresControls(pool, repository.tables.events),
+    async viewRows(pk) {
+      const {rows} = await pool.query<{count: string}>(
+        `SELECT count(*)::text AS count FROM ${POSTGRES_VIEW_TABLE} WHERE pk = $1`,
+        [pk],
+      )
+      return Number(rows[0]?.count ?? 0)
+    },
     // The event row alone, leaving the stream's head row as it was, as Go's driver inserts it.
     async bypassHead(event) {
       await pool.query(
@@ -320,9 +368,36 @@ async function postgresBackend(): Promise<Backend> {
         head: rows[0] === undefined ? null : BigInt(rows[0].head),
       }
     },
-    // TypeScript doesn't write PostgreSQL views yet, so no scenario it runs here has any.
-    async views() {
-      return []
+    // The rows as the neutral five columns, against the fixture items', as Go's driver compares
+    // them.
+    async checkViews(checks, name, partitions, base, expected) {
+      const {rows} = await pool.query<Record<string, string>>(
+        'SELECT pk, sk, entity_id, entity_type, payload FROM ' +
+          `${POSTGRES_VIEW_TABLE} WHERE pk = ANY($1)`,
+        [partitions],
+      )
+      const got = rows
+        .filter((row) => ownsViewRow(base, row['pk']!, row['sk']!))
+        .map((row) => ({
+          pk: row['pk']!,
+          sk: row['sk']!,
+          entityId: row['entity_id']!,
+          entityType: row['entity_type']!,
+          payload: row['payload']!,
+        }))
+      const want = expected.map((view) => {
+        const item = field(view, 'dynamoItem')
+        const attribute = (key: string) => str(field(field(item, key), 'S'))
+
+        return {
+          pk: attribute('pk'),
+          sk: attribute('sk'),
+          entityId: attribute('entityID'),
+          entityType: attribute('entityType'),
+          payload: attribute('payload'),
+        }
+      })
+      checks.equal(`${name}: views`, canonical(byKey(got)), canonical(byKey(want)))
     },
     // The event and snapshot rows as stored, as the Go driver compares them: each event's
     // metadata as JSON, since jsonb normalizes its text.
@@ -413,11 +488,13 @@ function jsonColumn(text: string | null | undefined): unknown {
   return text === null || text === undefined ? null : plain(parseJson(text))
 }
 
-// The scenarios TypeScript supports on a backend: every one, less what the backend can't run yet.
+// The scenarios TypeScript supports, which it runs on every backend.
 function scenarioNames(backend: string): string[] {
-  const unsupported = UNSUPPORTED_ON[backend] ?? []
+  if (!['dynamo', 'postgres'].includes(backend)) {
+    throw new Error(`--backend must be dynamo or postgres, not ${backend || '-'}`)
+  }
 
-  return SUPPORTED_SCENARIOS.filter((name) => !unsupported.includes(name))
+  return [...SUPPORTED_SCENARIOS]
 }
 
 async function supportedScenarios(backend: string): Promise<JsonValue[]> {
@@ -438,6 +515,10 @@ async function runStep(checks: Checks, backend: Backend, args: Args): Promise<nu
   let executed = 0
   for (const scenario of await supportedScenarios(args.backend)) {
     const name = str(field(scenario, 'name'))
+    // The interleaved run skips exclusive scenarios; a run with --only executes that one alone.
+    if (isExclusive(scenario) !== (args.only !== '') || (args.only !== '' && name !== args.only)) {
+      continue
+    }
     const step = list(field(scenario, 'steps'))[args.index]
     if (step === undefined || str(field(step, 'by')) !== args.as) {
       continue
@@ -446,6 +527,8 @@ async function runStep(checks: Checks, backend: Backend, args: Args): Promise<nu
 
     const runner = new Runner(backend.repository, scenario, args.run, {
       bypassHead: (event) => backend.bypassHead(event),
+      marker: backend.marker,
+      rebuild: rebuildDriver(backend),
     })
     const got = await runner.step(step)
     const want = expectedOutcome(field(step, 'expect'))
@@ -484,11 +567,8 @@ async function verify(
     // The view rows the scenario's projectors left in its own partitions.
     const partitions = viewPartitions(scenario, runner.entityId)
     if (partitions.length > 0) {
-      checks.equal(
-        `${name}: views`,
-        canonical(await backend.views(partitions, runner.entityId)),
-        canonical(optionalList(expected, 'views').map(plain)),
-      )
+      const views = optionalList(expected, 'views')
+      await backend.checkViews(checks, name, partitions, runner.entityId, views)
     }
 
     // The outcome rows the scenario's commands left.
@@ -504,6 +584,61 @@ async function verify(
       compareStream(checks, label, await backend.observe(runner, id), sibling)
       await backend.checkRows(checks, label, id, sibling)
     }
+  }
+}
+
+// The rebuild fence of a live run: the repository's, with a wait that really sleeps.
+function rebuildDriver(backend: Backend): RebuildDriver {
+  const fence = backend.repository
+  if (!isRebuildFence(fence)) {
+    throw new Error('the repository has no rebuild fence')
+  }
+
+  return {
+    fence,
+    wait: (seconds) => new Promise((resolve) => setTimeout(resolve, seconds * 1000)),
+    rows: (pk) => backend.viewRows(pk),
+  }
+}
+
+// Whether a row of a shared view partition belongs to the run's scenario: its partition or sort key
+// names the scenario's entity ID, as Go's OwnsViewRow decides.
+function ownsViewRow(base: string, pk: string, sk: string): boolean {
+  return pk.includes(base) || sk.includes(base)
+}
+
+// Neutral view rows by partition, then sort key bytes.
+function byKey<T extends {pk: string; sk: string}>(rows: T[]): T[] {
+  rows.sort((a, b) => compareUtf8(a.pk, b.pk) || compareUtf8(a.sk, b.sk))
+
+  return rows
+}
+
+// Every event of the run the log yields, once unfiltered and once narrowed to the account type, as
+// sorted "section entity sequence type" lines, which is what the Go and Rust drivers print.
+async function enumerate(backend: Backend, run: string): Promise<void> {
+  const repository = backend.repository
+  if (!isEventLog(repository)) {
+    throw new Error('the repository does not enumerate its log')
+  }
+
+  const lines: string[] = []
+  for (const [section, filter] of [
+    ['all', {}],
+    ['typed', {entityType: 'account'}],
+  ] as const) {
+    for await (const batch of repository.streamAllEvents(filter)) {
+      for (const event of batch) {
+        if (event.entityId.includes(run)) {
+          lines.push(`${section} ${event.entityId} ${event.sequence} ${event.type}`)
+        }
+      }
+    }
+  }
+  // Byte order, as Go's sort.Strings sorts.
+  lines.sort(compareUtf8)
+  for (const line of lines) {
+    console.log(line)
   }
 }
 

@@ -1,0 +1,65 @@
+id: evt-lambda
+language: typescript
+layer: library
+toolchains:
+  default: node
+project:
+  name: evt-lambda
+  description: The TypeScript Lambda helpers, @photon-grove/evt-lambda, held to compat/fixtures/lambda.json by packages/evt-compat.
+fileGroups:
+  sources:
+    - src/**/*
+    - package.json
+    - tsconfig.json
+    - /pnpm-lock.yaml
+  tests:
+    - test/**/*
+    - scripts/**/*
+    - tsconfig.test.json
+    - vitest.config.ts
+    - .oxlintrc.json
+  # The fixture runner imports the built package, so it lives in packages/evt-compat, which the
+  # evt-ts project builds (evt-ts:build-compat, after this project's build).
+  compat:
+    - /packages/evt-compat/src/lambda.ts
+    - /compat/fixtures/lambda.json
+tasks:
+  build:
+    command: pnpm run build
+    deps:
+      - evt-ts:build
+    inputs:
+      - '@group(sources)'
+    outputs:
+      - dist/**/*
+  # tsc for the published code (web globals only) and for the tests, oxlint, and the check that
+  # src/ imports nothing but relative paths and @photon-grove/evt.
+  check:
+    command: pnpm run check
+    deps:
+      - build
+    inputs:
+      - '@group(sources)'
+      - '@group(tests)'
+  # Vitest, then every lambda.json vector through the built package. The require() keeps the
+  # package loadable from CommonJS, which rules out top-level await.
+  test:
+    script: >-
+      pnpm run test && node ../evt-compat/dist/lambda.js &&
+      node -e "require('@photon-grove/evt-lambda')"
+    deps:
+      - evt-ts:build-compat
+    inputs:
+      - '@group(sources)'
+      - '@group(tests)'
+      - '@group(compat)'
+  # The fixture vectors on the other runtimes, against the same build. Bun and Deno come from
+  # .prototools locally and from the pinned setup actions in CI.
+  runtimes:
+    script: bun ../evt-compat/dist/lambda.js && deno run --allow-read ../evt-compat/dist/lambda.js
+    deps:
+      - evt-ts:build-compat
+    inputs:
+      - '@group(sources)'
+      - '@group(compat)'
+      - /.prototools

@@ -1,10 +1,30 @@
 import {describe, expect, test} from 'vitest'
 
-import {EvtError, TransientError} from '../src/errors.ts'
+import {
+  CommitTooLargeError,
+  EvtError,
+  ProjectorError,
+  ProjectorOperationError,
+  TransientError,
+  UnsupportedFeatureError,
+  ViewKeyTooLongError,
+  ViewsNotConfiguredError,
+} from '../src/errors.ts'
 import {type SerializedEvent, eventId} from '../src/event.ts'
+import {JOURNAL_MARKER} from '../src/features.ts'
 import {emptyMetadata} from '../src/metadata.ts'
+import {
+  type ProjectedView,
+  type ViewOperation,
+  deleteView,
+  expectPayload,
+  putView,
+} from '../src/projection.ts'
 import type {PgClient, PgConnection, PgResult} from '../src/postgres/client.ts'
-import {PgRepository} from '../src/postgres/repository.ts'
+import {PgRepository, type PgRepositoryOptions} from '../src/postgres/repository.ts'
+import type {PgViewRepository} from '../src/postgres/view-repository.ts'
+import type {ViewStatement, ViewWriter} from '../src/postgres/views.ts'
+import type {ViewRow} from '../src/views.ts'
 
 function event(sequence: number): SerializedEvent {
   return {
@@ -46,9 +66,15 @@ interface Fake {
 }
 
 // A client over that store. `fail` returns what a statement throws, `pooled` false leaves out
-// connect(), and `delay` holds every statement for that many milliseconds.
+// connect(), `delay` holds every statement for that many milliseconds, and `respond` answers a
+// statement in the store's place when it returns a result.
 function fake(
-  options: {fail?: (text: string) => unknown; pooled?: boolean; delay?: number} = {},
+  options: {
+    fail?: (text: string) => unknown
+    pooled?: boolean
+    delay?: number
+    respond?: (text: string) => PgResult | undefined
+  } = {},
 ): Fake {
   const log: string[] = []
   const values: (unknown[] | undefined)[] = []
@@ -64,7 +90,7 @@ function fake(
       throw failure
     }
 
-    return answer(text)
+    return options.respond?.(text) ?? answer(text)
   }
 
   const client: PgClient = {query}
@@ -242,9 +268,15 @@ describe('PgRepository', () => {
 
     const statements = transaction(log).slice(1, -1)
     expect(statements[0]).toBe('SELECT pg_advisory_xact_lock(1702261762, hashtext($1))')
-    expect(statements).toHaveLength(11)
+    expect(statements).toHaveLength(14)
     const ddl = log.slice(log.indexOf('START TRANSACTION ISOLATION LEVEL READ COMMITTED') + 2, -1)
     expect(ddl.every((text) => /^(CREATE|DO|ALTER) /.test(text))).toBe(true)
+    // The views table and its indexes come last, as Rust creates them after the shared DDL.
+    expect(ddl.slice(-3).map((text) => text.split(' (')[0])).toEqual([
+      'CREATE TABLE IF NOT EXISTS orders__evt_views',
+      'CREATE INDEX IF NOT EXISTS orders__evt_views_type_idx ON orders__evt_views',
+      'CREATE INDEX IF NOT EXISTS orders__evt_views_ttl_idx ON orders__evt_views',
+    ])
     // The recorded-identity columns are added by a guarded DO block, so a schema that has them takes
     // no lock on the outcomes table.
     const upgrade = ddl.filter((text) => text.includes('ALTER TABLE orders__evt_command_outcomes'))
@@ -256,5 +288,936 @@ describe('PgRepository', () => {
   test('refuses invalid table names at construction', () => {
     const {client} = fake()
     expect(() => new PgRepository(client, {eventsTable: 'x; DROP TABLE y'})).toThrow(EvtError)
+  })
+})
+
+// A view operation of the `handles` projector.
+function projected(op: ViewOperation, operation = 0): ProjectedView {
+  return {projector: 'handles', projectorIndex: 0, operation, op}
+}
+
+// A PostgreSQL error as `pg` raises it.
+function pgError(code: string, constraint?: string): Error {
+  return Object.assign(new Error(`SQLSTATE ${code}`), {code, constraint})
+}
+
+// A writer that puts every operation into a `views` table, with the compat drivers' statements.
+const writer: ViewWriter = (op) => {
+  if (op.kind === 'delete') {
+    return op.condition === 'present'
+      ? {sql: 'DELETE FROM views WHERE pk = $1', args: [op.pk, op.sk, op.owner]}
+      : {sql: 'WITH gone AS (DELETE FROM views) SELECT 1', args: [op.pk, op.sk, op.owner]}
+  }
+  const insert = 'INSERT INTO views (pk, sk, owner, payload) VALUES ($1, $2, $3, $4)'
+  return op.condition === 'absent'
+    ? {sql: insert, args: [op.pk, op.sk, op.owner, op.payload], keyConstraint: 'views_pkey'}
+    : {sql: `${insert} ON CONFLICT (pk, sk) DO UPDATE`, args: [op.pk, op.sk, op.owner, op.payload]}
+}
+
+// The writer, with every statement's rows taken as its count.
+const returning: ViewWriter = (op) => ({...writer(op), returning: true})
+
+// A writer whose statements are `size` bytes long and over.
+function sized(size: number): ViewWriter {
+  return () => ({sql: `SELECT 1 ${'-'.repeat(size)}`})
+}
+
+// A writer of short statements that name their sort keys.
+const short: ViewWriter = (view): ViewStatement => ({sql: `SELECT 1 /* ${view.sk} */`})
+
+// `count` puts of distinct rows.
+function puts(count: number): ViewOperation[] {
+  return Array.from({length: count}, (_, n) =>
+    putView('k', String(n).padStart(3, '0'), 'a', 'ledger', '{}'),
+  )
+}
+
+// A COMMIT that fails with a unique violation.
+function failAtCommit(text: string): unknown {
+  return text === 'COMMIT' ? pgError('23505') : undefined
+}
+
+// Commits one event of stream `a` with a snapshot and the given view operations.
+function commitViews(repo: PgRepository, ...ops: ViewOperation[]): Promise<void> {
+  const payload = new TextEncoder().encode('{}')
+  return repo.commit({
+    entityId: 'a',
+    events: [event(1)],
+    snapshot: {entityType: 'ledger', sequence: 1n, payload},
+    views: ops.map((op, index) => projected(op, index)),
+  })
+}
+
+async function rejection(promise: Promise<unknown>): Promise<unknown> {
+  try {
+    await promise
+  } catch (error) {
+    return error
+  }
+  throw new Error('expected a failure')
+}
+
+// A client whose view statements resolve `result`, and a repository with the writer on it.
+function answering(result: PgResult): {repo: PgRepository; log: string[]} {
+  const {client, log} = fake({respond: (text) => (/views/.test(text) ? result : undefined)})
+  return {repo: new PgRepository(client, {viewWriter: writer}), log}
+}
+
+// What a commit whose view statement raises `error` rejects with.
+function raising(error: unknown, op: ViewOperation): Promise<unknown> {
+  const {client} = fake({fail: (text) => (/views/.test(text) ? error : undefined)})
+  return rejection(commitViews(new PgRepository(client, {viewWriter: writer}), op))
+}
+
+describe('PgRepository view writer', () => {
+  test('runs view statements after the events and before the snapshot, with their own args', async () => {
+    const {client, log, values} = fake()
+    const repo = new PgRepository(client, {viewWriter: writer})
+    expect(repo.writesViews()).toBe(true)
+    await commitViews(repo, putView('k', 'one', 'a', 'ledger', '{"n":1}'))
+
+    expect(transaction(log).slice(-5)).toEqual([
+      'INSERT INTO evt_events (entity_id,',
+      'INSERT INTO views (pk,',
+      'SELECT sequence::text AS sequence',
+      'INSERT INTO evt_snapshots (entity_id,',
+      'COMMIT',
+    ])
+    const args = values[log.findIndex((text) => text.startsWith('INSERT INTO views'))]
+    expect(args?.slice(0, 3)).toEqual(['k', 'one', 'a'])
+    expect(args?.[3]).toEqual(new TextEncoder().encode('{"n":1}'))
+  })
+
+  test.each<[string, ViewOperation, PgResult]>([
+    [
+      'a put that affects no row',
+      putView('k', 'one', 'a', 'ledger', '{}'),
+      {rows: [], rowCount: 0},
+    ],
+    [
+      'a delete of a required row that affects none',
+      deleteView('k', 'one', 'a', {condition: 'present'}),
+      {rows: [], rowCount: 0},
+    ],
+    ['a delete that reports a foreign row', deleteView('k', 'one', 'a'), {rows: [{}]}],
+    [
+      'a delete that reports a foreign row the driver counts as none',
+      deleteView('k', 'one', 'a'),
+      {rows: [{}], affectedRows: 0},
+    ],
+  ])('fails the condition: %s', async (_name, op, result) => {
+    const {repo, log} = answering(result)
+    const error = await rejection(commitViews(repo, op))
+    expect(error).toBeInstanceOf(ProjectorOperationError)
+    expect(error).toMatchObject({reason: 'ConditionalCheckFailed', pk: 'k', sk: 'one'})
+    expect(log.at(-1)).toBe('ROLLBACK')
+  })
+
+  test.each<[string, ViewOperation, PgResult]>([
+    ['a put that affects a row', putView('k', 'one', 'a', 'ledger', '{}'), {rows: [], rowCount: 1}],
+    [
+      'a delete of a required row that PGlite counts',
+      deleteView('k', 'one', 'a', {condition: 'present'}),
+      {rows: [], affectedRows: 1},
+    ],
+    ['a delete that reports nothing', deleteView('k', 'one', 'a'), {rows: [], rowCount: 0}],
+    [
+      'an absent put, which needs no count',
+      putView('k', 'one', 'a', 'ledger', '{}', {condition: 'absent'}),
+      {rows: []},
+    ],
+  ])('holds the condition: %s', async (_name, op, result) => {
+    const {repo, log} = answering(result)
+    await commitViews(repo, op)
+    expect(log.at(-1)).toBe('COMMIT')
+  })
+
+  test.each<[string, ViewOperation]>([
+    ['a put', putView('k', 'one', 'a', 'ledger', '{}')],
+    ['a delete of a required row', deleteView('k', 'one', 'a', {condition: 'present'})],
+  ])('refuses %s whose count the driver does not report', async (_name, op) => {
+    const {repo} = answering({rows: []})
+    const error = await rejection(commitViews(repo, op))
+    expect(error).toMatchObject({code: 'invalidViewOperation'})
+  })
+
+  test('counts only the rows of a statement marked returning', async () => {
+    const failed = fake({respond: (text) => (/views/.test(text) ? {rows: []} : undefined)})
+    const error = await rejection(
+      commitViews(
+        new PgRepository(failed.client, {viewWriter: returning}),
+        deleteView('k', 'one', 'a', {condition: 'present'}),
+      ),
+    )
+    expect(error).toMatchObject({reason: 'ConditionalCheckFailed'})
+
+    // The rows win over a count the driver reports.
+    const held = fake({
+      respond: (text) => (/views/.test(text) ? {rows: [{}], rowCount: 0} : undefined),
+    })
+    const repo = new PgRepository(held.client, {viewWriter: returning})
+    await commitViews(repo, putView('k', 'one', 'a', 'ledger', '{}'))
+    expect(held.log.at(-1)).toBe('COMMIT')
+  })
+
+  test('counts the rows an unconditioned delete reports, with no driver count', async () => {
+    const {repo, log} = answering({rows: []})
+    await commitViews(repo, deleteView('k', 'one', 'a'))
+    expect(log.at(-1)).toBe('COMMIT')
+  })
+
+  test("runs a transaction's views after every stream's events, before every snapshot", async () => {
+    const {client, log} = fake()
+    const payload = new TextEncoder().encode('{}')
+    const b = {...event(1), id: eventId('b', 1n), entityId: 'b'}
+    await new PgRepository(client, {viewWriter: writer}).commitTransaction({
+      streams: [
+        {
+          entityId: 'a',
+          events: [event(1)],
+          snapshot: {entityType: 'ledger', sequence: 1n, payload},
+        },
+        {entityId: 'b', events: [b], snapshot: {entityType: 'ledger', sequence: 1n, payload}},
+      ],
+      fences: [],
+      views: [projected(putView('k', 'one', 'a', 'ledger', '{}'))],
+    })
+
+    const writes = transaction(log)
+      .filter((text) => /^INSERT INTO (evt_events|views|evt_snapshots) /.test(text))
+      .map((text) => text.split(' ')[2])
+    expect(writes).toEqual(['evt_events', 'evt_events', 'views', 'evt_snapshots', 'evt_snapshots'])
+  })
+
+  test("sends a copy of the writer's arguments", async () => {
+    const args = ['k', 'one', 'a']
+    const {client, values, log} = fake()
+    const repo = new PgRepository(client, {viewWriter: () => ({sql: 'SELECT 1 FROM views', args})})
+    await commitViews(repo, deleteView('k', 'one', 'a'))
+    const sent = values[log.indexOf('SELECT 1 FROM views')]
+    expect(sent).toEqual(args)
+    expect(sent).not.toBe(args)
+  })
+
+  test('maps the errors a view statement raises', async () => {
+    const taken = new Error('taken')
+    const claim = putView('k', 'one', 'a', 'ledger', '{}', {condition: 'absent', conflict: taken})
+    const plain = putView('k', 'one', 'a', 'ledger', '{}')
+
+    // The key constraint, named in any case, is the failed condition.
+    expect(await raising(pgError('23505', 'Views_PKey'), claim)).toMatchObject({
+      reason: 'ConditionalCheckFailed',
+      mapped: taken,
+    })
+    // Another constraint's violation, or one on a put without the condition, is the statement's.
+    expect(await raising(pgError('23505', 'views_payload_key'), claim)).toMatchObject({
+      reason: '23505',
+    })
+    expect(await raising(pgError('23505', 'views_pkey'), plain)).toMatchObject({
+      reason: '23505',
+      mapped: undefined,
+    })
+    expect(await raising(pgError('23514'), claim)).toMatchObject({
+      code: 'projectorOperation',
+      reason: '23514',
+    })
+    // A rollback is transient or passes through, and so does a lost connection.
+    expect(await raising(pgError('40001'), claim)).toBeInstanceOf(TransientError)
+    expect(await raising(pgError('40P01'), claim)).toBeInstanceOf(TransientError)
+    expect(await raising(pgError('40003'), claim)).toMatchObject({code: '40003'})
+    const lost = new Error('connection reset')
+    expect(await raising(lost, claim)).toBe(lost)
+  })
+
+  test('an integrity violation at COMMIT of a commit with views is the projector failure', async () => {
+    const {client} = fake({fail: failAtCommit})
+    const repo = new PgRepository(client, {viewWriter: writer})
+    const error = await rejection(commitViews(repo, putView('k', 'one', 'a', 'ledger', '{}')))
+    expect(error).toBeInstanceOf(ProjectorError)
+    expect(error).toMatchObject({projector: '(at commit)'})
+
+    const bare = fake({fail: failAtCommit})
+    const refused = await rejection(
+      new PgRepository(bare.client).commit({entityId: 'a', events: [event(1)]}),
+    )
+    expect(refused).not.toBeInstanceOf(ProjectorError)
+  })
+
+  test.each<[string, string, ViewWriter | undefined, ViewOperation]>([
+    ['no writer', 'viewsNotConfigured', undefined, putView('k', 'one', 'a', 'ledger', '{}')],
+    [
+      'an empty statement',
+      'invalidViewOperation',
+      () => ({sql: '  '}),
+      putView('k', 'one', 'a', 'ledger', '{}'),
+    ],
+    [
+      'an absent put without its key constraint',
+      'invalidViewOperation',
+      () => ({sql: 'INSERT INTO views VALUES ($1)', args: ['k']}),
+      putView('k', 'one', 'a', 'ledger', '{}', {condition: 'absent'}),
+    ],
+  ])('refuses %s before any query', async (_name, code, viewWriter, op) => {
+    const {client, log} = fake()
+    const repo = new PgRepository(client, viewWriter && {viewWriter})
+    const error = await rejection(commitViews(repo, op))
+    expect(error).toMatchObject({code})
+    expect(error instanceof ViewsNotConfiguredError).toBe(viewWriter === undefined)
+    expect(log).toEqual([])
+  })
+
+  test("passes a writer's own error through, before any query", async () => {
+    const refused = new Error('no table for this row')
+    const {client, log} = fake()
+    const repo = new PgRepository(client, {
+      viewWriter: () => {
+        throw refused
+      },
+    })
+    expect(await rejection(commitViews(repo, putView('k', 'one', 'a', 'ledger', '{}')))).toBe(
+      refused,
+    )
+    expect(log).toEqual([])
+  })
+
+  test('budgets each view as one action sized by its SQL text', async () => {
+    const {client, log} = fake()
+    const op = putView('k', 'one', 'a', 'ledger', '{}')
+    const long = new PgRepository(client, {viewWriter: sized(400_000)})
+    expect(await rejection(commitViews(long, op))).toBeInstanceOf(CommitTooLargeError)
+
+    // Two control checks, the head, the event and the snapshot leave room for 95 views.
+    const many = new PgRepository(client, {viewWriter: short})
+    expect(await rejection(commitViews(many, ...puts(96)))).toBeInstanceOf(CommitTooLargeError)
+    expect(log).toEqual([])
+
+    const fits = fake({
+      respond: (text) => (text.startsWith('SELECT 1 /*') ? {rows: [{}]} : undefined),
+    })
+    await commitViews(new PgRepository(fits.client, {viewWriter: short}), ...puts(95))
+    expect(fits.log.at(-1)).toBe('COMMIT')
+  })
+})
+
+// A client over a UTF8 store that declares stream-heads and, unless `declared` is false,
+// postgres-views. `respond` answers a statement first.
+function tableStore(
+  options: {
+    declared?: boolean
+    encoding?: string
+    respond?: (text: string) => PgResult | undefined
+  } = {},
+): Fake {
+  const features =
+    options.declared === false ? '{"stream-heads":1}' : '{"postgres-views":1,"stream-heads":1}'
+  return fake({
+    respond: (text) => {
+      const answered = options.respond?.(text)
+      if (answered !== undefined) {
+        return answered
+      }
+      if (text.startsWith("SELECT current_setting('server_encoding')")) {
+        return {rows: [{encoding: options.encoding ?? 'UTF8'}]}
+      }
+      if (text.startsWith('SELECT version::text')) {
+        return {rows: [{version: '1', features, history_dependent: '[]', retention: '[]'}]}
+      }
+
+      return undefined
+    },
+  })
+}
+
+describe('PgRepository views table', () => {
+  test('writes views to the views table with owner-guarded statements', async () => {
+    const {client, log, values} = tableStore({
+      respond: (text) => (text.startsWith('DELETE') ? {rows: [{}]} : undefined),
+    })
+    const repo = new PgRepository(client, {viewsTable: true})
+    expect(repo.viewRepository().table).toBe('evt_events__evt_views')
+    await commitViews(
+      repo,
+      putView('k', 'one', 'a', 'ledger', '{"n":1}', {condition: 'absent'}),
+      putView('k', 'two', 'a', 'ledger', '{"n":2}'),
+      deleteView('k', 'three', 'a', {condition: 'present'}),
+      deleteView('k', 'four', 'a'),
+    )
+
+    const views = log.filter((text) => text.includes('evt_events__evt_views'))
+    expect(views).toEqual([
+      'INSERT INTO evt_events__evt_views (pk, sk, entity_id, entity_type, payload, ttl) VALUES ($1, $2, $3, $4, $5, 0)',
+      'INSERT INTO evt_events__evt_views (pk, sk, entity_id, entity_type, payload, ttl) VALUES ($1, $2, $3, $4, $5, 0) ' +
+        'ON CONFLICT (pk, sk) DO UPDATE SET entity_type = EXCLUDED.entity_type, payload = EXCLUDED.payload, ttl = 0 ' +
+        'WHERE evt_events__evt_views.entity_id = EXCLUDED.entity_id RETURNING 1',
+      'DELETE FROM evt_events__evt_views WHERE pk = $1 AND sk = $2 AND entity_id = $3 RETURNING 1',
+      'WITH gone AS (DELETE FROM evt_events__evt_views WHERE pk = $1 AND sk = $2 AND entity_id = $3) ' +
+        'SELECT 1 FROM evt_events__evt_views WHERE pk = $1 AND sk = $2 AND entity_id <> $3',
+    ])
+    // The payload goes as text, which the table stores byte for byte.
+    expect(values[log.indexOf(views[0]!)]).toEqual(['k', 'one', 'a', 'ledger', '{"n":1}'])
+    expect(values[log.indexOf(views[3]!)]).toEqual(['k', 'four', 'a'])
+    // After the events, and before the snapshot.
+    expect(transaction(log).slice(-8)).toEqual([
+      'INSERT INTO evt_events (entity_id,',
+      'INSERT INTO evt_events__evt_views (pk,',
+      'INSERT INTO evt_events__evt_views (pk,',
+      'DELETE FROM evt_events__evt_views WHERE',
+      'WITH gone AS (DELETE',
+      'SELECT sequence::text AS sequence',
+      'INSERT INTO evt_snapshots (entity_id,',
+      'COMMIT',
+    ])
+  })
+
+  test.each<[string, ViewOperation, PgResult]>([
+    ["an upsert of another owner's row", putView('k', 'one', 'a', 'ledger', '{}'), {rows: []}],
+    [
+      'a release of an absent row',
+      deleteView('k', 'one', 'a', {condition: 'present'}),
+      {rows: [], rowCount: 1},
+    ],
+    ["a delete that finds another owner's row", deleteView('k', 'one', 'a'), {rows: [{}]}],
+  ])('fails the condition: %s', async (_name, op, result) => {
+    const {client, log} = tableStore({
+      respond: (text) => (/__evt_views/.test(text) ? result : undefined),
+    })
+    const error = await rejection(commitViews(new PgRepository(client, {viewsTable: true}), op))
+    expect(error).toMatchObject({reason: 'ConditionalCheckFailed', pk: 'k', sk: 'one'})
+    expect(log.at(-1)).toBe('ROLLBACK')
+  })
+
+  test('takes a violation of its own key as the failed condition of an absent put', async () => {
+    const absent = putView('k', 'one', 'a', 'ledger', '{}', {condition: 'absent'})
+    const commit = (constraint: string) => {
+      const {client} = tableStore()
+      const failing: PgClient = {
+        ...client,
+        query: async (text, values) => {
+          if (text.startsWith('INSERT INTO evt_events__evt_views')) {
+            throw pgError('23505', constraint)
+          }
+          return client.query(text, values)
+        },
+        connect: async () => ({...(await client.connect!()), query: failing.query}),
+      }
+      return rejection(commitViews(new PgRepository(failing, {viewsTable: true}), absent))
+    }
+    expect(await commit('evt_events__evt_views_pkey')).toMatchObject({
+      reason: 'ConditionalCheckFailed',
+    })
+    expect(await commit('another')).toMatchObject({reason: '23505'})
+  })
+
+  test('declares postgres-views once, after checking the encoding, before the first commit', async () => {
+    let declared = false
+    const {client, log, values} = tableStore({
+      declared: false,
+      respond: (text) => {
+        if (text.startsWith('SELECT version::text') && declared) {
+          const features = '{"postgres-views":1,"stream-heads":1}'
+          return {rows: [{version: '2', features, history_dependent: '[]', retention: '[]'}]}
+        }
+        if (text.startsWith('UPDATE evt_events__evt_features')) {
+          declared = true
+        }
+        return undefined
+      },
+    })
+    const repo = new PgRepository(client, {viewsTable: true})
+    await commitViews(repo, putView('k', 'one', 'a', 'ledger', '{}'))
+    await repo.commit({entityId: 'b', events: [{...event(1), entityId: 'b', id: eventId('b', 1n)}]})
+
+    const updates = log.flatMap((text, index) =>
+      text.startsWith('UPDATE evt_events__evt_features') ? [values[index]] : [],
+    )
+    expect(updates).toEqual([['2', '{"postgres-views":1,"stream-heads":1}', '[]', '[]', '1']])
+    const encoding = log.findIndex((text) => text.includes('server_encoding'))
+    expect(encoding).toBeGreaterThan(-1)
+    expect(encoding).toBeLessThan(
+      log.findIndex((text) => text.startsWith('UPDATE evt_events__evt_features')),
+    )
+    expect(log.filter((text) => text.includes('server_encoding'))).toHaveLength(1)
+  })
+
+  test('takes no exclusive lock on a store that already declares postgres-views', async () => {
+    const {client, log} = tableStore()
+    await commitViews(
+      new PgRepository(client, {viewsTable: true}),
+      putView('k', 'one', 'a', 'l', '{}'),
+    )
+    expect(log).not.toContain('SELECT pg_advisory_xact_lock(1702261761, hashtext($1))')
+    expect(log.some((text) => text.startsWith('UPDATE evt_events__evt_features'))).toBe(false)
+  })
+
+  test('refuses another version of postgres-views before any write', async () => {
+    const {client, log} = tableStore({
+      respond: (text) =>
+        text.startsWith('SELECT version::text')
+          ? {
+              rows: [
+                {
+                  version: '2',
+                  features: '{"postgres-views":2,"stream-heads":1}',
+                  history_dependent: '[]',
+                  retention: '[]',
+                },
+              ],
+            }
+          : undefined,
+    })
+    const repo = new PgRepository(client, {viewsTable: true})
+    expect(await rejection(commitViews(repo, putView('k', 'one', 'a', 'l', '{}')))).toMatchObject({
+      unsupported: [{name: 'postgres-views', version: 2}],
+    })
+    expect(log.some((text) => /^(INSERT|UPDATE)/.test(text))).toBe(false)
+  })
+
+  test('refuses a database that is not UTF8 before any write', async () => {
+    const {client, log} = tableStore({declared: false, encoding: 'SQL_ASCII'})
+    const error = await rejection(
+      commitViews(
+        new PgRepository(client, {viewsTable: true}),
+        putView('k', 'one', 'a', 'l', '{}'),
+      ),
+    )
+    expect(error).toMatchObject({code: 'invalidArgument'})
+    expect((error as Error).message).toContain('needs a UTF8 database, and this one is SQL_ASCII')
+    expect(log.some((text) => /^(INSERT|UPDATE)/.test(text))).toBe(false)
+  })
+
+  test('retries through a TransientError when the store lost its declaration', async () => {
+    let lost = false
+    const {client} = tableStore({
+      respond: (text) =>
+        lost && text.startsWith('SELECT version::text')
+          ? {
+              rows: [
+                {
+                  version: '3',
+                  features: '{"stream-heads":1}',
+                  history_dependent: '[]',
+                  retention: '[]',
+                },
+              ],
+            }
+          : undefined,
+    })
+    const repo = new PgRepository(client, {viewsTable: true})
+    await commitViews(repo, putView('k', 'one', 'a', 'ledger', '{}'))
+    lost = true
+    expect(
+      await rejection(commitViews(repo, putView('k', 'one', 'a', 'ledger', '{}'))),
+    ).toBeInstanceOf(TransientError)
+  })
+
+  test.each<[string, PgRepositoryOptions]>([
+    ['with no view target', {}],
+    ['with a view writer', {viewWriter: writer}],
+  ])('a writer %s refuses a store that declares postgres-views', async (_name, options) => {
+    const {client, log} = tableStore()
+    const repo = new PgRepository(client, options)
+    const commit = await rejection(repo.commit({entityId: 'a', events: [event(1)]}))
+    expect(commit).toBeInstanceOf(UnsupportedFeatureError)
+    expect(commit).toMatchObject({unsupported: [{name: 'postgres-views', version: 1}]})
+    const snapshot = await rejection(
+      repo.putSnapshot({
+        entityType: 'l',
+        entityId: 'a',
+        sequence: 0n,
+        eventSequence: 0n,
+        payload: new Uint8Array(),
+      }),
+    )
+    expect(snapshot).toBeInstanceOf(UnsupportedFeatureError)
+    expect(await rejection(repo.compactBelow('a', 1n))).toBeInstanceOf(UnsupportedFeatureError)
+    expect(log.some((text) => /^(INSERT|UPDATE|DELETE|WITH)/.test(text))).toBe(false)
+  })
+
+  test('budgets each view as its DynamoDB item', async () => {
+    const {client, log} = tableStore()
+    const repo = new PgRepository(client, {viewsTable: true})
+    // A 400 KB payload is over DynamoDB's item limit, though its statement is short.
+    const big = putView('k', 'one', 'a', 'ledger', `"${'x'.repeat(400_000)}"`)
+    expect(await rejection(commitViews(repo, big))).toBeInstanceOf(CommitTooLargeError)
+    expect(await rejection(commitViews(repo, ...puts(96)))).toBeInstanceOf(CommitTooLargeError)
+    expect(log.some((text) => text.startsWith('START'))).toBe(false)
+
+    await commitViews(repo, ...puts(95))
+    expect(log.at(-1)).toBe('COMMIT')
+  })
+
+  test('refuses what the table cannot store before any query', async () => {
+    const {client, log} = tableStore()
+    const repo = new PgRepository(client, {viewsTable: true})
+    // Each part is within its own limit, and together they are a byte over the index bound.
+    const long = putView('p'.repeat(2048), 's'.repeat(550), 'a', 'abc', '{}')
+    const tooLong = await rejection(commitViews(repo, long))
+    expect(tooLong).toBeInstanceOf(ViewKeyTooLongError)
+    expect(tooLong).toMatchObject({field: 'entity type, pk and sk', length: 2601, max: 2600})
+    const lone = await rejection(commitViews(repo, putView('k\uD800', 'one', 'a', 'ledger', '{}')))
+    expect(lone).toMatchObject({code: 'invalidViewOperation'})
+    expect((lone as Error).message).toContain('lone surrogate')
+    expect(log).toEqual([])
+  })
+
+  test('needs no driver count: an absent put is never counted, the rest return their rows', async () => {
+    // Rows only, as a client that reports no rowCount or affectedRows answers.
+    const {client, log} = tableStore({
+      respond: (text) =>
+        text.includes('__evt_views') ? {rows: text.endsWith('RETURNING 1') ? [{}] : []} : undefined,
+    })
+    await commitViews(
+      new PgRepository(client, {viewsTable: true}),
+      putView('k', 'one', 'a', 'ledger', '{}', {condition: 'absent'}),
+      putView('k', 'two', 'a', 'ledger', '{}'),
+      deleteView('k', 'three', 'a', {condition: 'present'}),
+      deleteView('k', 'four', 'a'),
+    )
+    expect(log.at(-1)).toBe('COMMIT')
+  })
+
+  test.each<[string, (views: PgViewRepository, signal: AbortSignal) => Promise<unknown>]>([
+    ['deleteView', (views, signal) => views.deleteView('k', 'one', {signal})],
+    ['purgeExpired', (views, signal) => views.purgeExpired(1, {signal})],
+  ])('%s rejects when aborted in flight', async (_name, call) => {
+    const controller = new AbortController()
+    const {client} = tableStore({
+      respond: (text) => {
+        if (text.startsWith('DELETE FROM') || text.startsWith('WITH gone AS')) {
+          controller.abort(new Error('stop'))
+          return {rows: [{deleted: '0'}]}
+        }
+        return undefined
+      },
+    })
+    const views = new PgRepository(client, {viewsTable: true}).viewRepository()
+    expect(await rejection(call(views, controller.signal))).toMatchObject({message: 'stop'})
+  })
+
+  test("applies the expected payload as a compare-and-set on the owner's row", async () => {
+    const {client, log, values} = tableStore()
+    const repo = new PgRepository(client, {viewsTable: true})
+    expect(repo.appliesExpectedPayload()).toBe(true)
+    const counter = putView('k', 'COUNTER', 'a', 'journal-counter', '{"n":2}')
+    await commitViews(repo, expectPayload(counter, new TextEncoder().encode('{"n":1}')))
+
+    const update = log.findIndex((text) => text.startsWith('UPDATE evt_events__evt_views'))
+    expect(log[update]).toBe(
+      'UPDATE evt_events__evt_views SET entity_type = $4, payload = $5, ttl = 0 ' +
+        'WHERE pk = $1 AND sk = $2 AND entity_id = $3 AND payload = $6 RETURNING 1',
+    )
+    expect(values[update]).toEqual(['k', 'COUNTER', 'a', 'journal-counter', '{"n":2}', '{"n":1}'])
+    expect(log.at(-1)).toBe('COMMIT')
+  })
+
+  test('a stale expected payload fails the condition and writes nothing', async () => {
+    const {client, log} = tableStore({
+      respond: (text) => (text.startsWith('UPDATE evt_events__evt_views') ? {rows: []} : undefined),
+    })
+    const counter = putView('k', 'COUNTER', 'a', 'journal-counter', '{"n":2}', {conflict: 'moved'})
+    const stale = expectPayload(counter, new TextEncoder().encode('{"n":0}'))
+    const error = await rejection(commitViews(new PgRepository(client, {viewsTable: true}), stale))
+    expect(error).toMatchObject({reason: 'ConditionalCheckFailed', mapped: 'moved'})
+    expect(log.at(-1)).toBe('ROLLBACK')
+  })
+
+  test('a view writer refuses an expected payload before any query', async () => {
+    const {client, log} = fake()
+    const repo = new PgRepository(client, {viewWriter: writer})
+    expect(repo.appliesExpectedPayload()).toBe(false)
+    const counter = putView('k', 'COUNTER', 'a', 'journal-counter', '{}')
+    const error = await rejection(
+      commitViews(repo, expectPayload(counter, new TextEncoder().encode('{}'))),
+    )
+    expect(error).toMatchObject({code: 'invalidViewOperation'})
+    expect((error as Error).message).toContain('a view writer cannot apply an expected payload')
+    expect(log).toEqual([])
+  })
+
+  test('takes the views table or a view writer, not both', () => {
+    const {client} = fake()
+    expect(() => new PgRepository(client, {viewsTable: true, viewWriter: writer})).toThrow(
+      /views table or through a view writer, not both/,
+    )
+  })
+})
+
+describe('PgRepository journal', () => {
+  test('reads the counters of several scopes in one statement, in the order given', async () => {
+    const {client, log, values} = tableStore({
+      respond: (text) =>
+        text.includes('sk = $1 AND pk IN (SELECT jsonb_array_elements_text($2::jsonb))')
+          ? {
+              rows: [
+                {
+                  pk: 'journal-counter#b',
+                  sk: 'COUNTER',
+                  entity_id: 'SYSTEM#JOURNAL',
+                  entity_type: 'journal-counter',
+                  payload: '{"scope":"b","position":7}',
+                  ttl: '0',
+                },
+              ],
+            }
+          : undefined,
+    })
+    const repo = new PgRepository(client, {viewsTable: true})
+    expect(await repo.readCounters(['a', 'b'])).toEqual([0n, 7n])
+    expect(log).toHaveLength(1)
+    expect(values[0]).toEqual(['COUNTER', '["journal-counter#a","journal-counter#b"]'])
+    expect(await repo.readCounters([])).toEqual([])
+    expect(log).toHaveLength(1)
+  })
+
+  test('reads the last position and rows of a scope, ordered by sort key', async () => {
+    const {client, log, values} = tableStore({
+      respond: (text) =>
+        text.startsWith('SELECT sk FROM') ? {rows: [{sk: '00000000000000000012'}]} : undefined,
+    })
+    const repo = new PgRepository(client, {viewsTable: true})
+    expect(await repo.readLastPosition('s')).toBe(12n)
+    expect(await repo.readRows('s', 3n, 5)).toEqual([])
+    expect(log).toEqual([
+      'SELECT sk FROM evt_events__evt_views WHERE pk = $1 ORDER BY sk DESC LIMIT 1',
+      'SELECT pk, sk, entity_id, entity_type, payload, ttl::text AS ttl FROM ' +
+        'evt_events__evt_views WHERE pk = $1 AND sk > $2 ORDER BY sk LIMIT $3::bigint',
+    ])
+    expect(values[1]).toEqual(['journal#s', '00000000000000000003', '5'])
+  })
+
+  test('reads a compaction row by its scope and sort key', async () => {
+    const {client, log, values} = tableStore()
+    const repo = new PgRepository(client, {viewsTable: true})
+    expect(await repo.readCompactionRow('s', 'LEASE')).toBeNull()
+    expect(log).toEqual([
+      'SELECT pk, sk, entity_id, entity_type, payload, ttl::text AS ttl FROM ' +
+        'evt_events__evt_views WHERE pk = $1 AND sk = $2',
+    ])
+    expect(values[0]).toEqual(['journal-compaction#s', 'LEASE'])
+  })
+
+  test('refuses every journal read without the views table, before any query', async () => {
+    const {client, log} = fake()
+    const repo = new PgRepository(client, {viewWriter: writer})
+    const errors = await Promise.all(
+      [
+        repo.readCounter('s'),
+        repo.readCounters(['s']),
+        repo.readLastPosition('s'),
+        repo.readRows('s', 0n, 1),
+        repo.readCompactionRow('s', 'LEASE'),
+      ].map(rejection),
+    )
+    for (const error of errors) {
+      expect(error).toBeInstanceOf(ViewsNotConfiguredError)
+    }
+    expect(log).toEqual([])
+  })
+
+  test('declares the journal only for a journal writer', async () => {
+    const {client, log} = tableStore()
+    const repo = new PgRepository(client, {viewsTable: true})
+    const error = await rejection(repo[JOURNAL_MARKER].declareJournal(['ledger']))
+    expect(error).toBeInstanceOf(UnsupportedFeatureError)
+    expect(log).toEqual([])
+  })
+})
+
+function bytes(text: string): Uint8Array {
+  return new TextEncoder().encode(text)
+}
+
+// A row of scope `s`'s compaction partition at `sk`.
+function compactionRow(sk: string, payload = '{}'): ViewRow {
+  return {
+    pk: 'journal-compaction#s',
+    sk,
+    entityId: 'SYSTEM#JOURNAL',
+    entityType: 'journal-compaction',
+    payload: bytes(payload),
+  }
+}
+
+describe('PgRepository journal compaction', () => {
+  test('locks the lease row first, then by key bytes, checks, and writes in that order', async () => {
+    const {client, log, values} = tableStore({
+      respond: (text) =>
+        text.startsWith('SELECT value::text')
+          ? {rows: [{value: '4', force_released: 'false'}]}
+          : undefined,
+    })
+    const repo = new PgRepository(client, {viewsTable: true})
+    const written = await repo.writeCompaction(4n, [
+      {kind: 'put', row: compactionRow('chunk#1'), expect: {kind: 'absent'}},
+      {kind: 'delete', pk: 'journal#s', sk: '00000000000000000001', owner: 'a'},
+      {kind: 'check', pk: 'journal-compaction#s', sk: 'LEASE', expect: {kind: 'any'}},
+    ])
+    expect(written).toEqual({kind: 'written'})
+    const tx = transaction(log)
+    expect(tx).toEqual([
+      'START TRANSACTION ISOLATION LEVEL',
+      'SELECT pg_advisory_xact_lock_shared(1702261761, hashtext($1))',
+      'SELECT value::text AS value,',
+      'SELECT pk, sk, entity_id,',
+      'SELECT pk, sk, entity_id,',
+      'SELECT pk, sk, entity_id,',
+      'DELETE FROM evt_events__evt_views WHERE',
+      'INSERT INTO evt_events__evt_views (pk,',
+      'COMMIT',
+    ])
+    const start = log.indexOf('START TRANSACTION ISOLATION LEVEL READ COMMITTED')
+    const locked = values.slice(start + 3, start + 6).map((args) => (args as string[]).join('/'))
+    // `#` (0x23) sorts before `-` (0x2D): the row's partition before the compaction partition.
+    expect(locked).toEqual([
+      'journal-compaction#s/LEASE',
+      'journal#s/00000000000000000001',
+      'journal-compaction#s/chunk#1',
+    ])
+  })
+
+  test('refuses on a moved epoch, a failed expectation or a foreign row, writing nothing', async () => {
+    const epoch = tableStore({
+      respond: (text) =>
+        text.startsWith('SELECT value::text')
+          ? {rows: [{value: '6', force_released: 'false'}]}
+          : undefined,
+    })
+    expect(
+      await new PgRepository(epoch.client, {viewsTable: true}).writeCompaction(4n, [
+        {kind: 'check', pk: 'p', sk: 's', expect: {kind: 'any'}},
+      ]),
+    ).toEqual({kind: 'epochChanged'})
+    expect(epoch.log.at(-1)).toBe('ROLLBACK')
+
+    const stored = {
+      pk: 'journal#s',
+      sk: '00000000000000000001',
+      entity_id: 'b',
+      entity_type: 'journal',
+      payload: '{}',
+      ttl: '0',
+    }
+    const taken = tableStore({
+      respond: (text) => (text.endsWith('FOR UPDATE') ? {rows: [stored]} : undefined),
+    })
+    expect(
+      await new PgRepository(taken.client, {viewsTable: true}).writeCompaction(null, [
+        {kind: 'put', row: compactionRow('LEASE'), expect: {kind: 'payload', payload: bytes('{}')}},
+        {kind: 'delete', pk: 'journal#s', sk: '00000000000000000001', owner: 'a'},
+      ]),
+    ).toEqual({kind: 'refused', at: 0})
+    expect(taken.log.some((text) => /^(INSERT|DELETE)/.test(text))).toBe(false)
+    expect(taken.log.at(-1)).toBe('ROLLBACK')
+  })
+
+  test('reports the first failing write in request order, not lock order', async () => {
+    const stored = {
+      pk: 'journal#s',
+      sk: '00000000000000000001',
+      entity_id: 'b',
+      entity_type: 'journal',
+      payload: '{}',
+      ttl: '0',
+    }
+    const {client} = tableStore({
+      respond: (text) => (text.endsWith('FOR UPDATE') ? {rows: [stored]} : undefined),
+    })
+    // The delete sorts after the lease row, which is locked first, and is refused first.
+    expect(
+      await new PgRepository(client, {viewsTable: true}).writeCompaction(null, [
+        {kind: 'delete', pk: 'journal#s', sk: '00000000000000000001', owner: 'a'},
+        {kind: 'check', pk: 'journal-compaction#s', sk: 'LEASE', expect: {kind: 'absent'}},
+      ]),
+    ).toEqual({kind: 'refused', at: 0})
+  })
+
+  test('refuses a row no view row may hold before any query', async () => {
+    const {client, log} = tableStore()
+    const repo = new PgRepository(client, {viewsTable: true})
+    const writes = [
+      {kind: 'put', row: {...compactionRow('LEASE'), ttl: 1.5}, expect: {kind: 'any'}},
+      {kind: 'delete', pk: 'journal#s', sk: '\uD800', owner: 'a'},
+    ] as const
+    const errors = await Promise.all(
+      writes.map((write) => rejection(repo.writeCompaction(null, [write]))),
+    )
+    for (const error of errors) {
+      expect(error).toMatchObject({code: 'invalidArgument'})
+    }
+    expect(log).toEqual([])
+  })
+
+  test('refuses a payload that is not UTF-8 before any query', async () => {
+    const {client, log} = tableStore()
+    const bad = {...compactionRow('LEASE'), payload: new Uint8Array([0xff])}
+    const error = await rejection(
+      new PgRepository(client, {viewsTable: true}).writeCompaction(null, [
+        {kind: 'put', row: bad, expect: {kind: 'any'}},
+      ]),
+    )
+    expect(error).toMatchObject({code: 'invalidArgument'})
+    expect(log).toEqual([])
+  })
+
+  test('reads the clock in whole seconds', () => {
+    const {client} = tableStore()
+    expect(new PgRepository(client, {viewsTable: true, clock: () => 1_999}).compactionNow()).toBe(1)
+  })
+})
+
+// A journal row in `scope` at `position`, as the journal's projector puts it.
+function journalRow(scope: string, position: string): ViewOperation {
+  return putView(`journal#${scope}`, position, 'a', 'journal', '{}', {condition: 'absent'})
+}
+
+// A commit carrying the journal's rows in scopes U+1F600, U+FFFD and U+1F600 again (UTF-8 bytes
+// put U+FFFD first, UTF-16 code units the other way), and a view of its own.
+function journaledCommit(repo: PgRepository): Promise<void> {
+  const rows = [
+    journalRow('\u{1F600}', '1'),
+    journalRow('\uFFFD', '1'),
+    journalRow('\u{1F600}', '2'),
+  ]
+  const views: ProjectedView[] = [
+    {projector: 'own', projectorIndex: 0, operation: 0, op: putView('k', 'v', 'a', 'l', '{}')},
+    ...rows.map((op, operation) => ({
+      projector: 'journal',
+      projectorIndex: 1,
+      operation,
+      op,
+    })),
+  ]
+
+  return repo.commit({entityId: 'a', events: [event(1)], views})
+}
+
+describe('PgRepository journal wake-ups', () => {
+  test('notifies each journaled scope once, in byte order, after the views', async () => {
+    const {client, log, values} = tableStore()
+    await journaledCommit(new PgRepository(client, {viewsTable: true}))
+    const notify = log.findIndex((text) => text.includes('pg_notify'))
+    expect(log[notify]).toBe(
+      'SELECT pg_notify($1, scope) FROM jsonb_array_elements_text($2::jsonb) ' +
+        'WITH ORDINALITY AS s(scope, n) ORDER BY n',
+    )
+    expect(values[notify]).toEqual(['evt_events__evt_journal', '["\uFFFD","\u{1F600}"]'])
+    expect(transaction(log).slice(-3)).toEqual([
+      'INSERT INTO evt_events__evt_views (pk,',
+      'SELECT pg_notify($1, scope) FROM',
+      'COMMIT',
+    ])
+  })
+
+  test('sends nothing with wakeups off, or for a commit that journals nothing', async () => {
+    const off = tableStore()
+    await journaledCommit(new PgRepository(off.client, {viewsTable: true, wakeups: false}))
+    const quiet = tableStore()
+    await commitViews(
+      new PgRepository(quiet.client, {viewsTable: true}),
+      putView('k', 'v', 'a', 'l', '{}'),
+    )
+    for (const {log} of [off, quiet]) {
+      expect(log.some((text) => text.includes('pg_notify'))).toBe(false)
+    }
   })
 })

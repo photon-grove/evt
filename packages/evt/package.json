@@ -1,6 +1,6 @@
 {
   "name": "@photon-grove/evt",
-  "version": "0.2.0",
+  "version": "0.2.2",
   "description": "Event sourcing for TypeScript, wire-compatible with the Go and Rust evt implementations.",
   "keywords": [
     "event-sourcing",
@@ -33,6 +33,10 @@
     "./dynamodb": {
       "types": "./dist/dynamodb/index.d.ts",
       "default": "./dist/dynamodb/index.js"
+    },
+    "./journal": {
+      "types": "./dist/journal/index.d.ts",
+      "default": "./dist/journal/index.js"
     },
     "./memory": {
       "types": "./dist/memory/index.d.ts",

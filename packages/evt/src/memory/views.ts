@@ -1,7 +1,7 @@
 // The in-memory view repository: the reference the conformance suite checks the DynamoDB one
 // against, and a test double for code that reads views. Every read, the entity-type listing
-// included, sees every write that has returned. `MemRepository` keeps its commit-wide view rows in
-// one of these, so a commit and a view read see the same rows, as Rust's `MemRepository` does.
+// included, sees every write that has returned. `MemRepository` keeps its view rows in one of
+// these, so a commit and a view read see the same rows, as Rust's `MemRepository` does.
 
 import type {CallOptions} from '../repository.js'
 import {compareUtf8} from '../utf8.js'
@@ -166,8 +166,8 @@ export class MemViewRepository implements ViewRepository {
 }
 
 /**
- * The rows `repo` reads and writes, which `MemRepository`'s commit path writes too. Not exported
- * from the package.
+ * The rows `repo` reads and writes, which `MemRepository`'s commits, journal and compaction write
+ * too. Not exported from the package.
  */
 export function viewRowsOf(repo: MemViewRepository): ViewRows {
   return rowsOf(repo)

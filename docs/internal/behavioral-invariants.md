@@ -109,8 +109,8 @@ both backends). The row shape and rules are specified in the
 [storage format](../reference/storage-format.md#views); the invariants are under
 [Commit-Wide Projectors](#commit-wide-projectors-v09-c7).
 
-The view repository (Go `dynamo.ViewRepository`; Rust `ViewRepository` on mem, DynamoDB and
-PostgreSQL; TypeScript `ViewRepository` on mem and DynamoDB) refuses U+0000 in a written row's `pk`,
+The view repository (Go `dynamo.ViewRepository`; Rust and TypeScript `ViewRepository` on mem,
+DynamoDB and PostgreSQL) refuses U+0000 in a written row's `pk`,
 `sk`, owner, entity type or payload, and in a `pk`, `sk` or entity type a read, delete or list
 names, with the typed invalid-argument error before any request. A batch holding such a row writes
 nothing. PostgreSQL `text` cannot hold U+0000, so the same call has the same result on every backend
@@ -118,11 +118,12 @@ nothing. PostgreSQL `text` cannot hold U+0000, so the same call has the same res
 `viewRepositoryConformance` in `packages/evt-compat`).
 
 In Rust and TypeScript, the view repository a repository hands out (the in-memory repository
-itself; `view_repository()` / `viewRepository()` on DynamoDB, refused without a views table) reads
-the rows that repository's commits write, owner included, and a point read or partition page taken
-straight after a commit reflects its put, overwrite or delete (Rust `committed_view_cases`,
-TypeScript `committedViewConformance`, in memory and live on Moto). A row written through the
-in-memory view repository is the row a later commit's owner check reads.
+itself; `view_repository()` / `viewRepository()` on DynamoDB, refused without a views table, and on
+PostgreSQL with the views table) reads the rows that repository's commits write, owner included,
+and a point read or partition page taken straight after a commit reflects its put, overwrite or
+delete (Rust `committed_view_cases`, TypeScript `committedViewConformance`, in memory and live on
+DynamoDB and PostgreSQL). A row written through the in-memory view repository is the row a later
+commit's owner check reads.
 
 TypeScript also refuses a lone surrogate there, which isn't UTF-8 and which Go and Rust strings
 can't hold. The view repository's other rules are the same in Rust and TypeScript;
@@ -338,9 +339,11 @@ error before any write and is never split.
 - Multi-stream transactions require a repository that declares `evt.TransactionalRepository`;
   `snapshots.Store.Transaction` refuses one that does not with `*TransactionsUnsupportedError`
   before dispatching anything
-- Go PostgreSQL executes a commit's view operations through its `ViewWriter`, and refuses the
-  operations of a transaction group built for another storage type with
-  `*ProjectorOperationsUnsupportedError` before any write; it never drops them
+- Go PostgreSQL executes a commit's view operations through its `ViewWriter` (TypeScript: the
+  `PgRepository` `viewWriter` option, or its views table with `viewsTable: true`, Rust's
+  `with_views_table()`), and refuses the operations of a transaction group built for
+  another storage type with `*ProjectorOperationsUnsupportedError` (TypeScript `invalidCommit`)
+  before any write; it never drops them
 - A commit that carries projector operations but writes no event is refused before any write
   (`ProjectorOnlyCommitError` / `Error::ProjectorWithoutEvents`): views are projections of
   committed events (ADR-0012). An empty command ID is treated as absent when deriving the commit ID
@@ -427,7 +430,11 @@ error before any write and is never split.
   that stalls past the recovery window `Error::Transient` / `TransientError` (a backend's
   `Transient` stays retryable, a definitive `Backend` error is returned). An ordinary conflict
   of an outcome-bearing commit also re-reads the row once, so a lost race with the same command
-  returns the winner's outcome
+  returns the winner's outcome. A DynamoDB `TransactionConflict` on the outcome put (only another
+  attempt of the same command writes it, and it is still committing) polls the row instead, for
+  150 ms with the recovery backoff and never past the recovery window (every language; TypeScript
+  through `TransientError.outcomeRow`); one on any other item reads it once. Absent, the transient
+  error stands and is never recorded
 - Only a genuinely indeterminate failure of an outcome-bearing commit is recovered — a timeout or
   cancelled context, a dispatch or connection failure, a truncated response, a 5xx or server fault,
   a connection dropped during PostgreSQL's `COMMIT` (Go `*AmbiguousWriteError`, Rust
@@ -450,6 +457,12 @@ error before any write and is never split.
   context detached from the caller's cancellation, for every indeterminate failure (including
   DynamoDB's `TransactionInProgressException`): a row that appears is resolved, and one still
   absent when the window ends is a retryable ambiguous write, never "not applied"
+- A DynamoDB commit never sets `ClientRequestToken`: the SDK fills in a fresh token per call and
+  resends it on its own retries, so an SDK retry that meets its own first attempt is
+  `TransactionInProgressException` (indeterminate) or success, never a `TransactionConflict`. A
+  per-command token would make a fence-aware retry, which resends the command ID with different
+  items, fail with `IdempotentParameterMismatchException` (indeterminate, so it would end as an
+  ambiguous write instead of running)
 - A concurrent same-ID, same-digest loser returns only the winner's stored outcome, never its own
   handler error or local decision
 - Outcome rows read from storage are validated (known status, digest, rejection/code consistency,
@@ -688,6 +701,15 @@ from the plan and deletes owned rows (by row type) the plan no longer produces, 
 skip and delete with a strongly consistent read by key; a planned put of an unowned type fails the
 run before any write.
 
+TypeScript's counterpart is `Store.streamEntitiesFromSnapshots(aggregate, filter)`, over the
+entity heads' IDs by bytes, each loaded like `Store.load`. Its `ProjectionRebuild` (`run`,
+`runWithLease`, `plan`) follows Rust's without the diff mode and the journal: the same split into
+current-state and history-dependent projectors, the same `CompactionUncoveredError`,
+`StreamHeadDriftError` and `SequenceGapError` rules for the replay, the same checks across the run
+(`SharedViewKeyError`, `DuplicateViewKeyError`, `CommitTooLargeError`), the same guarded batches of
+at most 99 operations with lease renewal, and the same release rule. A failure under a caller's
+lease is a `RebuildFailure` carrying the error, the batches attempted and the last lease.
+
 ## Commit-Wide Projectors (v0.9, C7)
 
 A `CommitProjector` is a pure function over one commit; its view operations commit in the same
@@ -720,8 +742,9 @@ transaction as the events. The byte-level rules are in the
   ID and the events and state of those types only (other streams by ID and type), and the
   store durably adds them to the manifest's `historyDependent` set before the first commit that runs
   it (`CompactBelow` then refuses them in every process). A repository that cannot declare
-  (`evt.HistoryDeclarer`) refuses the commit (`HistoryDeclarationUnsupportedError`), and a store its
-  writer refuses as uninitialized is refused before anything is declared.
+  (`evt.HistoryDeclarer`; TypeScript `declareHistoryDependent`) refuses the commit
+  (`HistoryDeclarationUnsupportedError`; TypeScript `historyDeclarationUnsupported`), and a store
+  its writer refuses as uninitialized is refused before anything is declared.
 - Every operation of every projector names an owner stream the commit wrote (of a declared type
   for a history-dependent projector). The owner is stored as the row's `entityID`, and every write
   to the row (put or delete) is conditioned on it: DynamoDB
@@ -746,10 +769,7 @@ transaction as the events. The byte-level rules are in the
 - A repository must declare `evt.ViewWritingRepository` (its `WritesViews()` returns true; a
   decorator returns the wrapped repository's; Rust `Repository::writes_views`; TypeScript
   `writesViews()`) or the store refuses a commit-wide projector (`ViewsUnsupportedError`, TypeScript
-  `viewsUnsupported`). TypeScript runs only current-state projectors so far: it can't declare
-  history-dependent entity types yet, so it refuses a projector that names a `history` with
-  `historyDeclarationUnsupported`, as Go and Rust refuse one on a backend that can't declare;
-  `CheckProjectorOperationsSupported`
+  `viewsUnsupported`). `CheckProjectorOperationsSupported`
   stays fail-closed for view operations.
 
 **Operations**
@@ -767,8 +787,9 @@ transaction as the events. The byte-level rules are in the
   `ProjectorOnlyCommit` / `ProjectorWithoutEvents` first. A repository with nowhere to write the
   operations refuses the commit with `ViewsNotConfigured`.
 - Each operation is one action in the 100-action budget and is sized as DynamoDB sizes it (a put its
-  item, a delete its key plus its condition expression); PostgreSQL sizes a statement by its SQL
-  text, so its byte estimate is a lower bound while its action count is exact.
+  item, a delete its key plus its condition expression); PostgreSQL with a view writer sizes a
+  statement by its SQL text, so its byte estimate is a lower bound while its action count is exact.
+  PostgreSQL with the views table sizes each operation as DynamoDB does, so the same commits fail.
 
 **Failure**
 
@@ -786,9 +807,70 @@ transaction as the events. The byte-level rules are in the
   nothing above it failed. The first failed operation in transaction order is the one named.
 - Nothing from the commit is written: not its events, not its other rows.
 
+### PostgreSQL views table (ADR 0008)
+
+- `{events}__evt_views` keys collate as `"C"`, so listings order by UTF-8 bytes as on DynamoDB, and
+  `payload` is `text` holding the exact bytes. `ensureSchema` / `ensure_schema` create it in Rust and
+  TypeScript, with Rust's DDL byte for byte; Go never does.
+- A row whose entity type, `pk` and `sk` are over 2,600 UTF-8 bytes together is refused before any
+  write: `invalidArgument` from the view repository, `ViewKeyTooLong` on the commit path.
+- The view repository and the commit target refuse a database whose encoding isn't `UTF8`, checked
+  once per repository on first use.
+- Cursors are DynamoDB's (`pk`, `sk`, and `entityType` for an entity-type listing), so Rust and
+  TypeScript continue each other's listings. A full page has a cursor; an unbounded page holds at
+  most 1,000 rows. Every read sees every committed transaction. `putViews` is one transaction, in
+  key byte order, keeping a repeated key's last row. `purgeExpired(now)` / `purge_expired` deletes
+  only rows whose positive `ttl` has passed.
+- With the views table as the commit target, every put replaces the whole row with `ttl = 0` and is
+  guarded by the owner (`absent`: a plain insert whose key violation fails it; otherwise an upsert
+  `WHERE entity_id = EXCLUDED.entity_id`); a `present` delete fails on no row, and an unconditioned
+  delete fails when another owner holds the key. A repository has the views table or a view writer,
+  never both (TypeScript refuses both at construction).
+- Before its first commit, outside the commit transaction, a views-table repository declares
+  `postgres-views` (version 1) once, after the encoding check. Every commit then requires it: a store
+  that lost it fails the commit as transient, and the retry declares it again. Every PostgreSQL
+  writer without the views table (Go's, and Rust's or TypeScript's with a view writer or none)
+  refuses a store that declares it on commits, snapshot writes and compaction, so a store's views
+  never split across two tables. Initialization still succeeds on such a store.
+- With the views table, and only with it, the engine's expected payload (the journal's counter) is a
+  compare-and-set: `UPDATE ... WHERE pk, sk, entity_id = owner AND payload = expected`, and no row
+  fails the condition (`appliesExpectedPayload()` / `applies_expected_payload()` is true). Through a
+  view writer it is refused with `invalidViewOperation` / `InvalidViewOperation` before any write.
+- TypeScript doesn't write rebuild views on PostgreSQL yet; Rust does on the views table.
+- The journal (ADR 0008, X4) lives in the views table, with the DynamoDB items' keys, owners and
+  payload bytes, so Rust and TypeScript read and continue each other's journal. Its reads are each
+  one statement outside a transaction (the counters of every scope in one), so a gap is never a row
+  still in flight. Without the views table every journal read fails with `ViewsNotConfigured`, and
+  a journaled commit is refused (`expectedPayloadUnsupported` / the counter's compare-and-set is
+  not applied) before the marker is touched. The journal's declarations read the manifest first
+  without a lock and take the exclusive lock only when they write.
+- Journal compaction on PostgreSQL writes each batch in one READ COMMITTED transaction: with an
+  epoch, the rebuild fence's shared lock and the generation check (`epochChanged` otherwise); the
+  named rows locked `FOR UPDATE`, the scope's `LEASE` row first and the rest by `(pk, sk)` bytes;
+  every expectation and delete owner checked before any write, the first failure in request order
+  refused; then the writes, an `absent` put as a plain insert whose key violation refuses the batch
+  and a delete guarded by its owner. A refusal rolls the whole batch back. Batches of one scope
+  serialize on its lease row, which is what makes an absent key safe to check; a serialization
+  failure or deadlock is transient. Rust and TypeScript run the same protocol.
+- Wake-ups (X5): a commit that wrote journal rows through the views table runs `pg_notify` on
+  `{events}__evt_journal` with each scope once, in ascending byte order, after its view statements,
+  so PostgreSQL delivers them at `COMMIT` and drops them with a rollback. A commit that journals
+  nothing, a repository with wake-ups off (`with_wakeups(false)` / `wakeups: false`), compaction
+  and rebuilds notify nothing. A `JournalListener` reports `Connected` on every connection, `Poll`
+  at a fixed cadence from the last `Poll` or `Connected` ahead of any pending scope, checks the
+  connection with `SELECT 1` on the call after a `Poll` (bounded by the connect timeout, replacing
+  a connection that fails it), and ignores notifications on other channels or with an invalid
+  scope. The TypeScript listener keeps each pending scope once, takes one `next()` at a time, and
+  an abort loses no pending scope.
+
 ## Journal (X1, Rust-first)
 
-Rust only (`photon-evt` with the `journal` cargo feature). Go does not implement the journal and
+Rust (`photon-evt` with the `journal` cargo feature), and TypeScript (`@photon-grove/evt/journal`)
+on its in-memory, DynamoDB and PostgreSQL (views table) repositories, which holds every rule below: its projector's seal is a module-private set of the engine's
+own projectors, a journal writer is a handle the journal added to a module-private set, and its
+rebuilds are `rebuildJournalWithLock`, `rebuildJournalWithLease`, `rebuildJournal` and
+`ProjectionRebuild`'s `journal` option. Go
+does not implement the journal and
 refuses a table that declares it (`UnsupportedFeatureError` on the first commit after the
 declaration; `evt-doctor migrate-heads` refuses it as well). The stored shapes are in the
 [storage format](../reference/storage-format.md#journal).
@@ -805,7 +887,10 @@ declaration; `evt-doctor migrate-heads` refuses it as well). The stored shapes a
   `JournalRepository` overrides both to return the attempt that committed, allocations included.
   `Executed::events`, `CommandOutcome::events` and `Transaction::commit` hand back those events, so
   every returned allocation equals the row a `page` read finds at that position. Wrappers must
-  forward both methods. A replayed or recovered outcome returns no events.
+  forward both methods. A replayed or recovered outcome returns no events. TypeScript has the same
+  contract as optional `commitWithReceipt` / `commitTransactionWithReceipt` repository methods,
+  with the defaults in the root helpers of the same names; its store, transactions and outcome
+  paths hand back the receipt's events.
 - **Rows and counters commit with the events.** Journal rows come from a history-dependent
   commit-wide projector: owned by the event's stream, written only if absent, owner never changes.
   Counters (the highest position per scope) are shared by every stream of a scope, so they are
@@ -865,6 +950,10 @@ declaration; `evt-doctor migrate-heads` refuses it as well). The stored shapes a
 ## Journal compaction (X2, Rust-first)
 
 The stored shapes are in the [storage format](../reference/storage-format.md#journal-compaction).
+TypeScript holds every rule below on its in-memory, DynamoDB and PostgreSQL (views table)
+repositories. Its rebuild-epoch read is the repositories'
+`observeRebuildEpoch`, and its compaction marker check and declaration accept the journal's
+features on any handle, since compaction is the journal's own.
 
 - **A snapshot before any delete.** A run stores the canonical chunks of rows `1..=checkpoint`,
   swaps the scope's manifest (the checkpoint becomes the floor) in one atomic write with the one
@@ -1026,7 +1115,8 @@ DESC LIMIT n`. The in-memory backend walks its stream backwards.
   `CompactBelow` (which writes no new rows but is refused all the same). TypeScript throws a
   `ReservedEntityIdError` from `commit`, `putSnapshot` and `compactBelow`.
 - Enumeration (`StreamAllEvents`/`StreamEntities`), entity heads (`StreamEntityHeads`), and rebuild
-  scans (`StreamEntitiesFromSnapshots`) skip every reserved partition. `ReservedNamespacePrefixes()` returns a copy; callers cannot
+  scans (`StreamEntitiesFromSnapshots`) skip every reserved partition (TypeScript:
+  `streamAllEvents`, `entityHeads`, `Store.streamEntities` and `Store.streamEntitiesFromSnapshots`). `ReservedNamespacePrefixes()` returns a copy; callers cannot
   change the authoritative namespace checks.
 - Entity IDs were never restricted before, so a pre-existing stream such as `SYSTEM#account` would
   disappear from enumeration after upgrading. Explicit event and snapshot reads by ID still
@@ -1107,8 +1197,15 @@ DESC LIMIT n`. The in-memory backend walks its stream backwards.
 
 ### Rebuild Fence (ADR-0004 C10)
 
+- Every language runs the lifecycle on every backend: Go's `evt.RebuildFence` (through
+  `RebuildFenceProvider`), Rust's `Repository` methods, and TypeScript's `RebuildFence` methods on
+  each repository (`rebuildState`, `rebuildGeneration`, `beginRebuild`, `renewRebuild`,
+  `endRebuild`, `forceReleaseRebuild`, `writeRebuildViews`), with its errors the Go names plus
+  `Error` and the reader helpers `observeRebuildEpoch`, `verifyRebuildEpoch` and
+  `readAtRebuildEpoch`. TypeScript takes leases in milliseconds, rounded up to whole seconds.
 - The fence is two engine rows in the reserved `SYSTEM#` namespace (storage spec, Rebuild Fence): a
-  lock row (`SYSTEM#REBUILD`: `owner`, `leaseExpiresAt` in whole epoch seconds; after a
+  lock row (`SYSTEM#REBUILD`: `owner`, the fencing `generation`, `leaseExpiresAt` in whole epoch
+  seconds; after a
   force-release, only `forceReleased = true`) and a generation item
   (`SYSTEM#REBUILD#GENERATION`: `value`, and `forceReleased` after a force-release). On
   PostgreSQL they are `{events}__evt_rebuild_lock` and `{events}__evt_rebuild_generation`. Every
