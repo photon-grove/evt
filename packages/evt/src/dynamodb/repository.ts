@@ -1277,9 +1277,13 @@ export class DynamoRepository
       // transient, like throttling, and never a conflict, as in Go and Rust.
       const colliding = codes.indexOf('TransactionConflict')
       if (colliding !== -1) {
+        // A conflict on the outcome put names another attempt of the same command, still
+        // committing: the store polls its row briefly instead of reading it once.
+        const outcomeRow =
+          layout.outcome !== null && codes[layout.outcome] === 'TransactionConflict'
         return new TransientError(
           `transaction conflict on ${entityAt(layout, colliding)}: another writer was committing at the same time`,
-          {cause: error, transactionConflict: true},
+          {cause: error, transactionConflict: true, outcomeRow},
         )
       }
       if (codes.some((code) => THROTTLED.has(code))) {

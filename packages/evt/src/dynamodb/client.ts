@@ -108,6 +108,12 @@ export interface DynamoClient {
   updateItem?(input: UpdateItemInput, options?: RequestOptions): Promise<unknown>
   query(input: QueryInput, options?: RequestOptions): Promise<Page>
   scan(input: ScanInput, options?: RequestOptions): Promise<Page>
+  /**
+   * A commit never sets `ClientRequestToken`: the SDK fills in one per call and resends it on its
+   * own retries. A structural client must do the same, never one token per command, since
+   * fence-aware retry resends a command ID with other items, which DynamoDB refuses with
+   * `IdempotentParameterMismatchException`.
+   */
   transactWriteItems(
     input: {TransactItems: TransactItem[]},
     options?: RequestOptions,
