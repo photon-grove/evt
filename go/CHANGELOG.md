@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.2](https://github.com/photon-grove/evt/compare/go/v0.13.1...go/v0.13.2) (2026-11-23)
+
+
+### Bug Fixes
+
+* **dynamo:** pin the SDK's commit token; poll after a conflict on the outcome put ([#311](https://github.com/photon-grove/evt/issues/311)) ([b1f9bd8](https://github.com/photon-grove/evt/commit/b1f9bd8e58a0b9b03a52bd30edd7c12d2d33f3f7))
+
 ## [0.13.1](https://github.com/photon-grove/evt/compare/go/v0.13.0...go/v0.13.1) (2026-11-21)
 
 
