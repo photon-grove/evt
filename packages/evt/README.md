@@ -220,8 +220,8 @@ On PostgreSQL the rows and counters are rows of the views table, written in the 
 transaction, and each read is one statement that sees every committed transaction. A
 `PgRepository` without `viewsTable: true` holds no journal: its journal reads fail with a
 `ViewsNotConfiguredError`, and a journaled commit through it is refused before anything is declared.
-A PostgreSQL journal reads a compacted scope's floor, but compacting on PostgreSQL, and rebuilds
-under the rebuild lock, are still Rust only.
+A PostgreSQL journal reads a compacted scope's floor, but compacting on PostgreSQL, and journal
+rebuilds under the rebuild lock, are still Rust only.
 
 Each journaled commit wakes listeners with `pg_notify`, once per scope it wrote, unless the
 repository is built with `wakeups: false`. A `JournalListener` (`@photon-grove/evt/postgres`) holds
@@ -324,6 +324,17 @@ of `AbortSignal`, which the DOM library, `@types/node`, and Bun's and Deno's typ
   derived state pins the generation with `observeRebuildEpoch` or `readAtRebuildEpoch`, which
   fail with the retryable `RebuildUnavailableError` and `RebuildEpochChangedError`. The memory and
   PostgreSQL repositories take a `clock` option for leases, as DynamoDB's does.
+  `new ProjectionRebuild(repository, {projectors, aggregates}).run(owner, leaseMs)` rebuilds
+  commit-wide projectors under that fence, as Rust's `ProjectionRebuild` does: a current-state
+  projector runs over each stream's final state, loaded from its snapshot so a compacted stream
+  rebuilds, and a history-dependent one replays every commit of the types it names, failing with
+  `CompactionUncoveredError` when a stream's early events are gone. Every row is computed and
+  checked first (a row two owners write is a `SharedViewKeyError`), then written in guarded
+  batches of at most 99 while the lease is renewed. A failure before any write releases a lock the
+  run acquired from a settled generation; once a write was attempted it keeps the lock until a run
+  completes. `plan()` is the dry run, `onProgress` reports the batches, and `runWithLease` runs
+  under a lease you took, throwing a `RebuildFailure` with the batches it attempted. It has no
+  journal or diff mode.
 - **Transactions.** `store.transaction()` commits several streams at once. `read(aggregate, id)`
   loads a stream of any aggregate type and returns a typed handle, `append(handle, events)` stages
   the events decided for it, and `commit({metadata})` stamps one commit ID on every event and

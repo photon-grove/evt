@@ -187,6 +187,41 @@ export function holdsRebuildLock(lease: RebuildLease, lock: RebuildLock | null):
   return lock !== null && lock.owner === lease.owner && lock.generation === lease.generation
 }
 
+/**
+ * Settles a begin whose result is unknown (a `RebuildBeginIndeterminateError`) from a state
+ * read after it failed, given the error's `lease` and `observed` generation: true when the lock
+ * holds `lease`, so the begin applied; false when it doesn't and the begin can no longer take it,
+ * because the generation moved from the `observed` value its write was conditioned on (the
+ * generation only grows); null while the generation is still `observed`, because the begin may
+ * still land.
+ *
+ * False means only that `lease` doesn't hold the lock: a begin that applied and was then
+ * force-released or taken over settles the same way. True is exact only when the owner token is
+ * the caller's alone, since a concurrent begin under the same token from the same generation
+ * writes the same lease.
+ */
+export function holdsRebuildBegun(
+  lease: RebuildLease,
+  observed: bigint,
+  state: RebuildState,
+): boolean | null {
+  if (holdsRebuildLock(lease, state.lock)) {
+    return true
+  }
+
+  return state.generation.value === observed ? null : false
+}
+
+/**
+ * Whether `lease` was acquired from the settled generation `before`, read with `rebuildGeneration`
+ * just before the `beginRebuild` that returned it, rather than taken over from an expired lease or
+ * acquired from a force-released generation (either may have left derived rows half-written). A
+ * rebuild under it that fails before any write may release it only when this is true.
+ */
+export function acquiredFromSettled(lease: RebuildLease, before: RebuildGeneration): boolean {
+  return before.value % 2n === 0n && lease.generation === before.value + 1n
+}
+
 /** How a rebuild takes the lock from the state it read. */
 export interface RebuildBeginPlan {
   readonly kind: 'acquire' | 'acquireForceReleased' | 'takeover'
@@ -261,8 +296,8 @@ export function fenceNow(clock: () => number): number {
   return Math.max(0, Math.floor(clock() / 1000))
 }
 
-// The lease guard's size in the budget: its key, `pk` and `sk = 0`.
-const REBUILD_GUARD_SIZE = 'pk'.length + 'sk'.length + REBUILD_LOCK_ID.length + '0'.length
+/** The lease guard's size in the budget: its key, `pk` and `sk = 0`. Internal. */
+export const REBUILD_GUARD_SIZE = 'pk'.length + 'sk'.length + REBUILD_LOCK_ID.length + '0'.length
 
 // Whether a string has no lone surrogate, so it's valid UTF-8.
 function wellFormed(text: string): boolean {
