@@ -5,6 +5,22 @@
 Accepted (2026-10-30). Tracking: the `TS` column of
 [`docs/reference/feature-matrix.md`](../reference/feature-matrix.md).
 
+_Implemented (2026-11-23):_ every phase in [Phasing](#6-phasing) has landed on `main`, and no `TS`
+cell is planned any more. TypeScript now runs every `scenarios.json` scenario, the exclusive ones
+included, and checks every vector of the seven fixture files. It writes in both live runs, standing
+in for Go and then for Rust, and it joins the enumeration diff. The writer rules that applied until
+phase 4 (below) no longer bind. A few cells still differ from Rust, and the matrix records each:
+
+- Deferred, as planned: the catch-up snapshot on read-only loads, the Rust load `tracing` fields
+  and the Rust `examples/banking`.
+- Not ported, because Go has neither: Rust's opt-in diff mode for `ProjectionRebuild`, and
+  in-band per-entity projector statements on PostgreSQL (Rust's `PgStatement` projectors). A
+  `PgRepository` refuses an aggregate's projector operations before any write, as Go's repository
+  does, and commit-wide projectors supersede them in every language.
+- Open in all three languages: the commit-wide projectors' state entry point, which rebuilds a
+  current-state row that combines several streams from complete final states.
+- `@photon-grove/evt-lambda` is complete against `lambda.json` but isn't on npm yet.
+
 ## Context
 
 - evt has two native implementations, the Go module and the Rust `photon-evt` crate, held together

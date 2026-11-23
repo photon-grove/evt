@@ -836,7 +836,8 @@ transaction as the events. The byte-level rules are in the
   compare-and-set: `UPDATE ... WHERE pk, sk, entity_id = owner AND payload = expected`, and no row
   fails the condition (`appliesExpectedPayload()` / `applies_expected_payload()` is true). Through a
   view writer it is refused with `invalidViewOperation` / `InvalidViewOperation` before any write.
-- TypeScript doesn't write rebuild views on PostgreSQL yet; Rust does on the views table.
+- A rebuild writes its view rows on PostgreSQL through the same target, under the lease guard, in
+  Rust and TypeScript: the views table, or the view writer.
 - The journal (ADR 0008, X4) lives in the views table, with the DynamoDB items' keys, owners and
   payload bytes, so Rust and TypeScript read and continue each other's journal. Its reads are each
   one statement outside a transaction (the counters of every scope in one), so a gap is never a row

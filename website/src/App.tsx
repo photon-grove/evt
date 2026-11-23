@@ -258,8 +258,7 @@ function ParityBand() {
         <h2>Where each language stands today.</h2>
         <p className="section-sub">
           This grid is read from the <a href="#/docs/reference/feature-matrix">feature matrix</a> when
-          the site is built, so it shows what is on the default branch, not plans. TypeScript is being
-          ported in phases, and its cells fill in as each phase lands.
+          the site is built, so it shows what is on the default branch, not plans.
         </p>
       </div>
       <ul className="parity-legend" aria-label="Legend">
@@ -320,7 +319,7 @@ function LanguagesBand() {
           evt isn't a binding. Each language is a native implementation of one normative storage
           format, and shared golden fixtures check them byte for byte. Go and Rust also take turns
           writing the same streams in live runs against DynamoDB and PostgreSQL, and the TypeScript
-          driver joins those runs for the scenarios it supports.
+          driver joins those runs for every scenario.
         </p>
       </div>
 
@@ -361,7 +360,7 @@ function LanguagesBand() {
         <div className="fixture-panel">
           <p className="fixture-caption">
             <strong>compat/fixtures</strong> · Go generates most vectors and Rust its extensions'.
-            TypeScript checks itself against the ones it covers so far. Nobody edits them by hand.
+            TypeScript checks itself against all of them. Nobody edits them by hand.
           </p>
           <ul className="fixture-list">
             {fixtures.map((fixture) => (
@@ -477,7 +476,6 @@ function Home({lang, onLang}: {lang: Lang; onLang: (lang: Lang) => void}) {
           <div className="install">
             <div className="install-head">
               <LangSwitch lang={lang} onChange={onLang} label="Install language" />
-              {lang === 'ts' ? <span className="install-note">being ported</span> : null}
             </div>
             <div className="install-line">
               <span className="prompt">$</span>

@@ -516,7 +516,7 @@ The table needs a string partition key `pk` and a number sort key `sk`, the same
 `dynamo.Repository` uses.
 
 For PostgreSQL, enable the `postgres` feature. The repository uses a `deadpool_postgres::Pool`, and
-`ensure_schema` runs the same idempotent DDL as Go's `EnsureSchema`, plus the Rust-only views table
+`ensure_schema` runs the same idempotent DDL as Go's `EnsureSchema`, plus the views table Go lacks
 (`{events}__evt_views`, below). Engine relations use the
 reserved `__evt_` infix. Schema setup migrates the old `{events}_entity_type_idx` index to
 `{events}__evt_entity_type_idx`, and it creates the rebuild fence's `{events}__evt_rebuild_lock`
@@ -638,7 +638,7 @@ every stream agrees with, so a rebuild, or a test, can run the projector again o
 
 Enable the `journal` feature for per-scope ordered, replayable delivery rows written in the commit
 that wrote the events ([ADR 0005](https://github.com/photon-grove/evt/blob/main/docs/adr/0005-rust-first-extensions-journal-and-lambda.md),
-Rust only for now, and Go refuses a table that declares it). A scope is a named, independently
+in Rust and TypeScript; Go refuses a table that declares it). A scope is a named, independently
 ordered sequence (a world, or a place in it). You map each event of the journaled entity types to
 zero or more scopes with a pure function. The event takes the next position in each, and a client
 polls a scope with `high_watermark` and `page`. The example below is [`examples/journal.rs`](https://github.com/photon-grove/evt/blob/main/crates/evt/examples/journal.rs),

@@ -280,7 +280,8 @@ the PostgreSQL repository a writer with `repo.WithViewWriter(fn)`. evt defines n
 there, so your `fn` turns each operation into SQL for your own table, and it must enforce the owner
 in that SQL (see [PostgreSQL](postgres.md#views)). The in-memory repository keeps the rows for
 tests (`mem.Repository.View`, `Views`). In TypeScript these are `DynamoRepository`'s `viewsTable`
-option, `PgRepository`'s `viewWriter` option, and `MemRepository`'s `view` and `views`.
+option, `PgRepository`'s `viewWriter` option (or `viewsTable: true` for the
+[views table](postgres.md#the-views-table)), and `MemRepository`'s `view` and `views`.
 
 A repository has to declare that it writes views. It implements `evt.ViewWritingRepository`, whose
 `WritesViews()` reports the capability (a decorator reports its wrapped repository's), and

@@ -33,16 +33,16 @@ implement a handful of traits or interfaces and use the pieces you need.
 
 Reach for it when the history matters as much as the current state: an audit trail you can trust,
 read models you can delete and rebuild, and retries that never record the same fact twice. Because
-the implementations share their storage format, a Rust service and a Go service can append to the
-same streams today, and the TypeScript package is held to the same fixtures as it's built.
+the implementations share their storage format, Rust, Go and TypeScript services can append to the
+same streams.
 
 ## Pick your language
 
 | | Install | Status |
 | --- | --- | --- |
 | **Rust** · [`photon-evt`](crates/evt/README.md) | `cargo add photon-evt` | Shipping, with the most features: the core, fenced rebuilds, the sync journal, and [`photon-evt-lambda`](crates/evt-lambda/README.md) for DynamoDB Streams |
-| **Go** · [`github.com/photon-grove/evt/go`](go/README.md) | `go get github.com/photon-grove/evt/go` | Shipping: the original module, with the core, fenced rebuilds and the `evt-doctor` CLI. The journal is Rust-only for now |
-| **TypeScript** · [`@photon-grove/evt`](packages/evt/README.md) | `npm install @photon-grove/evt` | Being ported in phases. The core, multi-stream transactions with read fences, command outcomes, fence-aware retry, commit-wide projectors with the fenced full rebuild, enumeration, the view repository, and the in-memory, DynamoDB and PostgreSQL backends are in. The journal is landing. The Lambda helpers are ported as [`@photon-grove/evt-lambda`](packages/evt-lambda/README.md), not yet on npm |
+| **Go** · [`github.com/photon-grove/evt/go`](go/README.md) | `go get github.com/photon-grove/evt/go` | Shipping: the original module, with the core, fenced rebuilds and the `evt-doctor` CLI. It doesn't have the sync journal |
+| **TypeScript** · [`@photon-grove/evt`](packages/evt/README.md) | `npm install @photon-grove/evt` | Shipping: the core, transactions with read fences, command outcomes, commit-wide projectors with fenced rebuilds, the view repository, the sync journal, and the in-memory, DynamoDB and PostgreSQL backends. The Lambda helpers are ported as [`@photon-grove/evt-lambda`](packages/evt-lambda/README.md), not yet on npm |
 
 The [feature matrix](docs/reference/feature-matrix.md) tracks every capability in each language,
 and a PR that changes one updates its row, so it describes the code on `main` rather than plans.
@@ -57,8 +57,8 @@ and a PR that changes one updates its row, so it describes the code on `main` ra
 | **Durable command outcomes**          | A retried command gets its stored answer, accepted or rejected, instead of running twice. Rejections can carry events of their own.     |
 | **Views derived from events**         | Commit-wide projectors write read-model rows in the same commit as the events. Rust's and TypeScript's `ProjectionRebuild` rebuild them from the log behind a rebuild fence, and Go's `RebuildProjections` rebuilds per-entity views under the same fence. |
 | **Snapshots and upcasters**           | Inline snapshots keep loads short, snapshot-verified compaction trims old history, and versioned upcasters let payloads change shape.    |
-| **One format, three languages**       | Golden fixtures and live interleaved runs keep Go and Rust writing the same bytes, and TypeScript checks itself against the same fixtures. See [how it's checked](#one-format-three-languages). |
-| **Realtime sync and Lambda (Rust)**   | A per-scope sync journal with gap detection and compaction, and `photon-evt-lambda` for DynamoDB Streams handlers.                       |
+| **One format, three languages**       | Golden fixtures and live interleaved runs keep Go, Rust and TypeScript writing the same bytes. See [how it's checked](#one-format-three-languages). |
+| **Realtime sync and Lambda**          | Rust and TypeScript: a per-scope sync journal with gap detection and compaction, and Lambda helpers for DynamoDB Streams handlers. |
 
 ## How a command flows
 
@@ -317,11 +317,11 @@ byte. Three things hold the implementations to it:
 
 - **Golden fixtures.** [`compat/fixtures`](compat/) holds encode and decode vectors, scenario
   outputs and exact DynamoDB requests. Go generates most of them and Rust generates its extensions'
-  (the journal and Lambda), and nobody edits them by hand. TypeScript checks itself against the
-  ones it covers so far.
+  (the journal and Lambda), and nobody edits them by hand. TypeScript checks itself against every
+  one of them.
 - **Live interleaved runs.** Go and Rust take turns writing the same streams in local DynamoDB and
-  PostgreSQL, then both verify every stream. The TypeScript driver joins those runs for the
-  scenarios it supports.
+  PostgreSQL, then both verify every stream. The TypeScript driver joins those runs for every
+  scenario, standing in for Go and then for Rust.
 - **Conformance suites.** Each language has a backend-neutral conformance suite, and every
   repository it ships passes it on the in-memory store, DynamoDB and PostgreSQL.
 
