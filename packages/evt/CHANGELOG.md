@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.3](https://github.com/photon-grove/evt/compare/evt-ts-v0.2.2...evt-ts-v0.2.3) (2026-11-23)
+
+
+### Features
+
+* **ts:** read commit-wide view rows through the repository that wrote them ([#314](https://github.com/photon-grove/evt/issues/314)) ([58a5557](https://github.com/photon-grove/evt/commit/58a55573649dc7c545a8736eed8e0796cd4f2621))
+* **ts:** rebuild the journal under the rebuild lock ([#332](https://github.com/photon-grove/evt/issues/332)) ([65944be](https://github.com/photon-grove/evt/commit/65944be83faae0f290930e418037560c4c3249d9))
+
 ## [0.2.2](https://github.com/photon-grove/evt/compare/evt-ts-v0.2.1...evt-ts-v0.2.2) (2026-11-23)
 
 
